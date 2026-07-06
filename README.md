@@ -116,6 +116,20 @@ To use this server with Claude Desktop, add the following configuration to your 
 
 After updating the configuration, restart Claude Desktop for the changes to take effect.
 
+### Running over HTTP (optional)
+
+By default the server uses **stdio** (the MCP client launches it as a subprocess). To instead serve over **HTTP** on a port, set `HUMAN_LOOP_HTTP_PORT`:
+
+```bash
+HUMAN_LOOP_HTTP_PORT=8000 python human_loop_server.py
+# endpoint: http://127.0.0.1:8000/mcp   (bind address via HUMAN_LOOP_HTTP_HOST, default 127.0.0.1)
+```
+
+Then point a URL-based MCP client at `http://127.0.0.1:8000/mcp`. Notes:
+- HTTP mode is long-running — stop it with Ctrl+C (it does not exit on stdin EOF like stdio does).
+- The GUI dialogs still appear on **this machine's** desktop, so HTTP is mainly useful when the client runs on the same machine but connects by URL; a remote client's user won't see the local pop-ups.
+- Without the env var, behavior is unchanged (stdio).
+
 ## 🛠️ Available Tools
 
 ### 1. `get_user_input`

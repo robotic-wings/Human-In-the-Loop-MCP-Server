@@ -2730,8 +2730,18 @@ def main():
     elif IS_LINUX:
         print("Linux detected - Using Linux-compatible GUI settings with modern styling")
     
-    print("")
-    print("Starting MCP server...")
+    # Transport: default stdio (client launches us as a subprocess). Set
+    # HUMAN_LOOP_HTTP_PORT to instead serve over HTTP on that port so a client
+    # can connect by URL. The GUI is still local to THIS machine's desktop.
+    http_port = os.environ.get("HUMAN_LOOP_HTTP_PORT")
+    http_host = os.environ.get("HUMAN_LOOP_HTTP_HOST", "127.0.0.1")
+    if http_port:
+        print(f"Starting MCP server on http://{http_host}:{http_port} (HTTP transport)...")
+        print("Note: HTTP mode is long-running; stop it with Ctrl+C. The GUI dialogs "
+              "appear on this machine's desktop only.")
+    else:
+        print("")
+        print("Starting MCP server (stdio transport)...")
 
     # The MCP server runs on a background thread while tkinter owns the main
     # thread. tkinter/macOS AppKit require all windows to be created on the
@@ -2739,10 +2749,13 @@ def main():
     # it submits dialog requests to the DialogRunner, which builds them here.
     def _serve():
         try:
-            mcp.run()
+            if http_port:
+                mcp.run(transport="http", host=http_host, port=int(http_port))
+            else:
+                mcp.run()
         finally:
-            # Transport closed (client disconnected / stdin EOF): tell the main
-            # loop to stop so the process can exit cleanly.
+            # Transport closed (client disconnected / stdin EOF / server stopped):
+            # tell the main loop to stop so the process can exit cleanly.
             _dialog_runner.request_shutdown()
 
     server_thread = threading.Thread(target=_serve, name="mcp-server", daemon=True)
