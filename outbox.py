@@ -2,10 +2,10 @@
 """
 Outbox viewer for the Human-in-the-Loop MCP Server.
 
-A small, self-contained (stdlib-only) tool to browse and delete the "outbox"
-(发件箱) — the local archive of everything the human sent back to the AI through
-the `assign_task_to_human` tool: the AI's command + description, the human's
-written note, and any file/image attachments.
+A small, self-contained (stdlib-only) tool to browse and delete the "outbox" —
+the local archive of everything the human sent back to the AI through the
+`assign_task_to_human` tool: the AI's command + description, the human's written
+note, and any file/image attachments.
 
 Deliberately styled after classic Windows 9x (silver 3D widgets, raised/sunken
 reliefs, bitmap font) — NOT a modern UI.
@@ -307,7 +307,7 @@ class OutboxViewer:
         messagebox.showinfo(
             "About",
             "Outbox Viewer\n"
-            "Human-in-the-Loop MCP Server (发件箱)\n\n"
+            "Human-in-the-Loop MCP Server\n\n"
             "Browse and delete archived task submissions.\n"
             f"Location: {get_outbox_dir()}")
 

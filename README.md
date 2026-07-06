@@ -16,7 +16,7 @@ A powerful **Model Context Protocol (MCP) Server** that enables AI assistants li
 - **Multi-line Input**: Collect longer text content, code, or detailed descriptions
 - **Confirmation Dialogs**: Ask for yes/no decisions before proceeding with actions
 - **Information Messages**: Display notifications, status updates, and results
-- **Delegate a Task to a Human**: Hand off a real-world task and wait (long-running) for the human to report **Completed / Failed / Still-progressing**, with an optional written note and file/image attachments. Survives client tool-call timeouts via a heartbeat protocol, and archives every submission to a local **Outbox**.
+- **Delegate a Task to a Human**: Hand off a real-world task and wait (long-running) for the human to report **Completed / Failed / Still-progressing**, with an optional written note and file/image attachments. Starts with a non-focus-stealing **ringing notification** (so it doesn't interrupt), survives client tool-call timeouts via a heartbeat protocol, detects assistant disconnection, and archives every submission to a local **Outbox**.
 - **Health Check**: Monitor server status and GUI availability
 
 ### 🎨 Modern Cross-Platform GUI
@@ -211,7 +211,13 @@ Delegate a real-world task to a human and wait — potentially for a long time �
 - `task_description` (str): Detailed instructions for the human.
 - `task_id` (str, optional): Leave empty to **start** a new task. Pass back the previous call's `task_id` to **continue** an existing task (after a heartbeat or an interim update) — this revives the same window without losing the human's work.
 - `client_timeout_seconds` (int, default `240`): **Your own per-tool-call timeout.** Claude Desktop hard-codes ~240s, so pass `240`. Claude Code has no timeout, so pass a large value like `3600`.
+- `max_result_bytes` (int, default `1000000`): **Your client's max tool-result size, in bytes.** Claude Desktop rejects results over ~1 MB, so pass `1000000`; Claude Code allows much larger (configurable) results, so pass a big value (e.g. `30000000`). The human sees a live size counter and can't submit text+attachments whose encoded size would exceed this, and the server hard-caps the result to that budget — so a big deliverable is never rejected as "too large" and lost.
 - `context_note` (str, optional): Extra context shown to the human.
+
+**Ringing notification first (doesn't interrupt).** A task does **not** immediately pop a full window. Instead a small **notification toast** appears in the top-right corner **without stealing focus**, and a classic telephone ringtone (`notify.wav`) loops to get attention:
+- **View** → stops the ring and opens the full task window immediately. The tool returns `status: "opened"` — treat it like a heartbeat (re-call with the same `task_id`, don't reply to the user).
+- **Cancel** → stops the ring; the task is reported **failed** (`status: "failed"`, `reason: "declined_via_notification"`).
+The ring loops until the user clicks (or the assistant disconnects, in which case the toast auto-closes). Continuing an *in-progress* task reopens the window directly **without** re-ringing — unless a long time has passed since the human last acted (a "follow-up"), in which case it rings again.
 
 **One window = one submission.** Whenever the human clicks a button, the current note + attachments are sent to the AI and **the window closes**. The only difference between the buttons is whether the task is finished:
 - **✅ Completed** / **❌ Failed** — terminal; the task ends.
@@ -220,11 +226,18 @@ Delegate a real-world task to a human and wait — potentially for a long time �
 **Long-running heartbeat protocol (important):**
 Claude Desktop enforces a hard ~4-minute per-tool-call timeout that cannot be disabled from the server. To keep the human's dialog alive indefinitely, the server returns a **heartbeat** shortly before your `client_timeout_seconds` elapses:
 
-- `status: "heartbeat"` (`human_action: false`) → the human hasn't submitted anything yet. **Do not respond to the user or reason about the task — immediately call the tool again with the same `task_id`.** The same window (and everything typed in it) stays intact; a countdown warns the human a few seconds before each sync so they can pause.
+- `status: "heartbeat"` (`human_action: false`) → the human hasn't submitted anything yet (or hasn't clicked the notification). **Do not respond to the user or reason about the task — immediately call the tool again with the same `task_id`.** The same window/toast (and everything typed) stays intact; a countdown warns the human a few seconds before each sync so they can pause.
+- `status: "opened"` (`human_action: false`) → the human clicked **View** on the notification and the task window is now open. Also a keepalive — re-call with the same `task_id`, don't reply.
 - `status: "in_progress"` (`human_action: true`) → a genuine interim update; **the window has closed** and the task isn't finished. Process it, then decide: re-call with the same `task_id` to reopen a fresh window, or finish.
-- `status: "completed"` / `"failed"` / `"cancelled"` → terminal (`needs_continuation: false`); the `task_id` is gone.
+- `status: "completed"` / `"failed"` (`human_action: true`) → the human's report (`resubmittable: true`). The session is **kept open for your review** — not destroyed. If the deliverable is insufficient (or `attachments_omitted_for_size` is true because an attachment was too big to inline under `max_result_bytes`), you may call again with the same `task_id` and an updated `task_description` to request a re-submission; if satisfied, just stop (the session is reaped automatically).
+- `status: "cancelled"` → terminal (`needs_continuation: false`); the `task_id` is gone.
 
-Human submissions with attachments are returned as **content blocks**: images inline (the model can see them) and other files as embedded resources, with an ~25 MB cap (oversized files are referenced by path instead). Every submission is also archived to the **Outbox** (see below).
+The single open window is **reused** across heartbeats (never re-created), and the leg the server waits is always strictly shorter than your `client_timeout_seconds`, so the heartbeat is guaranteed to reach you before your client kills the call.
+
+**Liveness & disconnect safety (so no zombie windows):**
+The window continuously shows its connection state — `Assistant connected · next check-in in m:ss (task <id> · opened <time>)` — refreshed on every heartbeat, and displays the short `task_id` + open time so duplicate windows are easy to tell apart. If the assistant stops checking in (conversation ended, client died, or it forgot to re-call), the window shows `The assistant may have disconnected…` and, after a further grace period, **auto-saves any draft the human typed to the Outbox and closes itself** — so a human never keeps typing into a dead task, and their work is never lost. If the assistant later reconnects with that `task_id`, it receives the auto-saved content as a terminal `cancelled` result (with `reason: "assistant_disconnected"`).
+
+Human submissions with attachments are returned as **content blocks**: images inline (the model can see them) and other files as embedded resources. The task window shows a **live submission-size counter** (text + attachments vs your `max_result_bytes`); if it would exceed the budget the three submit buttons grey out until the human trims it. As a hard safety, the server also caps the returned result to the budget — anything that doesn't fit is referenced by path instead of inlined (and is still saved in full to the Outbox), so a result is never rejected as "too large". Every submission is also archived to the **Outbox** (see below).
 
 **Example Usage:**
 ```python
@@ -247,7 +260,7 @@ status = await health_check()
 # Returns detailed platform and functionality information
 ```
 
-## 📤 Outbox (发件箱) & Viewer
+## 📤 Outbox & Viewer
 
 Every human submission sent through `assign_task_to_human` (the AI's command + description, the human's note, and copies of all attachments) is archived to disk so nothing is lost when the window is cleared or closed.
 
@@ -288,7 +301,7 @@ All tools return structured JSON responses:
 - **get_multiline_input**: `user_input`, `character_count`, `line_count`
 - **show_confirmation_dialog**: `confirmed`, `response`
 - **show_info_message**: `acknowledged`
-- **assign_task_to_human**: `status` (`heartbeat` / `in_progress` / `completed` / `failed` / `cancelled` / `session_not_found` / `expired`), `human_action`, `needs_continuation`, `task_id`. Human submissions are returned as a content list (summary text + inline images/files) rather than a plain dict.
+- **assign_task_to_human**: `status` (`heartbeat` / `opened` / `in_progress` / `completed` / `failed` / `cancelled` / `session_not_found` / `expired`), `human_action`, `needs_continuation`, `task_id`. Human submissions are returned as a content list (summary text + inline images/files) rather than a plain dict.
 
 ## 🧠 Best Practices for AI Integration
 

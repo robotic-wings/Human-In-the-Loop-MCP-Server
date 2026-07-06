@@ -41,20 +41,72 @@ IS_LINUX = CURRENT_PLATFORM == 'linux'
 mcp = FastMCP("Human-in-the-Loop Server")
 
 # --------------------------------------------------------------------------- #
-# Outbox (发件箱): local, on-disk archive of everything the human sends to the AI
+# Outbox: local, on-disk archive of everything the human sends to the AI
 # --------------------------------------------------------------------------- #
 OUTBOX_ENV_VAR = "HUMAN_LOOP_OUTBOX_DIR"
 DEFAULT_OUTBOX_DIR = os.path.join(os.path.expanduser("~"), ".human_loop_outbox")
 OUTBOX_SCHEMA_VERSION = 1
 
 # Attachment inlining limits for the tool return value (bytes).
-MAX_INLINE_TOTAL_BYTES = 25 * 1024 * 1024   # ~25 MB across all attachments
-MAX_INLINE_FILE_BYTES = 10 * 1024 * 1024    # per-file cap
+MAX_INLINE_FILE_BYTES = 10 * 1024 * 1024    # absolute per-file sanity cap
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 
+# Tool-result size budgeting. Clients cap how big a tool result may be (Claude
+# Desktop rejects results > 1 MB); attachments are base64-inlined, so the encoded
+# size is what counts. The AI passes its own limit as `max_result_bytes`.
+DEFAULT_MAX_RESULT_BYTES = 1_000_000   # safe default for Claude Desktop (~1 MB)
+RESULT_OVERHEAD_BYTES = 4096           # rough JSON envelope / manifest allowance
+
+
+def _b64_len(nbytes):
+    """Length of base64-encoding `nbytes` raw bytes."""
+    return ((nbytes + 2) // 3) * 4
+
+
+def estimate_result_bytes(text, attachment_paths):
+    """Estimate the encoded size of the tool result for the given submission —
+    text (UTF-8) plus base64-inlined attachments plus a fixed overhead. Slightly
+    conservative on purpose so the UI warns before the real client limit."""
+    total = len((text or "").encode("utf-8")) + RESULT_OVERHEAD_BYTES
+    for p in (attachment_paths or []):
+        try:
+            total += _b64_len(os.path.getsize(p)) + 256
+        except OSError:
+            pass
+    return total
+
+
+def _human_bytes(n):
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{int(n)} B" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
 # Heartbeat / continuation tuning (seconds).
-HEARTBEAT_SAFETY_MARGIN = 30   # subtracted from the client's own timeout
-MIN_LEG_SECONDS = 30           # floor for a single wait "leg"
+HEARTBEAT_SAFETY_MARGIN = 30       # max seconds shaved off the client's timeout
+DISCONNECT_GRACE_SECONDS = 20      # past a leg deadline before we warn "may be disconnected"
+AUTO_CLOSE_AFTER_SECONDS = 180     # further silence before auto-saving the draft & closing
+
+# Pre-task notification / ringtone.
+RINGTONE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notify.wav")
+FOLLOW_UP_NOTIFY_AFTER_SECONDS = 180  # re-ring on continuation only after this much idle
+
+# The task window's connection/countdown line is debug info now that timeouts no
+# longer affect the human's experience - hidden unless this is set.
+SHOW_CONNECTION_STATUS = os.environ.get("HUMAN_LOOP_SHOW_STATUS", "").lower() in ("1", "true", "yes")
+
+
+def compute_leg_seconds(client_timeout_seconds: int) -> int:
+    """A single wait 'leg', always strictly shorter than the client's timeout.
+
+    The heartbeat MUST come back before the client kills the call, otherwise the
+    dialog is orphaned. So we shave a proportional margin (capped) and never
+    return a value >= the client's timeout.
+    """
+    ct = max(2, int(client_timeout_seconds))
+    margin = min(HEARTBEAT_SAFETY_MARGIN, max(1, ct // 4))
+    return max(1, ct - margin)
 
 
 def get_outbox_dir() -> str:
@@ -87,7 +139,7 @@ def archive_to_outbox(entry: Dict[str, Any], attachment_paths: List[str]) -> Opt
 
     Writes to a temporary directory first, then atomically renames it into place
     so a viewer never observes a half-written entry. Returns the final entry
-    directory path, or None on failure (failures are swallowed — archiving must
+    directory path, or None on failure (failures are swallowed - archiving must
     never crash the tool).
     """
     try:
@@ -161,6 +213,82 @@ def archive_to_outbox(entry: Dict[str, Any], attachment_paths: List[str]) -> Opt
         except Exception:
             pass
         return None
+
+
+class RingPlayer:
+    """Cross-OS looping ringtone. Idempotent start()/stop(); never raises.
+
+    Windows uses winsound's native SND_LOOP; macOS/Linux run a daemon thread
+    that re-spawns a CLI player (afplay / paplay / aplay) until stopped, since
+    those players don't loop on their own.
+    """
+
+    def __init__(self, path=RINGTONE_PATH):
+        self.path = path
+        self._stop = threading.Event()
+        self._thread = None
+        self._proc = None
+        self._started = False
+
+    def _posix_player_cmd(self):
+        for name in (("afplay",) if IS_MACOS else ("paplay", "aplay")):
+            exe = shutil.which(name)
+            if exe:
+                return [exe, self.path]
+        return None
+
+    def _loop_posix(self, cmd):
+        while not self._stop.is_set():
+            start = time.monotonic()
+            try:
+                self._proc = subprocess.Popen(
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self._proc.wait()
+            except Exception:
+                break
+            # If the player exits almost instantly (missing device/file), back
+            # off so we don't spin; the stop event also breaks the wait.
+            if time.monotonic() - start < 0.2:
+                if self._stop.wait(1.0):
+                    break
+
+    def start(self):
+        if self._started or not self.path or not os.path.isfile(self.path):
+            return
+        self._started = True
+        try:
+            if IS_WINDOWS:
+                import winsound
+                winsound.PlaySound(
+                    self.path,
+                    winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_LOOP)
+            else:
+                cmd = self._posix_player_cmd()
+                if cmd is None:
+                    return
+                self._thread = threading.Thread(
+                    target=self._loop_posix, args=(cmd,), daemon=True)
+                self._thread.start()
+        except Exception as e:
+            print(f"Warning: could not start ringtone: {e}")
+
+    def stop(self):
+        if not self._started:
+            return
+        self._started = False
+        try:
+            if IS_WINDOWS:
+                import winsound
+                winsound.PlaySound(None, winsound.SND_PURGE)
+            else:
+                self._stop.set()
+                if self._proc is not None:
+                    try:
+                        self._proc.terminate()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
 
 class DialogRunner:
@@ -405,13 +533,21 @@ def create_modern_button(parent, text, command, button_type="primary", theme_col
         bg_color = theme_colors["bg_secondary"]
         fg_color = theme_colors["fg_primary"]
         hover_color = theme_colors["bg_accent"]
-    
+
+    # macOS aqua ignores a tk.Button's `bg`, so the intended colored fill never
+    # shows and white primary text ends up unreadable on the default light
+    # button. Use readable dark/accent text there instead, and tint the button
+    # region via highlightbackground.
+    if IS_MACOS:
+        fg_color = theme_colors["accent_color"] if button_type == "primary" else theme_colors["fg_primary"]
+
     button = tk.Button(
         parent,
         text=text,
         command=command,
         bg=bg_color,
         fg=fg_color,
+        highlightbackground=bg_color,
         font=get_system_font(),
         relief="flat",
         borderwidth=0,
@@ -1181,17 +1317,20 @@ class HumanTaskSession:
     MAX_LIFETIME_SECONDS = 30 * 60  # orphan safety net
 
     def __init__(self, task_id, task_title, task_description, context_note,
-                 client_timeout_seconds, loop):
+                 client_timeout_seconds, loop, max_result_bytes=DEFAULT_MAX_RESULT_BYTES):
         self.task_id = task_id
         self.task_title = task_title
         self.task_description = task_description
         self.context_note = context_note
         self.client_timeout_seconds = client_timeout_seconds
+        self.max_result_bytes = max_result_bytes
         self.loop = loop
         self.updates = asyncio.Queue()
         self.dialog = None
         self.created_at = time.monotonic()
+        self.created_wall = datetime.now()
         self.last_seen = self.created_at
+        self.last_human_action_at = self.created_at  # for follow-up re-notify timing
         self.closed = False
 
     def attach_dialog(self, dialog):
@@ -1212,10 +1351,6 @@ class HumanTaskSession:
         if self.dialog:
             self.dialog.begin_countdown(leg_seconds)
 
-    def enter_waiting_state(self):
-        if self.dialog:
-            self.dialog.enter_waiting_state()
-
     def close(self):
         self.closed = True
         if self.dialog:
@@ -1227,6 +1362,148 @@ class HumanTaskSession:
         # but an abandoned dormant session (window closed, AI never re-called)
         # is eventually reaped.
         return (time.monotonic() - self.last_seen) > self.MAX_LIFETIME_SECONDS
+
+
+class NotificationWindow:
+    """Small, non-focus-stealing top-right toast that rings before the full task
+    window opens. View opens the task window (instantly, on the main thread);
+    Cancel reports the task failed. Participates in the heartbeat/disconnect
+    machinery (``begin_countdown``/``close``) so a ringing orphan can't survive
+    the assistant going away."""
+
+    def __init__(self, parent, session):
+        self.parent = parent
+        self.session = session
+        self.theme_colors = get_theme_colors()
+        self._alive = True
+        self._leg_seconds = None
+        self._last_contact = None
+        self._ui_after = None
+        self.ring = RingPlayer()
+
+        c = self.theme_colors
+        self.win = tk.Toplevel(parent)
+        self.win.title("New task")
+        self.win.resizable(False, False)
+        self.win.configure(bg=c["bg_primary"])
+        w, h = 360, 175
+        try:
+            sw = self.win.winfo_screenwidth()
+        except Exception:
+            sw = 1440
+        self.win.geometry(f"{w}x{h}+{max(0, sw - w - 24)}+24")
+        # Visible above other windows, but DELIBERATELY do NOT steal focus:
+        # no configure_window_for_platform / configure_macos_app / lift / focus_force.
+        try:
+            self.win.attributes("-topmost", True)
+        except Exception:
+            pass
+
+        main = tk.Frame(self.win, bg=c["bg_primary"])
+        main.pack(fill="both", expand=True, padx=16, pady=14)
+
+        tk.Label(main, text="You have a new task", bg=c["bg_primary"],
+                 fg=c["fg_primary"], font=get_title_font(), anchor="w",
+                 justify="left").pack(fill="x", pady=(0, 6))
+
+        title = session.task_title or "(untitled task)"
+        if len(title) > 120:
+            title = title[:117] + "…"
+        tk.Label(main, text=title, bg=c["bg_primary"], fg=c["fg_secondary"],
+                 font=get_system_font(), anchor="w", justify="left",
+                 wraplength=324).pack(fill="x", pady=(0, 4))
+
+        self.status_label = tk.Label(
+            main, text="Ringing… choose View or Cancel.",
+            bg=c["bg_primary"], fg=c["fg_secondary"], font=get_system_font(),
+            anchor="w", justify="left", wraplength=324)
+        self.status_label.pack(fill="x", pady=(0, 10))
+
+        btns = tk.Frame(main, bg=c["bg_primary"])
+        btns.pack(fill="x", side="bottom")
+        create_modern_button(btns, "View", self._on_view, "primary", c).pack(side=tk.RIGHT, padx=(8, 0))
+        create_modern_button(btns, "Cancel", self._on_cancel, "secondary", c).pack(side=tk.RIGHT)
+
+        self.win.protocol("WM_DELETE_WINDOW", self._on_cancel)
+        self.ring.start()
+
+    # participates in the session's leg/disconnect machinery
+    def begin_countdown(self, leg_seconds):
+        self._leg_seconds = max(1, leg_seconds)
+        self._last_contact = time.monotonic()
+        if self._ui_after is None:
+            self._ui_tick()
+
+    def _ui_tick(self):
+        if not self._alive:
+            self._ui_after = None
+            return
+        if self._last_contact is None:
+            self._ui_after = self.win.after(500, self._ui_tick)
+            return
+        over = (time.monotonic() - self._last_contact) - (self._leg_seconds or 1)
+        if over >= AUTO_CLOSE_AFTER_SECONDS:
+            self._disconnect_autoclose()
+            return
+        if over >= DISCONNECT_GRACE_SECONDS:
+            try:
+                self.status_label.config(
+                    text="The assistant may have disconnected - this notification will close soon.",
+                    fg=self.theme_colors.get("error_color", self.theme_colors["fg_secondary"]))
+            except Exception:
+                pass
+        self._ui_after = self.win.after(1000, self._ui_tick)
+
+    def _on_view(self):
+        if not self._alive:
+            return
+        self.ring.stop()
+        # Open the full task window immediately (this runs on the main thread), so
+        # it appears the instant the human clicks - no AI round-trip needed.
+        try:
+            win = HumanTaskDialog(self.parent, self.session)
+            self.session.attach_dialog(win)
+            win.begin_countdown(compute_leg_seconds(self.session.client_timeout_seconds))
+        except Exception as e:
+            print(f"Warning: failed to open task window: {e}")
+        self.close()  # closes the toast; session.dialog now points at the task window
+        self.session.submit_from_ui({"kind": "view"})
+
+    def _on_cancel(self):
+        if not self._alive:
+            return
+        self.ring.stop()
+        self.session.submit_from_ui({"kind": "decline"})
+        self.close()
+
+    def _disconnect_autoclose(self):
+        if not self._alive:
+            return
+        self.ring.stop()
+        self.session.submit_from_ui({"kind": "decline", "reason": "assistant_disconnected"})
+        self.close()
+
+    def close(self):
+        self._alive = False
+        try:
+            self.ring.stop()
+        except Exception:
+            pass
+        if self._ui_after:
+            try:
+                self.win.after_cancel(self._ui_after)
+            except Exception:
+                pass
+            self._ui_after = None
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+        try:
+            if self.session.dialog is self:
+                self.session.dialog = None
+        except Exception:
+            pass
 
 
 class HumanTaskDialog:
@@ -1241,21 +1518,23 @@ class HumanTaskDialog:
         self.theme_colors = get_theme_colors()
         self.attachments = []          # list[str] of chosen file paths
         self._alive = True
-        self._waiting = False
-        self._after_id = None
-        self._deadline = None
+        self._leg_seconds = None       # current wait-leg length
+        self._last_contact = None      # monotonic time of last assistant check-in
+        self._ui_after = None          # recurring liveness/countdown tick id
 
         c = self.theme_colors
+        self._tid8 = session.task_id[:8]
         self.dialog = tk.Toplevel(parent)
-        self.dialog.title(f"Task from assistant — {session.task_title}")
+        self.dialog.title(f"Task from assistant - {session.task_title}  [{self._tid8}]")
         self.dialog.resizable(True, True)
         configure_modern_window(self.dialog)
         if IS_MACOS:
-            self.dialog.geometry("580x640")
+            self.dialog.geometry("580x700")
         elif IS_WINDOWS:
-            self.dialog.geometry("600x660")
+            self.dialog.geometry("600x720")
         else:
-            self.dialog.geometry("560x620")
+            self.dialog.geometry("560x680")
+        self.dialog.minsize(460, 520)
         self._center_window()
 
         main = tk.Frame(self.dialog, bg=c["bg_primary"])
@@ -1268,21 +1547,22 @@ class HumanTaskDialog:
                  fg=c["fg_primary"], font=get_title_font(), anchor="w",
                  justify="left", wraplength=520).grid(row=0, column=0, sticky="ew", pady=(0, 8))
 
-        # Task description (what the AI is asking the human to do)
-        tk.Label(main, text=session.task_description, bg=c["bg_primary"],
-                 fg=c["fg_secondary"], font=get_system_font(), anchor="w",
-                 justify="left", wraplength=520).grid(row=1, column=0, sticky="ew", pady=(0, 6))
-
+        # Task description (what the AI is asking the human to do). A fixed-height,
+        # scrollable, read-only-but-SELECTABLE text box — so a long description
+        # can't push the controls off-screen, and the human can select/copy it.
+        desc = session.task_description or ""
         if session.context_note:
-            tk.Label(main, text=session.context_note, bg=c["bg_primary"],
-                     fg=c["fg_secondary"], font=get_system_font(), anchor="w",
-                     justify="left", wraplength=520).grid(row=2, column=0, sticky="ew", pady=(0, 6))
+            desc = f"{desc}\n\n--- context ---\n{session.context_note}"
+        self._make_readonly_text(main, desc, height=6).grid(
+            row=1, column=0, sticky="ew", pady=(0, 8))
 
-        # Countdown / status banner
+        # Connection/countdown line. Kept as a widget so the liveness/disconnect
+        # watchdog can update it, but hidden by default (debug-only info now).
         self.countdown_label = tk.Label(
             main, text="", bg=c["bg_primary"], fg=c["fg_secondary"],
             font=get_system_font(), anchor="w", justify="left")
-        self.countdown_label.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        if SHOW_CONNECTION_STATUS:
+            self.countdown_label.grid(row=3, column=0, sticky="ew", pady=(0, 10))
 
         # Body ("email body")
         tk.Label(main, text="Your report to the assistant:", bg=c["bg_primary"],
@@ -1322,21 +1602,97 @@ class HumanTaskDialog:
         attach_scroll.grid(row=0, column=1, sticky="ns")
         self.attach_listbox.configure(yscrollcommand=attach_scroll.set)
 
+        # Live submission-size counter (text + attachments vs the client's limit).
+        self.size_label = tk.Label(
+            main, text="", bg=c["bg_primary"], fg=c["fg_secondary"],
+            font=get_system_font(), anchor="w", justify="left")
+        self.size_label.grid(row=8, column=0, sticky="ew", pady=(0, 6))
+
         # Action buttons: Completed / Failed / Still progressing
         button_frame = tk.Frame(main, bg=c["bg_primary"])
-        button_frame.grid(row=8, column=0, sticky="ew")
-        create_modern_button(button_frame, "✅ Completed",
-                             lambda: self._submit("completed", terminal=True),
-                             "primary", self.theme_colors).pack(side=tk.LEFT)
-        create_modern_button(button_frame, "❌ Failed",
-                             lambda: self._submit("failed", terminal=True),
-                             "secondary", self.theme_colors).pack(side=tk.LEFT, padx=(8, 0))
-        create_modern_button(button_frame, "⏳ Still progressing",
-                             lambda: self._submit("in_progress", terminal=False),
-                             "secondary", self.theme_colors).pack(side=tk.RIGHT)
+        button_frame.grid(row=9, column=0, sticky="ew")
+        self.btn_completed = create_modern_button(
+            button_frame, "Completed", lambda: self._submit("completed", terminal=True),
+            "primary", self.theme_colors)
+        self.btn_completed.pack(side=tk.LEFT)
+        self.btn_failed = create_modern_button(
+            button_frame, "Failed", lambda: self._submit("failed", terminal=True),
+            "secondary", self.theme_colors)
+        self.btn_failed.pack(side=tk.LEFT, padx=(8, 0))
+        self.btn_in_progress = create_modern_button(
+            button_frame, "Still progressing", lambda: self._submit("in_progress", terminal=False),
+            "secondary", self.theme_colors)
+        self.btn_in_progress.pack(side=tk.RIGHT)
+        self._submit_buttons = (self.btn_completed, self.btn_failed, self.btn_in_progress)
 
         self.dialog.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.body_text.bind("<KeyRelease>", lambda e: self._update_size_counter())
+        self._update_size_counter()
         self.body_text.focus_set()
+
+    def _update_size_counter(self):
+        """Refresh the size counter and enable/disable the submit buttons based on
+        whether the estimated result fits the client's max_result_bytes budget."""
+        if not self._alive:
+            return
+        limit = self.session.max_result_bytes or DEFAULT_MAX_RESULT_BYTES
+        body = self.body_text.get("1.0", tk.END).strip()
+        est = estimate_result_bytes(body, self.attachments)
+        over = est > limit
+        c = self.theme_colors
+        if over:
+            self.size_label.config(
+                text=(f"Submission size: {_human_bytes(est)} / {_human_bytes(limit)} limit — "
+                      f"too large. Remove attachments or text to submit."),
+                fg=c.get("error_color", c["fg_secondary"]))
+        else:
+            self.size_label.config(
+                text=f"Submission size: {_human_bytes(est)} / {_human_bytes(limit)} limit",
+                fg=c["fg_secondary"])
+        state = "disabled" if over else "normal"
+        for b in self._submit_buttons:
+            try:
+                b.configure(state=state)
+            except Exception:
+                pass
+
+    def _make_readonly_text(self, parent, content, height):
+        """A bounded, scrollable Text that is read-only but still selectable and
+        copyable (Text can't grow unbounded like a Label, and unlike a Label its
+        content can be selected/copied)."""
+        c = self.theme_colors
+        wrap = tk.Frame(parent, bg=c["bg_primary"])
+        wrap.columnconfigure(0, weight=1)
+        wrap.rowconfigure(0, weight=1)
+        txt = tk.Text(wrap, height=height, wrap="word")
+        apply_modern_style(txt, "text", self.theme_colors)
+        txt.configure(fg=c["fg_secondary"])
+        txt.grid(row=0, column=0, sticky="nsew", padx=(0, 2))
+        sb = tk.Scrollbar(wrap, orient="vertical", command=txt.yview)
+        apply_modern_style(sb, "scrollbar", self.theme_colors)
+        sb.grid(row=0, column=1, sticky="ns")
+        txt.configure(yscrollcommand=sb.set)
+        txt.insert("1.0", content or "")
+
+        # Read-only but selectable/copyable: block edits, keep copy & select-all.
+        def _copy(_e):
+            try:
+                txt.clipboard_clear()
+                txt.clipboard_append(txt.get("sel.first", "sel.last"))
+            except tk.TclError:
+                pass
+            return "break"
+
+        def _select_all(_e):
+            txt.tag_add("sel", "1.0", "end-1c")
+            return "break"
+
+        txt.bind("<Key>", lambda e: "break")      # block typing/deletion
+        txt.bind("<Control-c>", _copy)
+        txt.bind("<Command-c>", _copy)            # macOS
+        txt.bind("<Control-a>", _select_all)
+        txt.bind("<Command-a>", _select_all)      # macOS
+        return wrap
 
     # ---------------- attachment handling ---------------- #
     def _add_attachments(self):
@@ -1358,56 +1714,115 @@ class HumanTaskDialog:
     def _refresh_attachments(self):
         self.attach_listbox.delete(0, tk.END)
         for p in self.attachments:
-            self.attach_listbox.insert(tk.END, os.path.basename(p))
+            try:
+                sz = _human_bytes(os.path.getsize(p))
+            except OSError:
+                sz = "?"
+            self.attach_listbox.insert(tk.END, f"{os.path.basename(p)}  ({sz})")
+        self._update_size_counter()
 
-    # ---------------- countdown / banner ---------------- #
+    # ---------------- liveness / countdown / watchdog ---------------- #
     def begin_countdown(self, leg_seconds):
-        self._waiting = False
-        self._deadline = time.monotonic() + max(1, leg_seconds)
-        if self._after_id:
-            try:
-                self.dialog.after_cancel(self._after_id)
-            except Exception:
-                pass
-            self._after_id = None
-        self._tick()
+        """Called each time the assistant checks in (starts a new wait leg).
+        Resets the 'last contact' clock; the single always-on tick renders it."""
+        self._leg_seconds = max(1, leg_seconds)
+        self._last_contact = time.monotonic()
+        if self._ui_after is None:      # start the recurring tick once
+            self._ui_tick()
 
-    def _tick(self):
-        if not self._alive or self._waiting or self._deadline is None:
+    @staticmethod
+    def _fmt(seconds):
+        seconds = max(0, int(seconds))
+        return f"{seconds // 60:d}:{seconds % 60:02d}"
+
+    def _ui_tick(self):
+        """One always-running 1s tick that shows connection liveness, warns
+        before each sync, detects assistant disconnection, and finally auto-saves
+        the draft + closes the window so nothing is ever silently orphaned."""
+        if not self._alive:
+            self._ui_after = None
             return
-        remaining = int(round(self._deadline - time.monotonic()))
-        if remaining < 0:
-            remaining = 0
-        mm, ss = divmod(remaining, 60)
-        if remaining <= self.WARN_SECONDS:
-            self.countdown_label.config(
-                text=f"⏳ Syncing with assistant in {mm:d}:{ss:02d} — you can pause for a moment (your work is saved).",
-                fg=self.theme_colors.get("error_color", self.theme_colors["fg_secondary"]))
-        else:
-            self.countdown_label.config(
-                text=f"⏳ {mm:d}:{ss:02d} until the assistant checks in (this window stays open).",
-                fg=self.theme_colors["fg_secondary"])
-        if remaining <= 0:
-            return  # tool will flip us into the waiting state
-        self._after_id = self.dialog.after(250, self._tick)
+        if self._last_contact is None:
+            self._ui_after = self.dialog.after(500, self._ui_tick)
+            return
 
-    def enter_waiting_state(self):
-        self._waiting = True
-        if self._after_id:
-            try:
-                self.dialog.after_cancel(self._after_id)
-            except Exception:
-                pass
-            self._after_id = None
-        if self._alive:
+        idle = time.monotonic() - self._last_contact
+        leg = self._leg_seconds or 1
+        remaining = leg - idle
+        opened = self.session.created_wall.strftime("%H:%M:%S")
+        c = self.theme_colors
+        warn_c = c.get("error_color", c["fg_secondary"])
+
+        if remaining > self.WARN_SECONDS:
             self.countdown_label.config(
-                text="🔄 Reconnecting to assistant… (keep working — nothing is lost)",
-                fg=self.theme_colors["fg_secondary"])
+                text=f"Assistant connected · next check-in in {self._fmt(remaining)}   "
+                     f"(task {self._tid8} · opened {opened})",
+                fg=c["fg_secondary"])
+        elif remaining > 0:
+            self.countdown_label.config(
+                text=f"Syncing shortly - you may pause a moment; your work is saved.   "
+                     f"(task {self._tid8})",
+                fg=c["fg_secondary"])
+        else:
+            over = idle - leg
+            if over < DISCONNECT_GRACE_SECONDS:
+                self.countdown_label.config(
+                    text=f"Waiting for the assistant to check in…   (task {self._tid8})",
+                    fg=c["fg_secondary"])
+            elif over < AUTO_CLOSE_AFTER_SECONDS:
+                left = AUTO_CLOSE_AFTER_SECONDS - over
+                self.countdown_label.config(
+                    text=(f"The assistant may have disconnected (silent {int(idle)}s). "
+                          f"Your work is safe - this window will auto-save & close in {self._fmt(left)} "
+                          f"if it stays silent."),
+                    fg=warn_c)
+            else:
+                self._autosave_and_close()
+                return
+        self._ui_after = self.dialog.after(1000, self._ui_tick)
+
+    def _autosave_and_close(self):
+        """Assistant went silent for too long: archive whatever the human drafted
+        (so it's never lost) and close the orphaned window."""
+        if not self._alive:
+            return
+        body = self.body_text.get("1.0", tk.END).strip()
+        paths = list(self.attachments)
+        archived = None
+        try:
+            if body or paths:
+                archived = archive_to_outbox(
+                    {
+                        "task_id": self.session.task_id,
+                        "status": "disconnected_autosave",
+                        "human_action": False,
+                        "task_title": self.session.task_title,
+                        "task_description": self.session.task_description,
+                        "context_note": self.session.context_note,
+                        "client_timeout_seconds": self.session.client_timeout_seconds,
+                        "body": body,
+                    },
+                    paths,
+                )
+        except Exception:
+            pass
+        # Deliver a terminal result so any awaiting (or future) tool call cleans up.
+        self.session.submit_from_ui({
+            "status": "cancelled",
+            "human_action": False,
+            "reason": "assistant_disconnected",
+            "body": body,
+            "attachment_paths": paths,
+            "terminal": True,
+            "already_archived": True,
+            "archived_dir": archived,
+        })
+        self.close()
 
     # ---------------- submit / close ---------------- #
     def _submit(self, status, terminal):
         """Any submit action (Completed/Failed/Still-progressing) is one complete
-        'email'. It always CLOSES the window — the window's lifecycle is exactly
+        'email'. It always CLOSES the window - the window's lifecycle is exactly
         one submission. The only difference between statuses is whether the task
         is terminated (`terminal`), not whether the window stays open."""
         if not self._alive:
@@ -1421,7 +1836,20 @@ class HumanTaskDialog:
                 messagebox.showwarning(
                     "Nothing to send",
                     "Type a note or attach a file before sending an interim update.\n\n"
-                    "Use ✅ Completed or ❌ Failed to finish the task instead.",
+                    "Use Completed or Failed to finish the task instead.",
+                    parent=self.dialog)
+            except Exception:
+                pass
+            return
+        # Defensive: buttons are disabled when over budget, but never send an
+        # over-limit submission (the client would reject it).
+        limit = self.session.max_result_bytes or DEFAULT_MAX_RESULT_BYTES
+        if estimate_result_bytes(body, paths) > limit:
+            try:
+                messagebox.showwarning(
+                    "Submission too large",
+                    f"This submission is larger than the {_human_bytes(limit)} limit.\n\n"
+                    "Remove attachments or shorten your note, then submit.",
                     parent=self.dialog)
             except Exception:
                 pass
@@ -1451,12 +1879,12 @@ class HumanTaskDialog:
 
     def close(self):
         self._alive = False
-        if self._after_id:
+        if self._ui_after:
             try:
-                self.dialog.after_cancel(self._after_id)
+                self.dialog.after_cancel(self._ui_after)
             except Exception:
                 pass
-            self._after_id = None
+            self._ui_after = None
         try:
             self.dialog.destroy()
         except Exception:
@@ -1490,49 +1918,70 @@ def _build_submission_result(session, payload, needs_continuation, archived_dir)
 
     Returns ``[summary_text, *Image(...), *File(...)]``. Images the model can see;
     other files come back as embedded resources. Oversized attachments are not
-    inlined — they are referenced by path (and are safe in the outbox archive).
+    inlined - they are referenced by path (and are safe in the outbox archive).
     """
     status = payload.get("status", "in_progress")
     body = payload.get("body", "")
     paths = payload.get("attachment_paths", []) or []
 
-    images, files, manifest, inlined_total = [], [], [], 0
+    # Hard cap the encoded result to the client's budget so it can NEVER be
+    # rejected as "too large" (which would lose the deliverable). Anything that
+    # doesn't fit is referenced by path instead of inlined; it is still safe in
+    # the outbox archive, and the AI can request a smaller re-submission.
+    limit = getattr(session, "max_result_bytes", DEFAULT_MAX_RESULT_BYTES) or DEFAULT_MAX_RESULT_BYTES
+    encoded_budget = max(0, limit - RESULT_OVERHEAD_BYTES - len((body or "").encode("utf-8")))
+
+    images, files, manifest, encoded_used, any_omitted = [], [], [], 0, False
     for p in paths:
         name = os.path.basename(p)
         try:
             size = os.path.getsize(p)
+            enc = _b64_len(size) + 256
             mime = mimetypes.guess_type(p)[0] or "application/octet-stream"
             ext = os.path.splitext(p)[1].lower()
             is_image = ext in IMAGE_EXTENSIONS or mime.startswith("image/")
             entry = {"name": name, "size_bytes": size, "mime": mime, "inlined": False}
-            if size <= MAX_INLINE_FILE_BYTES and (inlined_total + size) <= MAX_INLINE_TOTAL_BYTES:
+            if size <= MAX_INLINE_FILE_BYTES and (encoded_used + enc) <= encoded_budget:
                 if is_image:
                     images.append(Image(path=p))
                 else:
                     files.append(File(path=p, name=name))
                 entry["inlined"] = True
-                inlined_total += size
+                encoded_used += enc
             else:
+                any_omitted = True
                 entry["path_reference"] = p
-                entry["note"] = "too large to inline; saved in the outbox archive"
+                entry["note"] = ("omitted from the result to stay under max_result_bytes; "
+                                 "the full file is saved in the outbox archive")
             manifest.append(entry)
         except Exception as e:
             manifest.append({"name": name, "error": str(e)})
 
+    disconnected = payload.get("reason") == "assistant_disconnected"
+    resubmittable = status in ("completed", "failed")
     summary = {
         "status": status,
         "task_id": session.task_id,
-        "human_action": True,
+        "human_action": payload.get("human_action", True),
         "needs_continuation": needs_continuation,
+        "resubmittable": resubmittable,
         "task_title": session.task_title,
         "body": body,
         "attachments": manifest,
+        "attachments_omitted_for_size": any_omitted,
         "outbox_entry": archived_dir,
         "platform": CURRENT_PLATFORM,
     }
+    if payload.get("reason"):
+        summary["reason"] = payload["reason"]
+
+    review = (" Review the deliverable. The session is kept open for review: if it is insufficient "
+              "(or an attachment was omitted for size — see attachments_omitted_for_size), you MAY call "
+              "assign_task_to_human again with the SAME task_id and an updated task_description (e.g. "
+              "asking for a smaller attachment) to request a re-submission. If satisfied, you are done.")
     headers = {
-        "completed": "The human reports the task is COMPLETED.",
-        "failed": "The human reports the task FAILED.",
+        "completed": "The human reports the task is COMPLETED." + review,
+        "failed": "The human reports the task FAILED." + review,
         "in_progress": ("The human sent an INTERIM update and the task window has CLOSED; the task is "
                         "NOT finished. Process this update (they may be asking or discussing something). "
                         "YOU decide the next step: if the human should keep working, call "
@@ -1540,8 +1989,11 @@ def _build_submission_result(session, payload, needs_continuation, archived_dir)
                         "(optionally put your reply to them in context_note); otherwise finish normally."),
         "cancelled": "The human DISMISSED / cancelled the task dialog.",
     }
-    summary_text = headers.get(status, "Human submission.") + "\n\n" + json.dumps(
-        summary, ensure_ascii=False, indent=2)
+    header = headers.get(status, "Human submission.")
+    if disconnected:
+        header = ("The task window auto-closed because it detected the assistant had stopped checking in. "
+                  "Any draft the human had typed was auto-saved to the outbox and is included below.")
+    summary_text = header + "\n\n" + json.dumps(summary, ensure_ascii=False, indent=2)
     return [summary_text, *images, *files]
 
 
@@ -1549,8 +2001,9 @@ def _build_submission_result(session, payload, needs_continuation, archived_dir)
 async def assign_task_to_human(
     task_title: Annotated[str, Field(description="Short title of the task you are asking the human to perform")],
     task_description: Annotated[str, Field(description="Detailed instructions/description of the task for the human")],
-    task_id: Annotated[Optional[str], Field(description="Leave empty to START a new task. To CONTINUE an existing task (after a 'heartbeat' response or an 'in_progress' update), pass back the task_id from the previous call — this revives the same open window without losing the human's work.")] = None,
+    task_id: Annotated[Optional[str], Field(description="Leave empty to START a new task. To CONTINUE an existing task (after a 'heartbeat' response or an 'in_progress' update), pass back the task_id from the previous call - this revives the same open window without losing the human's work.")] = None,
     client_timeout_seconds: Annotated[int, Field(description="YOUR OWN per-tool-call timeout, in seconds. Claude Desktop hardcodes ~240s, so pass 240. Claude Code has no timeout, so pass a large value like 3600. The server returns a 'heartbeat' response safely before this deadline so you can immediately re-call and keep the human's dialog alive.")] = 240,
+    max_result_bytes: Annotated[int, Field(description="YOUR CLIENT'S max tool-result size, in BYTES. Claude Desktop rejects results over ~1000000 (1 MB), so pass 1000000. Claude Code allows much larger, configurable results — pass a big value (e.g. 30000000). The human sees a live size counter and cannot submit text+attachments whose encoded size would exceed this, so a large deliverable is never rejected/lost.")] = DEFAULT_MAX_RESULT_BYTES,
     context_note: Annotated[str, Field(description="Optional extra context to show the human in the dialog")] = "",
     ctx: Context = None,
 ) -> Any:
@@ -1559,7 +2012,13 @@ async def assign_task_to_human(
     report back Completed / Failed / Still-progressing, optionally with a written note
     and file/image attachments.
 
-    IMPORTANT — window lifecycle & heartbeat protocol (read carefully):
+    IMPORTANT - window lifecycle & heartbeat protocol (read carefully):
+    - The flow starts with a small, non-focus-stealing notification toast that RINGS in the
+      corner (it does not interrupt the human's current work). They click View to open the
+      task window, or Cancel to decline.
+    - `status: "opened"` (human_action=false): the human clicked View and the task window is
+      now open. Like a heartbeat - do NOT respond to the user; just call again with the same
+      `task_id` to keep waiting for their report.
     - One window == one submission. Whenever the human clicks a button
       (Completed / Failed / Still-progressing), the window CLOSES and you receive their
       note + attachments. The ONLY difference between the buttons is whether the task is
@@ -1567,15 +2026,26 @@ async def assign_task_to_human(
     - Always pass `client_timeout_seconds` (your own per-call timeout). The server returns
       BEFORE that deadline so your client doesn't kill the call.
     - `status: "heartbeat"` (human_action=false): the human has NOT submitted anything yet.
-      Do NOT reply to the user and do NOT reason about the task — just call this tool AGAIN
+      Do NOT reply to the user and do NOT reason about the task - just call this tool AGAIN
       immediately with the SAME `task_id`. Pure keepalive; the SAME window stays open with
       their work intact (a countdown warns them a few seconds before each sync).
     - `status: "in_progress"` (human_action=true): the human sent an interim update and the
       window has CLOSED; the task is not finished. Process the update, then DECIDE: to let
       them keep working, call again with the SAME `task_id` to reopen a fresh window
       (optionally reply via `context_note`); otherwise just finish.
-    - `status: "completed"` / `"failed"` / `"cancelled"`: terminal (needs_continuation
-      false); the task_id is gone.
+    - `status: "completed"` / `"failed"` (human_action=true): the human's report. These are
+      NOT immediately destroyed — the session is kept open for your REVIEW (`resubmittable:
+      true`). If the deliverable is insufficient, or `attachments_omitted_for_size` is true
+      (an attachment was too big to inline under `max_result_bytes` and was referenced by
+      path / saved to the outbox), you MAY call again with the SAME `task_id` and an updated
+      `task_description` (e.g. "please attach a smaller photo") to request a re-submission.
+      If satisfied, simply stop — the session is reaped automatically.
+    - `status: "cancelled"`: terminal. With `reason: "declined_via_notification"` the human
+      clicked Cancel on the notification; with `reason: "assistant_disconnected"` the window
+      auto-closed after you went silent (any draft is auto-saved and included).
+    - Pass `max_result_bytes` = your client's max tool-result size. The human sees a live size
+      counter and cannot submit anything whose encoded size would exceed it, and the server
+      hard-caps the result to that budget — so a deliverable is never rejected as "too large".
     - Every human submission (note + attachments + your command) is also archived to a
       local "outbox" that can be browsed later with the standalone outbox.py viewer.
     """
@@ -1592,7 +2062,7 @@ async def assign_task_to_human(
             }
 
         loop = asyncio.get_running_loop()
-        leg_seconds = max(MIN_LEG_SECONDS, int(client_timeout_seconds) - HEARTBEAT_SAFETY_MARGIN)
+        leg_seconds = compute_leg_seconds(client_timeout_seconds)
 
         # Reap abandoned/dormant sessions (window closed, AI never re-called).
         for sid, sess in list(_task_sessions.items()):
@@ -1613,31 +2083,47 @@ async def assign_task_to_human(
             }
 
         if session is None:
-            # Brand-new task: create the session and open a fresh window.
+            # Brand-new task: create the session and RING a non-focus-stealing
+            # notification toast first (don't rudely pop the full window).
             new_id = uuid.uuid4().hex[:12]
             session = HumanTaskSession(
-                new_id, task_title, task_description, context_note, client_timeout_seconds, loop)
+                new_id, task_title, task_description, context_note, client_timeout_seconds, loop,
+                max_result_bytes=max_result_bytes)
             await _dialog_runner.run_dialog(
-                lambda root: session.attach_dialog(HumanTaskDialog(root, session)), timeout=30)
+                lambda root: session.attach_dialog(NotificationWindow(root, session)), timeout=30)
             _task_sessions[new_id] = session
             if ctx:
-                await ctx.info(f"Opened human task dialog (task_id={new_id})")
-        elif session.dialog is None:
+                await ctx.info(f"Notified human of new task (task_id={new_id})")
+        elif session.dialog is None and session.updates.empty():
             # Continuation of an existing task whose window closed after a prior
-            # interim ("in_progress") submission — reopen a fresh window. Carry
-            # over the latest command/description/context so the human sees the
-            # assistant's follow-up.
+            # interim ("in_progress") submission. Carry over the latest
+            # command/description/context. If a lot of time has passed since the
+            # human last acted, treat it as a "follow-up" and ring the toast
+            # again; if the assistant is re-engaging quickly, reopen directly.
             session.task_title = task_title
             session.task_description = task_description
             session.context_note = context_note
             session.client_timeout_seconds = client_timeout_seconds
-            await _dialog_runner.run_dialog(
-                lambda root: session.attach_dialog(HumanTaskDialog(root, session)), timeout=30)
-            if ctx:
-                await ctx.info(f"Reopened human task dialog (task_id={session.task_id})")
+            session.max_result_bytes = max_result_bytes
+            idle = time.monotonic() - session.last_human_action_at
+            if idle > FOLLOW_UP_NOTIFY_AFTER_SECONDS:
+                await _dialog_runner.run_dialog(
+                    lambda root: session.attach_dialog(NotificationWindow(root, session)), timeout=30)
+                if ctx:
+                    await ctx.info(f"Follow-up: re-notified human (task_id={session.task_id}, idle={int(idle)}s)")
+            else:
+                await _dialog_runner.run_dialog(
+                    lambda root: session.attach_dialog(HumanTaskDialog(root, session)), timeout=30)
+                if ctx:
+                    await ctx.info(f"Reopened human task dialog (task_id={session.task_id})")
+        # else (session.dialog is None but a payload is already buffered): the
+        # window auto-closed after the assistant went silent; deliver that
+        # buffered result below instead of reopening a window.
 
-        # Start / refresh this leg's countdown on the main thread.
-        _dialog_runner.submit(lambda root: session.begin_leg(leg_seconds))
+        # Start / refresh this leg's countdown on the main thread (only if a
+        # window is actually open).
+        if session.dialog is not None:
+            _dialog_runner.submit(lambda root: session.begin_leg(leg_seconds))
 
         # Await a human submission OR the heartbeat deadline.
         try:
@@ -1654,7 +2140,6 @@ async def assign_task_to_human(
                     "message": "The human task dialog exceeded its max lifetime and was closed.",
                     "platform": CURRENT_PLATFORM,
                 }
-            _dialog_runner.submit(lambda root: session.enter_waiting_state())
             if ctx:
                 await ctx.debug(f"Heartbeat (no human action yet) for task_id={session.task_id}")
             return {
@@ -1663,23 +2148,63 @@ async def assign_task_to_human(
                 "human_action": False,
                 "needs_continuation": True,
                 "task_id": session.task_id,
-                "message": ("Keepalive only — the human has not submitted anything yet. Do NOT respond to "
+                "message": ("Keepalive only - the human has not submitted anything yet. Do NOT respond to "
                             "the user or reason about task content. Immediately call assign_task_to_human "
                             "again with the same task_id to keep the dialog alive."),
                 "platform": CURRENT_PLATFORM,
             }
 
-        # A human submission arrived.
+        # --- Notification-toast events (before the task window is involved) --- #
+        kind = payload.get("kind")
+        if kind == "view":
+            # The human clicked "View" - the toast handler already opened the full
+            # task window instantly. Keep waiting for their actual report.
+            if ctx:
+                await ctx.info(f"Human opened the task window (task_id={session.task_id})")
+            return {
+                "success": True,
+                "status": "opened",
+                "human_action": False,
+                "needs_continuation": True,
+                "task_id": session.task_id,
+                "message": ("The human opened the task window. Keep waiting - call assign_task_to_human "
+                            "again with the same task_id and do NOT respond to the user in the meantime."),
+                "platform": CURRENT_PLATFORM,
+            }
+        if kind == "decline":
+            # The human clicked "Cancel" on the notification (or it auto-closed on
+            # disconnect) - treat the task as failed.
+            session.dialog = None
+            _task_sessions.pop(session.task_id, None)
+            declined_disconnect = payload.get("reason") == "assistant_disconnected"
+            if ctx:
+                await ctx.info(f"Human declined the task via notification (task_id={session.task_id})")
+            return {
+                "success": True,
+                "status": "failed",
+                "human_action": not declined_disconnect,
+                "needs_continuation": False,
+                "task_id": session.task_id,
+                "reason": payload.get("reason", "declined_via_notification"),
+                "message": ("The human declined the task from the notification popup; treat the task as FAILED."
+                            if not declined_disconnect else
+                            "The notification auto-closed because you had gone silent; the task was not accepted."),
+                "platform": CURRENT_PLATFORM,
+            }
+
+        # A submission arrived (human action, or an auto-save from a disconnected window).
         status = payload.get("status", "in_progress")
         terminal = payload.get("terminal", status in ("completed", "failed", "cancelled"))
 
-        archived_dir = None
-        if payload.get("body") or payload.get("attachment_paths"):
+        if payload.get("already_archived"):
+            # The dialog auto-saved the draft itself (disconnect watchdog).
+            archived_dir = payload.get("archived_dir")
+        elif payload.get("body") or payload.get("attachment_paths"):
             archived_dir = archive_to_outbox(
                 {
                     "task_id": session.task_id,
                     "status": status,
-                    "human_action": True,
+                    "human_action": payload.get("human_action", True),
                     "task_title": session.task_title,
                     "task_description": session.task_description,
                     "context_note": session.context_note,
@@ -1688,6 +2213,8 @@ async def assign_task_to_human(
                 },
                 payload.get("attachment_paths", []),
             )
+        else:
+            archived_dir = None
 
         if ctx:
             await ctx.info(f"Human submission: status={status}, task_id={session.task_id}, "
@@ -1696,8 +2223,19 @@ async def assign_task_to_human(
         # The dialog closed itself on submit (one window == one submission).
         session.dialog = None
         session.last_seen = time.monotonic()
+        if payload.get("human_action", True):
+            session.last_human_action_at = session.last_seen
+
+        if status in ("completed", "failed"):
+            # Do NOT destroy the session yet — keep it dormant for AI review. If
+            # the deliverable is insufficient (or the client rejected the result,
+            # or an attachment was omitted for size), the assistant can re-call
+            # with the same task_id + updated task_description to request a
+            # re-submission. Abandoned sessions are reaped by is_expired.
+            return _build_submission_result(session, payload, needs_continuation=False, archived_dir=archived_dir)
 
         if terminal:
+            # cancelled / declined / disconnected — genuinely terminal.
             _task_sessions.pop(session.task_id, None)
             return _build_submission_result(session, payload, needs_continuation=False, archived_dir=archived_dir)
 
@@ -2039,7 +2577,7 @@ You have access to Human-in-the-Loop tools that allow you to interact directly w
 - `get_multiline_input` - Long-form text (descriptions, code, documents)
 - `show_confirmation_dialog` - Yes/No decisions (confirmations, approvals)
 - `show_info_message` - Status updates and notifications
-- `assign_task_to_human` - Delegate a real-world task and wait (long-running) for the human to report Completed/Failed/Still-progressing with an optional note and file/image attachments. Uses a heartbeat protocol: always pass your own `client_timeout_seconds`, and when you get `status: "heartbeat"` re-call with the same `task_id` (do not respond to the user in between). Submissions are archived to a local outbox.
+- `assign_task_to_human` - Delegate a real-world task and wait (long-running) for the human to report Completed/Failed/Still-progressing with an optional note and file/image attachments. It first shows a non-focus-stealing ringing notification (View/Cancel). Uses a heartbeat protocol: always pass your own `client_timeout_seconds` and `max_result_bytes` (your client's tool-result size limit, e.g. 1000000 for Claude Desktop); when you get `status: "heartbeat"` or `status: "opened"` re-call with the same `task_id` (do not respond to the user in between). Completed/failed keep the session open for your review — re-call with the same `task_id` and updated `task_description` to request a re-submission (e.g. a smaller attachment). Cancel on the notification returns `status: "failed"`. Submissions are archived to a local outbox.
 
 **BEST PRACTICES:**
 - Ask specific, clear questions with context
@@ -2197,7 +2735,7 @@ def main():
 
     # The MCP server runs on a background thread while tkinter owns the main
     # thread. tkinter/macOS AppKit require all windows to be created on the
-    # process's main (first) thread, so the server never touches Tk directly —
+    # process's main (first) thread, so the server never touches Tk directly -
     # it submits dialog requests to the DialogRunner, which builds them here.
     def _serve():
         try:
