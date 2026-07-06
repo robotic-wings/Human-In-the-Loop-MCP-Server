@@ -13,6 +13,7 @@ import json
 import mimetypes
 import platform
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -82,6 +83,33 @@ def _human_bytes(n):
         if n < 1024 or unit == "GB":
             return f"{int(n)} B" if unit == "B" else f"{n:.1f} {unit}"
         n /= 1024
+
+
+# Non-blocking heuristics that flag a task_description likely misusing the tool
+# (a composite/multi-step order, a list of questions, or a chat-message dump).
+COMPOSITE_TASK_CHAR_LIMIT = 400
+
+
+def composite_task_advisory(task_description):
+    """Return a short advisory string if the description looks like it is NOT a
+    single atomic action, else None. Purely advisory — never blocks."""
+    text = task_description or ""
+    reasons = []
+    if len(re.findall(r"(?m)^\s*(?:\d+[.)]|[-*•])\s+\S", text)) >= 2:
+        reasons.append("it reads as a numbered/bulleted list of several steps")
+    if (text.count("?") + text.count("？")) >= 2:
+        reasons.append("it contains multiple questions")
+    if len(text) > COMPOSITE_TASK_CHAR_LIMIT:
+        reasons.append("it is long for a single instruction")
+    if not reasons:
+        return None
+    return (
+        "Heads up: this task_description may be misusing assign_task_to_human (" +
+        "; ".join(reasons) + "). This tool is for ONE indivisible physical action whose "
+        "report is a completion status. If you are asking a question, use get_user_input / "
+        "get_multiline_input / get_user_choice instead. If this is several steps, assign "
+        "them as separate sequential tasks, adjusting each from the previous report."
+    )
 
 # Heartbeat / continuation tuning (seconds).
 HEARTBEAT_SAFETY_MARGIN = 30       # max seconds shaved off the client's timeout
@@ -1331,6 +1359,7 @@ class HumanTaskSession:
         self.created_wall = datetime.now()
         self.last_seen = self.created_at
         self.last_human_action_at = self.created_at  # for follow-up re-notify timing
+        self.advisory = None  # non-blocking hint if the description looks misused
         self.closed = False
 
     def attach_dialog(self, dialog):
@@ -1974,6 +2003,8 @@ def _build_submission_result(session, payload, needs_continuation, archived_dir)
     }
     if payload.get("reason"):
         summary["reason"] = payload["reason"]
+    if getattr(session, "advisory", None):
+        summary["advisory"] = session.advisory
 
     review = (" Review the deliverable. The session is kept open for review: if it is insufficient "
               "(or an attachment was omitted for size — see attachments_omitted_for_size), you MAY call "
@@ -1999,8 +2030,8 @@ def _build_submission_result(session, payload, needs_continuation, archived_dir)
 
 @mcp.tool()
 async def assign_task_to_human(
-    task_title: Annotated[str, Field(description="Short title of the task you are asking the human to perform")],
-    task_description: Annotated[str, Field(description="Detailed instructions/description of the task for the human")],
+    task_title: Annotated[str, Field(description="Short imperative title of the ONE action (e.g. 'Photograph the north wall'). Not a question.")],
+    task_description: Annotated[str, Field(description="A SINGLE, atomic, actionable instruction for one physical-world action. This is a work order, not a chat message: NOT a question, NOT a list of multiple steps, NOT background+questions+a to-do list. If the work has several steps, assign them as separate sequential tasks instead.")],
     task_id: Annotated[Optional[str], Field(description="Leave empty to START a new task. To CONTINUE an existing task (after a 'heartbeat' response or an 'in_progress' update), pass back the task_id from the previous call - this revives the same open window without losing the human's work.")] = None,
     client_timeout_seconds: Annotated[int, Field(description="YOUR OWN per-tool-call timeout, in seconds. Claude Desktop hardcodes ~240s, so pass 240. Claude Code has no timeout, so pass a large value like 3600. The server returns a 'heartbeat' response safely before this deadline so you can immediately re-call and keep the human's dialog alive.")] = 240,
     max_result_bytes: Annotated[int, Field(description="YOUR CLIENT'S max tool-result size, in BYTES. Claude Desktop rejects results over ~1000000 (1 MB), so pass 1000000. Claude Code allows much larger, configurable results — pass a big value (e.g. 30000000). The human sees a live size counter and cannot submit text+attachments whose encoded size would exceed this, so a large deliverable is never rejected/lost.")] = DEFAULT_MAX_RESULT_BYTES,
@@ -2008,9 +2039,22 @@ async def assign_task_to_human(
     ctx: Context = None,
 ) -> Any:
     """
-    Delegate a real-world task to a human and wait (possibly a long time) for them to
-    report back Completed / Failed / Still-progressing, optionally with a written note
-    and file/image attachments.
+    Delegate ONE atomic physical-world ACTION to a human and wait for their report of
+    whether it was done (with an optional note and file/image attachments).
+
+    SCOPE — use this tool ONLY for a single concrete real-world action, and read these
+    three rules; they are the most common ways this tool is misused:
+      1. NOT for questions / information requests. Do NOT use assign_task_to_human to ask
+         the human anything (a date, a status, a preference, a fact). Its report describes
+         TASK EXECUTION, not answers to your questions. To ask, use `get_user_input`,
+         `get_multiline_input`, or `get_user_choice` instead.
+      2. ONE atomic, indivisible action per task. Do NOT bundle multiple steps (e.g.
+         "survey the site AND take photos AND check the soil AND count inventory") into one
+         call. Assign steps as SEPARATE sequential tasks, adjusting each based on the
+         previous report — step-by-step direction is the whole point of this tool.
+      3. A work order, not a chat message. Keep `task_description` to a single actionable
+         instruction. Dumping background + several questions + a checklist defeats the
+         structured task→execution→report loop and is equivalent to sending a chat message.
 
     IMPORTANT - window lifecycle & heartbeat protocol (read carefully):
     - The flow starts with a small, non-focus-stealing notification toast that RINGS in the
@@ -2089,6 +2133,7 @@ async def assign_task_to_human(
             session = HumanTaskSession(
                 new_id, task_title, task_description, context_note, client_timeout_seconds, loop,
                 max_result_bytes=max_result_bytes)
+            session.advisory = composite_task_advisory(task_description)
             await _dialog_runner.run_dialog(
                 lambda root: session.attach_dialog(NotificationWindow(root, session)), timeout=30)
             _task_sessions[new_id] = session
@@ -2105,6 +2150,7 @@ async def assign_task_to_human(
             session.context_note = context_note
             session.client_timeout_seconds = client_timeout_seconds
             session.max_result_bytes = max_result_bytes
+            session.advisory = composite_task_advisory(task_description)
             idle = time.monotonic() - session.last_human_action_at
             if idle > FOLLOW_UP_NOTIFY_AFTER_SECONDS:
                 await _dialog_runner.run_dialog(
@@ -2142,7 +2188,7 @@ async def assign_task_to_human(
                 }
             if ctx:
                 await ctx.debug(f"Heartbeat (no human action yet) for task_id={session.task_id}")
-            return {
+            resp = {
                 "success": True,
                 "status": "heartbeat",
                 "human_action": False,
@@ -2153,6 +2199,9 @@ async def assign_task_to_human(
                             "again with the same task_id to keep the dialog alive."),
                 "platform": CURRENT_PLATFORM,
             }
+            if session.advisory:
+                resp["advisory"] = session.advisory
+            return resp
 
         # --- Notification-toast events (before the task window is involved) --- #
         kind = payload.get("kind")
@@ -2161,7 +2210,7 @@ async def assign_task_to_human(
             # task window instantly. Keep waiting for their actual report.
             if ctx:
                 await ctx.info(f"Human opened the task window (task_id={session.task_id})")
-            return {
+            resp = {
                 "success": True,
                 "status": "opened",
                 "human_action": False,
@@ -2171,6 +2220,9 @@ async def assign_task_to_human(
                             "again with the same task_id and do NOT respond to the user in the meantime."),
                 "platform": CURRENT_PLATFORM,
             }
+            if session.advisory:
+                resp["advisory"] = session.advisory
+            return resp
         if kind == "decline":
             # The human clicked "Cancel" on the notification (or it auto-closed on
             # disconnect) - treat the task as failed.
@@ -2577,7 +2629,7 @@ You have access to Human-in-the-Loop tools that allow you to interact directly w
 - `get_multiline_input` - Long-form text (descriptions, code, documents)
 - `show_confirmation_dialog` - Yes/No decisions (confirmations, approvals)
 - `show_info_message` - Status updates and notifications
-- `assign_task_to_human` - Delegate a real-world task and wait (long-running) for the human to report Completed/Failed/Still-progressing with an optional note and file/image attachments. It first shows a non-focus-stealing ringing notification (View/Cancel). Uses a heartbeat protocol: always pass your own `client_timeout_seconds` and `max_result_bytes` (your client's tool-result size limit, e.g. 1000000 for Claude Desktop); when you get `status: "heartbeat"` or `status: "opened"` re-call with the same `task_id` (do not respond to the user in between). Completed/failed keep the session open for your review — re-call with the same `task_id` and updated `task_description` to request a re-submission (e.g. a smaller attachment). Cancel on the notification returns `status: "failed"`. Submissions are archived to a local outbox.
+- `assign_task_to_human` - Delegate ONE atomic physical-world ACTION and wait (long-running) for the human to report Completed/Failed/Still-progressing with an optional note and file/image attachments. Its report describes task execution, so: do NOT use it to ask questions or request information (use the input/choice tools for that), do NOT bundle multiple steps into one task (assign them as separate sequential tasks, adjusting each from the previous report), and keep `task_description` to a single actionable instruction (it's a work order, not a chat message). It first shows a non-focus-stealing ringing notification (View/Cancel). Uses a heartbeat protocol: always pass your own `client_timeout_seconds` and `max_result_bytes` (your client's tool-result size limit, e.g. 1000000 for Claude Desktop); when you get `status: "heartbeat"` or `status: "opened"` re-call with the same `task_id` (do not respond to the user in between). Completed/failed keep the session open for your review — re-call with the same `task_id` and updated `task_description` to request a re-submission (e.g. a smaller attachment). Cancel on the notification returns `status: "failed"`. Submissions are archived to a local outbox.
 
 **BEST PRACTICES:**
 - Ask specific, clear questions with context
@@ -2615,10 +2667,13 @@ You have access to Human-in-the-Loop tools that allow you to interact directly w
 
 ASK YOURSELF:
 1. Is this decision subjective or preference-based? → USE CHOICE DIALOG
-2. Do I need specific information not provided? → USE INPUT DIALOG  
+2. Do I need specific information not provided? → USE INPUT DIALOG
 3. Could this action cause problems if wrong? → USE CONFIRMATION DIALOG
 4. Is this a long process the user should know about? → USE INFO MESSAGE
 5. Do I need detailed explanation or content? → USE MULTILINE INPUT
+6. Do I need the human to physically DO something in the real world (one action)? → USE assign_task_to_human
+   - Asking a question is NOT a task — use the input/choice tools.
+   - Several steps are NOT one task — assign them one at a time, sequentially.
 
 AVOID OVERUSE:
 - Don't ask for information already provided

@@ -218,7 +218,14 @@ result = await show_info_message(
 ```
 
 ### 6. `assign_task_to_human`
-Delegate a real-world task to a human and wait — potentially for a long time — for them to report back, optionally with a written note and file/image attachments.
+Delegate **one atomic physical-world action** to a human and wait — potentially for a long time — for them to report back, optionally with a written note and file/image attachments.
+
+**Scope — what this tool is (and is NOT) for.** The human's report describes *task execution*, so:
+- **Not for questions / information.** Don't use it to ask the human anything (a date, a status, a preference) — use `get_user_input` / `get_multiline_input` / `get_user_choice`. The report is a completion status, not an answer.
+- **One atomic action per task.** Don't bundle multiple steps ("survey AND photograph AND check soil") into one call — assign them as separate sequential tasks, adjusting each from the previous report (step-by-step direction is the point).
+- **A work order, not a chat message.** Keep `task_description` to a single actionable instruction, not background + questions + a checklist.
+
+The server also returns a non-blocking `advisory` field when a `task_description` looks like it may be violating these (a numbered list, multiple questions, or unusually long).
 
 **Parameters:**
 - `task_title` (str): Short title of the task.
