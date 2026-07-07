@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 import tkinter as tk
-from tkinter import messagebox, simpledialog, ttk, filedialog
+from tkinter import messagebox, filedialog
 from typing import List, Dict, Any, Optional, Literal
 from datetime import datetime, timezone
 import sys
@@ -38,6 +38,13 @@ IS_WINDOWS = CURRENT_PLATFORM == 'windows'
 IS_MACOS = CURRENT_PLATFORM == 'darwin'
 IS_LINUX = CURRENT_PLATFORM == 'linux'
 
+
+def _out(*args):
+    """Write diagnostics to STDERR. Under the default stdio transport, STDOUT is
+    the JSON-RPC channel — anything printed there would corrupt the protocol."""
+    sys.stderr.write(" ".join(str(a) for a in args) + "\n")
+    sys.stderr.flush()
+
 # Initialize the MCP server
 mcp = FastMCP("Human-in-the-Loop Server")
 
@@ -48,8 +55,6 @@ OUTBOX_ENV_VAR = "HUMAN_LOOP_OUTBOX_DIR"
 DEFAULT_OUTBOX_DIR = os.path.join(os.path.expanduser("~"), ".human_loop_outbox")
 OUTBOX_SCHEMA_VERSION = 1
 
-# Attachment inlining limits for the tool return value (bytes).
-MAX_INLINE_FILE_BYTES = 10 * 1024 * 1024    # absolute per-file sanity cap
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 
 # Tool-result size budgeting. Clients cap how big a tool result may be (Claude
@@ -234,7 +239,7 @@ def archive_to_outbox(entry: Dict[str, Any], attachment_paths: List[str]) -> Opt
         os.replace(tmp_dir, final_dir)
         return final_dir
     except Exception as e:
-        print(f"Warning: failed to archive submission to outbox: {e}")
+        _out(f"Warning: failed to archive submission to outbox: {e}")
         try:
             if 'tmp_dir' in locals() and os.path.exists(tmp_dir):
                 shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -298,7 +303,7 @@ class RingPlayer:
                     target=self._loop_posix, args=(cmd,), daemon=True)
                 self._thread.start()
         except Exception as e:
-            print(f"Warning: could not start ringtone: {e}")
+            _out(f"Warning: could not start ringtone: {e}")
 
     def stop(self):
         if not self._started:
@@ -352,7 +357,7 @@ class DialogRunner:
             elif IS_WINDOWS:
                 self.root.attributes('-topmost', True)
         except Exception as e:
-            print(f"Warning: GUI initialization failed: {e}")
+            _out(f"Warning: GUI initialization failed: {e}")
 
         self._started.set()
         self.root.after(50, self._pump)
@@ -641,29 +646,24 @@ def ensure_gui_initialized():
     return _dialog_runner.is_ready()
 
 def configure_window_for_platform(window):
-    """Apply platform-specific window configurations"""
+    """Raise and focus a dialog window. Uses window.attributes (works on a
+    Toplevel; window.call does NOT — only the Tk root has .call)."""
     try:
-        if IS_MACOS:
-            # macOS-specific window configuration
-            window.call('wm', 'attributes', '.', '-topmost', '1')
-            window.lift()
-            window.focus_force()
-            # Try to activate the app on macOS
-            configure_macos_app()
-        elif IS_WINDOWS:
-            # Windows-specific configuration (existing behavior)
+        if IS_MACOS or IS_WINDOWS:
             window.attributes('-topmost', True)
             window.lift()
             window.focus_force()
+            if IS_MACOS:
+                configure_macos_app()  # bring the Python app to the front
     except Exception as e:
-        print(f"Warning: Platform-specific window configuration failed: {e}")
+        _out(f"Warning: Platform-specific window configuration failed: {e}")
 
 def create_input_dialog(root, title: str, prompt: str, default_value: str = "", input_type: str = "text"):
     """Build a modern input dialog as a child of the shared root (main thread)."""
     try:
         return ModernInputDialog(root, title, prompt, default_value, input_type).result
     except Exception as e:
-        print(f"Error in input dialog: {e}")
+        _out(f"Error in input dialog: {e}")
         return None
 
 def show_confirmation(root, title: str, message: str):
@@ -671,7 +671,7 @@ def show_confirmation(root, title: str, message: str):
     try:
         return ModernConfirmationDialog(root, title, message).result
     except Exception as e:
-        print(f"Error in confirmation dialog: {e}")
+        _out(f"Error in confirmation dialog: {e}")
         return False
 
 def show_info(root, title: str, message: str):
@@ -679,7 +679,7 @@ def show_info(root, title: str, message: str):
     try:
         return ModernInfoDialog(root, title, message).result
     except Exception as e:
-        print(f"Error in info dialog: {e}")
+        _out(f"Error in info dialog: {e}")
         return False
 
 class ModernInputDialog:
@@ -1022,7 +1022,7 @@ def create_choice_dialog(root, title: str, prompt: str, choices: List[str], allo
     try:
         return ChoiceDialog(root, title, prompt, choices, allow_multiple).result
     except Exception as e:
-        print(f"Error in choice dialog: {e}")
+        _out(f"Error in choice dialog: {e}")
         return None
 
 def create_multiline_input_dialog(root, title: str, prompt: str, default_value: str = ""):
@@ -1030,7 +1030,7 @@ def create_multiline_input_dialog(root, title: str, prompt: str, default_value: 
     try:
         return MultilineInputDialog(root, title, prompt, default_value).result
     except Exception as e:
-        print(f"Error in multiline dialog: {e}")
+        _out(f"Error in multiline dialog: {e}")
         return None
 
 class ChoiceDialog:
@@ -1494,7 +1494,7 @@ class NotificationWindow:
             self.session.attach_dialog(win)
             win.begin_countdown(compute_leg_seconds(self.session.client_timeout_seconds))
         except Exception as e:
-            print(f"Warning: failed to open task window: {e}")
+            _out(f"Warning: failed to open task window: {e}")
         self.close()  # closes the toast; session.dialog now points at the task window
         self.session.submit_from_ui({"kind": "view"})
 
@@ -1970,7 +1970,7 @@ def _build_submission_result(session, payload, needs_continuation, archived_dir)
             ext = os.path.splitext(p)[1].lower()
             is_image = ext in IMAGE_EXTENSIONS or mime.startswith("image/")
             entry = {"name": name, "size_bytes": size, "mime": mime, "inlined": False}
-            if size <= MAX_INLINE_FILE_BYTES and (encoded_used + enc) <= encoded_budget:
+            if (encoded_used + enc) <= encoded_budget:
                 if is_image:
                     images.append(Image(path=p))
                 else:
@@ -2039,7 +2039,7 @@ async def assign_task_to_human(
     ctx: Context = None,
 ) -> Any:
     """
-    Delegate ONE atomic physical-world ACTION to a human and wait for their report of
+    Delegate ONE atomic real-world ACTION that cannot be done by the assistant (e.g. physical-world actions) to a human and wait for their report of
     whether it was done (with an optional note and file/image attachments).
 
     SCOPE — use this tool ONLY for a single concrete real-world action, and read these
@@ -2077,16 +2077,22 @@ async def assign_task_to_human(
       window has CLOSED; the task is not finished. Process the update, then DECIDE: to let
       them keep working, call again with the SAME `task_id` to reopen a fresh window
       (optionally reply via `context_note`); otherwise just finish.
-    - `status: "completed"` / `"failed"` (human_action=true): the human's report. These are
-      NOT immediately destroyed — the session is kept open for your REVIEW (`resubmittable:
-      true`). If the deliverable is insufficient, or `attachments_omitted_for_size` is true
+    - `status: "completed"` / `"failed"` WITH `resubmittable: true` (human_action=true): the
+      human's report from the task window. The session is kept open for your REVIEW — NOT
+      destroyed. If the deliverable is insufficient, or `attachments_omitted_for_size` is true
       (an attachment was too big to inline under `max_result_bytes` and was referenced by
       path / saved to the outbox), you MAY call again with the SAME `task_id` and an updated
       `task_description` (e.g. "please attach a smaller photo") to request a re-submission.
       If satisfied, simply stop — the session is reaped automatically.
-    - `status: "cancelled"`: terminal. With `reason: "declined_via_notification"` the human
-      clicked Cancel on the notification; with `reason: "assistant_disconnected"` the window
-      auto-closed after you went silent (any draft is auto-saved and included).
+    - Terminal outcomes (needs_continuation=false, task_id is gone, NOT resubmittable) — check
+      `status` + `reason`:
+        * `status: "failed"`, `reason: "declined_via_notification"` — the human clicked Cancel
+          on the notification (declined the task; distinct from a task-window "Failed" report,
+          which is resubmittable per above).
+        * `status: "cancelled"` (no reason) — the human closed the task window without reporting.
+        * `reason: "assistant_disconnected"` (status "failed" from the notification or
+          "cancelled" from the task window) — the dialog auto-closed after you went silent; any
+          draft the human had typed is auto-saved to the outbox and included.
     - Pass `max_result_bytes` = your client's max tool-result size. The human sees a live size
       counter and cannot submit anything whose encoded size would exceed it, and the server
       hard-caps the result to that budget — so a deliverable is never rejected as "too large".
@@ -2121,8 +2127,8 @@ async def assign_task_to_human(
                 "status": "session_not_found",
                 "task_id": task_id,
                 "needs_continuation": False,
-                "message": ("No such task_id (it was completed, failed, cancelled, or expired). "
-                            "Start a new task by calling without a task_id."),
+                "message": ("No such task_id (it was cancelled/declined, or the session expired "
+                            "after inactivity). Start a new task by calling without a task_id."),
                 "platform": CURRENT_PLATFORM,
             }
 
@@ -2761,29 +2767,29 @@ async def health_check() -> Dict[str, Any]:
 # Main execution
 
 def main():
-    print("Starting Human-in-the-Loop MCP Server...")
-    print("This server provides tools for LLMs to interact with humans through GUI dialogs.")
-    print(f"Platform: {CURRENT_PLATFORM} ({platform.system()} {platform.release()})")
-    print("")
-    print("Available tools:")
-    print("get_user_input - Get text/number input from user")
-    print("get_user_choice - Let user choose from options")
-    print("get_multiline_input - Get multi-line text from user")
-    print("show_confirmation_dialog - Ask user for yes/no confirmation")
-    print("show_info_message - Display information to user")
-    print("get_human_loop_prompt - Get guidance on when to use human-in-the-loop tools")
-    print("health_check - Check server status")
-    print("")
+    _out("Starting Human-in-the-Loop MCP Server...")
+    _out("This server provides tools for LLMs to interact with humans through GUI dialogs.")
+    _out(f"Platform: {CURRENT_PLATFORM} ({platform.system()} {platform.release()})")
+    _out("")
+    _out("Available tools:")
+    _out("get_user_input - Get text/number input from user")
+    _out("get_user_choice - Let user choose from options")
+    _out("get_multiline_input - Get multi-line text from user")
+    _out("show_confirmation_dialog - Ask user for yes/no confirmation")
+    _out("show_info_message - Display information to user")
+    _out("get_human_loop_prompt - Get guidance on when to use human-in-the-loop tools")
+    _out("health_check - Check server status")
+    _out("")
     
     # Platform-specific startup messages
     if IS_MACOS:
-        print("macOS detected - Using native system fonts and window management")
-        print("Note: You may need to allow Python to control your computer in System Preferences > Security & Privacy > Accessibility")
+        _out("macOS detected - Using native system fonts and window management")
+        _out("Note: You may need to allow Python to control your computer in System Preferences > Security & Privacy > Accessibility")
     elif IS_WINDOWS:
-        print("Windows detected - Using modern Windows 11-style GUI with enhanced styling")
-        print("Features: Modern colors, improved fonts, hover effects, and sleek design")
+        _out("Windows detected - Using modern Windows 11-style GUI with enhanced styling")
+        _out("Features: Modern colors, improved fonts, hover effects, and sleek design")
     elif IS_LINUX:
-        print("Linux detected - Using Linux-compatible GUI settings with modern styling")
+        _out("Linux detected - Using Linux-compatible GUI settings with modern styling")
     
     # Transport: default stdio (client launches us as a subprocess). Set
     # HUMAN_LOOP_HTTP_PORT to instead serve over HTTP on that port so a client
@@ -2791,12 +2797,12 @@ def main():
     http_port = os.environ.get("HUMAN_LOOP_HTTP_PORT")
     http_host = os.environ.get("HUMAN_LOOP_HTTP_HOST", "127.0.0.1")
     if http_port:
-        print(f"Starting MCP server on http://{http_host}:{http_port} (HTTP transport)...")
-        print("Note: HTTP mode is long-running; stop it with Ctrl+C. The GUI dialogs "
+        _out(f"Starting MCP server on http://{http_host}:{http_port} (HTTP transport)...")
+        _out("Note: HTTP mode is long-running; stop it with Ctrl+C. The GUI dialogs "
               "appear on this machine's desktop only.")
     else:
-        print("")
-        print("Starting MCP server (stdio transport)...")
+        _out("")
+        _out("Starting MCP server (stdio transport)...")
 
     # The MCP server runs on a background thread while tkinter owns the main
     # thread. tkinter/macOS AppKit require all windows to be created on the
