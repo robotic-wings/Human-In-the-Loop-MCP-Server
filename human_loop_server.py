@@ -31,6 +31,7 @@ from typing import Annotated
 os.environ.setdefault('FASTMCP_LOG_LEVEL', 'INFO')
 from fastmcp import FastMCP, Context
 from fastmcp.utilities.types import Image, File
+import human_loop_config
 
 # Platform detection
 CURRENT_PLATFORM = platform.system().lower()
@@ -57,10 +58,10 @@ OUTBOX_SCHEMA_VERSION = 1
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 
-# Tool-result size budgeting. Clients cap how big a tool result may be (Claude
-# Desktop rejects results > 1 MB); attachments are base64-inlined, so the encoded
+# Tool-result size budgeting. Clients cap how big a tool result may be
+# attachments are base64-inlined, so the encoded
 # size is what counts. The AI passes its own limit as `max_result_bytes`.
-DEFAULT_MAX_RESULT_BYTES = 1_000_000   # safe default for Claude Desktop (~1 MB)
+DEFAULT_MAX_RESULT_BYTES = 1_000_000   # safe default
 RESULT_OVERHEAD_BYTES = 4096           # rough JSON envelope / manifest allowance
 
 
@@ -109,9 +110,9 @@ def composite_task_advisory(task_description):
     if not reasons:
         return None
     return (
-        "Heads up: this task_description may be misusing assign_task_to_human (" +
-        "; ".join(reasons) + "). This tool is for ONE indivisible physical action whose "
-        "report is a completion status. If you are asking a question, use get_user_input / "
+        "Heads up for the asssistant: the task_description you have just provided may be misusing assign_task_to_human (" +
+        "; ".join(reasons) + "). Please note that this tool is for ONE indivisible action you cannot "
+        "do itself, whose report is a completion status. If you are asking a question, use get_user_input / "
         "get_multiline_input / get_user_choice instead. If this is several steps, assign "
         "them as separate sequential tasks, adjusting each from the previous report."
     )
@@ -658,6 +659,44 @@ def configure_window_for_platform(window):
     except Exception as e:
         _out(f"Warning: Platform-specific window configuration failed: {e}")
 
+def build_readonly_text(parent, content, theme_colors, height=6, width=None):
+    """A bounded, scrollable Text that is read-only but still selectable/copyable.
+    Used for any potentially long body/message so it scrolls instead of clipping
+    (a Label grows unbounded and pushes controls off-screen). Returns (frame, text)."""
+    c = theme_colors
+    wrap = tk.Frame(parent, bg=c["bg_primary"])
+    wrap.columnconfigure(0, weight=1)
+    wrap.rowconfigure(0, weight=1)
+    txt = tk.Text(wrap, height=height, wrap="word", **({"width": width} if width else {}))
+    apply_modern_style(txt, "text", theme_colors)
+    txt.configure(fg=c["fg_secondary"])
+    txt.grid(row=0, column=0, sticky="nsew", padx=(0, 2))
+    sb = tk.Scrollbar(wrap, orient="vertical", command=txt.yview)
+    apply_modern_style(sb, "scrollbar", theme_colors)
+    sb.grid(row=0, column=1, sticky="ns")
+    txt.configure(yscrollcommand=sb.set)
+    txt.insert("1.0", content or "")
+
+    def _copy(_e):
+        try:
+            txt.clipboard_clear()
+            txt.clipboard_append(txt.get("sel.first", "sel.last"))
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _select_all(_e):
+        txt.tag_add("sel", "1.0", "end-1c")
+        return "break"
+
+    txt.bind("<Key>", lambda e: "break")      # read-only (block typing/deletion)
+    txt.bind("<Control-c>", _copy)
+    txt.bind("<Command-c>", _copy)            # macOS
+    txt.bind("<Control-a>", _select_all)
+    txt.bind("<Command-a>", _select_all)      # macOS
+    return wrap, txt
+
+
 def create_input_dialog(root, title: str, prompt: str, default_value: str = "", input_type: str = "text"):
     """Build a modern input dialog as a child of the shared root (main thread)."""
     try:
@@ -701,10 +740,10 @@ class ModernInputDialog:
         
         # Set size based on platform
         if IS_WINDOWS:
-            self.dialog.geometry("420x280")
+            self.dialog.geometry("420x300")
         else:
-            self.dialog.geometry("400x260")
-        
+            self.dialog.geometry("400x285")
+
         self.center_window()
         
         # Create the main frame
@@ -756,7 +795,16 @@ class ModernInputDialog:
         if default_value:
             self.entry.insert(0, default_value)
             self.entry.select_range(0, tk.END)
-        
+        # Live validation as the user types (enables/disables OK for numeric types).
+        self.entry.bind("<KeyRelease>", self._validate)
+
+        # Inline validation hint, shown only when the value doesn't match input_type.
+        self.hint_label = tk.Label(
+            main_frame, text="", bg=self.theme_colors["bg_primary"],
+            fg=self.theme_colors.get("error_color", self.theme_colors["fg_secondary"]),
+            font=get_system_font(), anchor="w", justify="left")
+        self.hint_label.pack(fill="x", pady=(0, 12))
+
         # Button frame
         button_frame = tk.Frame(main_frame, bg=self.theme_colors["bg_primary"])
         button_frame.pack(fill="x")
@@ -777,12 +825,13 @@ class ModernInputDialog:
         self.dialog.bind('<Return>', lambda e: self.ok_clicked())
         self.dialog.bind('<Escape>', lambda e: self.cancel_clicked())
         
-        # Focus on entry
+        # Focus on entry, set initial OK enabled/disabled state.
         self.entry.focus_set()
-        
+        self._validate()
+
         # Wait for dialog completion
         self.dialog.wait_window()
-    
+
     def center_window(self):
         """Center the dialog window on screen"""
         self.dialog.update_idletasks()
@@ -792,28 +841,59 @@ class ModernInputDialog:
         screen_height = self.dialog.winfo_screenheight()
         x = (screen_width // 2) - (width // 2)
         y = (screen_height // 2) - (height // 2)
-        
+
         if IS_MACOS:
             y = max(50, y - 50)
         elif IS_WINDOWS:
             y = max(30, y - 30)
-            
+
         self.dialog.geometry(f"{width}x{height}+{x}+{y}")
-    
-    def ok_clicked(self):
-        value = self.entry.get()
+
+    def _parse_current(self):
+        """Return (is_valid, parsed_value) for the current entry text.
+
+        For integer/float, an empty or unparseable value is INVALID (so OK is
+        blocked — cancel via the Cancel button). Text is always valid.
+        """
+        raw = self.entry.get()
+        value = raw.strip()
         if self.input_type == "integer":
+            if not value:
+                return (False, None)
             try:
-                self.result = int(value) if value else None
+                return (True, int(value))
             except ValueError:
-                self.result = None
+                return (False, None)
         elif self.input_type == "float":
+            if not value:
+                return (False, None)
             try:
-                self.result = float(value) if value else None
+                return (True, float(value))
             except ValueError:
-                self.result = None
+                return (False, None)
+        # text: any content is acceptable; empty means "no input" (→ cancelled).
+        return (True, raw if raw else None)
+
+    def _validate(self, *_):
+        """Enable/disable OK and show a hint based on the current value."""
+        valid, _v = self._parse_current()
+        try:
+            self.ok_button.configure(state="normal" if valid else "disabled")
+        except Exception:
+            pass
+        if self.input_type in ("integer", "float") and not valid:
+            kind = "whole number" if self.input_type == "integer" else "number"
+            self.hint_label.config(text=f"Please enter a valid {kind} to continue.")
         else:
-            self.result = value if value else None
+            self.hint_label.config(text="")
+
+    def ok_clicked(self):
+        valid, parsed = self._parse_current()
+        if not valid:
+            # OK is disabled in this state; also guard the Enter-key path.
+            self._validate()
+            return
+        self.result = parsed
         self.dialog.destroy()
     
     def cancel_clicked(self):
@@ -831,23 +911,16 @@ class ModernConfirmationDialog:
         self.dialog = tk.Toplevel(parent)
         self.dialog.title(title)
         self.dialog.grab_set()
-        self.dialog.resizable(False, False)
-        
+        self.dialog.resizable(True, True)
+        self.dialog.minsize(380, 210)
+
         # Apply modern window styling
         configure_modern_window(self.dialog)
-        
-        # Set size based on content
-        if IS_WINDOWS:
-            self.dialog.geometry("440x220")
-        else:
-            self.dialog.geometry("420x200")
-        
-        self.center_window()
-        
+
         # Create the main frame
         main_frame = tk.Frame(self.dialog, bg=self.theme_colors["bg_primary"])
         main_frame.pack(fill="both", expand=True, padx=24, pady=20)
-        
+
         # Title label
         title_label = tk.Label(
             main_frame,
@@ -857,36 +930,30 @@ class ModernConfirmationDialog:
             font=get_title_font(),
             anchor="w"
         )
-        title_label.pack(fill="x", pady=(0, 12))
-        
-        # Message label
-        message_label = tk.Label(
-            main_frame,
-            text=message,
-            bg=self.theme_colors["bg_primary"],
-            fg=self.theme_colors["fg_secondary"],
-            font=get_system_font(),
-            wraplength=370,
-            justify="left",
-            anchor="w"
-        )
-        message_label.pack(fill="x", pady=(0, 24))
-        
-        # Button frame
+        title_label.pack(side="top", fill="x", pady=(0, 12))
+
+        # Buttons pinned to the BOTTOM first, so they stay visible with long text.
         button_frame = tk.Frame(main_frame, bg=self.theme_colors["bg_primary"])
-        button_frame.pack(fill="x")
-        
-        # Create modern buttons
+        button_frame.pack(side="bottom", fill="x", pady=(16, 0))
         self.yes_button = create_modern_button(
             button_frame, "Yes", self.yes_clicked, "primary", self.theme_colors
         )
         self.yes_button.pack(side=tk.RIGHT, padx=(8, 0))
-        
         self.no_button = create_modern_button(
             button_frame, "No", self.no_clicked, "secondary", self.theme_colors
         )
         self.no_button.pack(side=tk.RIGHT)
-        
+
+        # Message in a scrollable, read-only box so long text scrolls instead of
+        # clipping / pushing the buttons off-screen.
+        msg_height = min(max(3, len((message or "").splitlines()) + 1), 16)
+        msg_frame, _ = build_readonly_text(
+            main_frame, message, self.theme_colors, height=msg_height, width=48)
+        msg_frame.pack(side="top", fill="both", expand=True)
+
+        self.dialog.update_idletasks()
+        self.center_window()
+
         # Handle window close and keyboard shortcuts
         self.dialog.protocol("WM_DELETE_WINDOW", self.no_clicked)
         self.dialog.bind('<Return>', lambda e: self.yes_clicked())
@@ -934,23 +1001,16 @@ class ModernInfoDialog:
         self.dialog = tk.Toplevel(parent)
         self.dialog.title(title)
         self.dialog.grab_set()
-        self.dialog.resizable(False, False)
-        
+        self.dialog.resizable(True, True)
+        self.dialog.minsize(360, 200)
+
         # Apply modern window styling
         configure_modern_window(self.dialog)
-        
-        # Set size based on content
-        if IS_WINDOWS:
-            self.dialog.geometry("420x200")
-        else:
-            self.dialog.geometry("400x180")
-        
-        self.center_window()
-        
+
         # Create the main frame
         main_frame = tk.Frame(self.dialog, bg=self.theme_colors["bg_primary"])
         main_frame.pack(fill="both", expand=True, padx=24, pady=20)
-        
+
         # Title label
         title_label = tk.Label(
             main_frame,
@@ -960,39 +1020,35 @@ class ModernInfoDialog:
             font=get_title_font(),
             anchor="w"
         )
-        title_label.pack(fill="x", pady=(0, 12))
-        
-        # Message label
-        message_label = tk.Label(
-            main_frame,
-            text=message,
-            bg=self.theme_colors["bg_primary"],
-            fg=self.theme_colors["fg_secondary"],
-            font=get_system_font(),
-            wraplength=350,
-            justify="left",
-            anchor="w"
-        )
-        message_label.pack(fill="x", pady=(0, 24))
-        
-        # Button frame
+        title_label.pack(side="top", fill="x", pady=(0, 12))
+
+        # Button frame pinned to the BOTTOM first, so it is always visible even
+        # when the message is long.
         button_frame = tk.Frame(main_frame, bg=self.theme_colors["bg_primary"])
-        button_frame.pack(fill="x")
-        
-        # Create modern OK button
+        button_frame.pack(side="bottom", fill="x", pady=(16, 0))
         self.ok_button = create_modern_button(
             button_frame, "OK", self.ok_clicked, "primary", self.theme_colors
         )
         self.ok_button.pack(side=tk.RIGHT)
-        
+
+        # Message in a scrollable, read-only box so long text scrolls instead of
+        # clipping / pushing the button off-screen.
+        msg_height = min(max(3, len((message or "").splitlines()) + 1), 16)
+        msg_frame, _ = build_readonly_text(
+            main_frame, message, self.theme_colors, height=msg_height, width=46)
+        msg_frame.pack(side="top", fill="both", expand=True)
+
+        self.dialog.update_idletasks()
+        self.center_window()
+
         # Handle window close and keyboard shortcuts
         self.dialog.protocol("WM_DELETE_WINDOW", self.ok_clicked)
         self.dialog.bind('<Return>', lambda e: self.ok_clicked())
         self.dialog.bind('<Escape>', lambda e: self.ok_clicked())
-        
+
         # Focus on OK button
         self.ok_button.focus_set()
-        
+
         # Wait for dialog completion
         self.dialog.wait_window()
     
@@ -1345,13 +1401,15 @@ class HumanTaskSession:
     MAX_LIFETIME_SECONDS = 30 * 60  # orphan safety net
 
     def __init__(self, task_id, task_title, task_description, context_note,
-                 client_timeout_seconds, loop, max_result_bytes=DEFAULT_MAX_RESULT_BYTES):
+                 client_timeout_seconds, loop, max_result_bytes=DEFAULT_MAX_RESULT_BYTES,
+                 attachments_enabled=True):
         self.task_id = task_id
         self.task_title = task_title
         self.task_description = task_description
         self.context_note = context_note
         self.client_timeout_seconds = client_timeout_seconds
         self.max_result_bytes = max_result_bytes
+        self.attachments_enabled = attachments_enabled
         self.loop = loop
         self.updates = asyncio.Queue()
         self.dialog = None
@@ -1408,7 +1466,10 @@ class NotificationWindow:
         self._leg_seconds = None
         self._last_contact = None
         self._ui_after = None
-        self.ring = RingPlayer()
+        # Operator-configured ringtone / mute (falls back to the bundled sound).
+        _notif = human_loop_config.get_notification()
+        self._muted = bool(_notif.get("muted", False))
+        self.ring = RingPlayer(path=_notif.get("ringtone_path") or RINGTONE_PATH)
 
         c = self.theme_colors
         self.win = tk.Toplevel(parent)
@@ -1454,7 +1515,8 @@ class NotificationWindow:
         create_modern_button(btns, "Cancel", self._on_cancel, "secondary", c).pack(side=tk.RIGHT)
 
         self.win.protocol("WM_DELETE_WINDOW", self._on_cancel)
-        self.ring.start()
+        if not self._muted:
+            self.ring.start()
 
     # participates in the session's leg/disconnect machinery
     def begin_countdown(self, leg_seconds):
@@ -1610,26 +1672,28 @@ class HumanTaskDialog:
         body_scroll.grid(row=0, column=1, sticky="ns")
         self.body_text.configure(yscrollcommand=body_scroll.set)
 
-        # Attachments
-        attach_header = tk.Frame(main, bg=c["bg_primary"])
-        attach_header.grid(row=6, column=0, sticky="ew", pady=(0, 4))
-        tk.Label(attach_header, text="Attachments:", bg=c["bg_primary"],
-                 fg=c["fg_primary"], font=get_system_font(), anchor="w").pack(side=tk.LEFT)
-        create_modern_button(attach_header, "Attach files/images…", self._add_attachments,
-                             "secondary", self.theme_colors).pack(side=tk.RIGHT)
-        create_modern_button(attach_header, "Remove selected", self._remove_attachment,
-                             "secondary", self.theme_colors).pack(side=tk.RIGHT, padx=(0, 8))
+        # Attachments (only when the operator has enabled the feature)
+        self.attach_listbox = None
+        if getattr(session, "attachments_enabled", True):
+            attach_header = tk.Frame(main, bg=c["bg_primary"])
+            attach_header.grid(row=6, column=0, sticky="ew", pady=(0, 4))
+            tk.Label(attach_header, text="Attachments:", bg=c["bg_primary"],
+                     fg=c["fg_primary"], font=get_system_font(), anchor="w").pack(side=tk.LEFT)
+            create_modern_button(attach_header, "Attach files/images…", self._add_attachments,
+                                 "secondary", self.theme_colors).pack(side=tk.RIGHT)
+            create_modern_button(attach_header, "Remove selected", self._remove_attachment,
+                                 "secondary", self.theme_colors).pack(side=tk.RIGHT, padx=(0, 8))
 
-        attach_container = tk.Frame(main, bg=c["bg_primary"])
-        attach_container.grid(row=7, column=0, sticky="ew", pady=(0, 14))
-        attach_container.columnconfigure(0, weight=1)
-        self.attach_listbox = tk.Listbox(attach_container, selectmode=tk.EXTENDED, height=4)
-        apply_modern_style(self.attach_listbox, "listbox", self.theme_colors)
-        self.attach_listbox.grid(row=0, column=0, sticky="ew", padx=(0, 2))
-        attach_scroll = tk.Scrollbar(attach_container, orient="vertical", command=self.attach_listbox.yview)
-        apply_modern_style(attach_scroll, "scrollbar", self.theme_colors)
-        attach_scroll.grid(row=0, column=1, sticky="ns")
-        self.attach_listbox.configure(yscrollcommand=attach_scroll.set)
+            attach_container = tk.Frame(main, bg=c["bg_primary"])
+            attach_container.grid(row=7, column=0, sticky="ew", pady=(0, 14))
+            attach_container.columnconfigure(0, weight=1)
+            self.attach_listbox = tk.Listbox(attach_container, selectmode=tk.EXTENDED, height=4)
+            apply_modern_style(self.attach_listbox, "listbox", self.theme_colors)
+            self.attach_listbox.grid(row=0, column=0, sticky="ew", padx=(0, 2))
+            attach_scroll = tk.Scrollbar(attach_container, orient="vertical", command=self.attach_listbox.yview)
+            apply_modern_style(attach_scroll, "scrollbar", self.theme_colors)
+            attach_scroll.grid(row=0, column=1, sticky="ns")
+            self.attach_listbox.configure(yscrollcommand=attach_scroll.set)
 
         # Live submission-size counter (text + attachments vs the client's limit).
         self.size_label = tk.Label(
@@ -1686,41 +1750,7 @@ class HumanTaskDialog:
                 pass
 
     def _make_readonly_text(self, parent, content, height):
-        """A bounded, scrollable Text that is read-only but still selectable and
-        copyable (Text can't grow unbounded like a Label, and unlike a Label its
-        content can be selected/copied)."""
-        c = self.theme_colors
-        wrap = tk.Frame(parent, bg=c["bg_primary"])
-        wrap.columnconfigure(0, weight=1)
-        wrap.rowconfigure(0, weight=1)
-        txt = tk.Text(wrap, height=height, wrap="word")
-        apply_modern_style(txt, "text", self.theme_colors)
-        txt.configure(fg=c["fg_secondary"])
-        txt.grid(row=0, column=0, sticky="nsew", padx=(0, 2))
-        sb = tk.Scrollbar(wrap, orient="vertical", command=txt.yview)
-        apply_modern_style(sb, "scrollbar", self.theme_colors)
-        sb.grid(row=0, column=1, sticky="ns")
-        txt.configure(yscrollcommand=sb.set)
-        txt.insert("1.0", content or "")
-
-        # Read-only but selectable/copyable: block edits, keep copy & select-all.
-        def _copy(_e):
-            try:
-                txt.clipboard_clear()
-                txt.clipboard_append(txt.get("sel.first", "sel.last"))
-            except tk.TclError:
-                pass
-            return "break"
-
-        def _select_all(_e):
-            txt.tag_add("sel", "1.0", "end-1c")
-            return "break"
-
-        txt.bind("<Key>", lambda e: "break")      # block typing/deletion
-        txt.bind("<Control-c>", _copy)
-        txt.bind("<Command-c>", _copy)            # macOS
-        txt.bind("<Control-a>", _select_all)
-        txt.bind("<Command-a>", _select_all)      # macOS
+        wrap, _ = build_readonly_text(parent, content, self.theme_colors, height=height)
         return wrap
 
     # ---------------- attachment handling ---------------- #
@@ -1741,13 +1771,14 @@ class HumanTaskDialog:
         self._refresh_attachments()
 
     def _refresh_attachments(self):
-        self.attach_listbox.delete(0, tk.END)
-        for p in self.attachments:
-            try:
-                sz = _human_bytes(os.path.getsize(p))
-            except OSError:
-                sz = "?"
-            self.attach_listbox.insert(tk.END, f"{os.path.basename(p)}  ({sz})")
+        if self.attach_listbox is not None:
+            self.attach_listbox.delete(0, tk.END)
+            for p in self.attachments:
+                try:
+                    sz = _human_bytes(os.path.getsize(p))
+                except OSError:
+                    sz = "?"
+                self.attach_listbox.insert(tk.END, f"{os.path.basename(p)}  ({sz})")
         self._update_size_counter()
 
     # ---------------- liveness / countdown / watchdog ---------------- #
@@ -2031,18 +2062,21 @@ def _build_submission_result(session, payload, needs_continuation, archived_dir)
 @mcp.tool()
 async def assign_task_to_human(
     task_title: Annotated[str, Field(description="Short imperative title of the ONE action (e.g. 'Photograph the north wall'). Not a question.")],
-    task_description: Annotated[str, Field(description="A SINGLE, atomic, actionable instruction for one physical-world action. This is a work order, not a chat message: NOT a question, NOT a list of multiple steps, NOT background+questions+a to-do list. If the work has several steps, assign them as separate sequential tasks instead.")],
+    task_description: Annotated[str, Field(description="A SINGLE, atomic, actionable instruction for one action the assistant cannot do itself and must delegate to a human (a physical-world action is the common case). This is a work order, not a chat message: NOT a question, NOT a list of multiple steps, NOT background+questions+a to-do list. If the work has several steps, assign them as separate sequential tasks instead.")],
     task_id: Annotated[Optional[str], Field(description="Leave empty to START a new task. To CONTINUE an existing task (after a 'heartbeat' response or an 'in_progress' update), pass back the task_id from the previous call - this revives the same open window without losing the human's work.")] = None,
-    client_timeout_seconds: Annotated[int, Field(description="YOUR OWN per-tool-call timeout, in seconds. Claude Desktop hardcodes ~240s, so pass 240. Claude Code has no timeout, so pass a large value like 3600. The server returns a 'heartbeat' response safely before this deadline so you can immediately re-call and keep the human's dialog alive.")] = 240,
-    max_result_bytes: Annotated[int, Field(description="YOUR CLIENT'S max tool-result size, in BYTES. Claude Desktop rejects results over ~1000000 (1 MB), so pass 1000000. Claude Code allows much larger, configurable results — pass a big value (e.g. 30000000). The human sees a live size counter and cannot submit text+attachments whose encoded size would exceed this, so a large deliverable is never rejected/lost.")] = DEFAULT_MAX_RESULT_BYTES,
+    client_timeout_seconds: Annotated[Optional[int], Field(description="YOUR OWN per-tool-call timeout, in seconds. The server returns a 'heartbeat' response safely before this deadline so you can immediately re-call and keep the human's dialog alive. If omitted, the server's configured default is used.")] = None,
+    max_result_bytes: Annotated[Optional[int], Field(description="YOUR CLIENT'S max tool-result size, in BYTES. The human sees a live size counter and cannot submit text+attachments whose encoded size would exceed this, so a large deliverable is never rejected/lost. If omitted, the server's configured default is used.")] = None,
     context_note: Annotated[str, Field(description="Optional extra context to show the human in the dialog")] = "",
     ctx: Context = None,
 ) -> Any:
     """
-    Delegate ONE atomic real-world ACTION that cannot be done by the assistant (e.g. physical-world actions) to a human and wait for their report of
-    whether it was done (with an optional note and file/image attachments).
+    Delegate to a human ONE atomic action that the assistant CANNOT do itself, and wait for
+    their report of whether it was done (with an optional note and file/image attachments). A
+    physical-world action is the common case, but the defining trait is simply that YOU can't
+    do it — anything that requires a person (their hands, presence, judgment, credentials, or
+    access you lack) qualifies.
 
-    SCOPE — use this tool ONLY for a single concrete real-world action, and read these
+    SCOPE — use this tool ONLY for a single action you cannot do yourself, and read these
     three rules; they are the most common ways this tool is misused:
       1. NOT for questions / information requests. Do NOT use assign_task_to_human to ask
          the human anything (a date, a status, a preference, a fact). Its report describes
@@ -2097,7 +2131,7 @@ async def assign_task_to_human(
       counter and cannot submit anything whose encoded size would exceed it, and the server
       hard-caps the result to that budget — so a deliverable is never rejected as "too large".
     - Every human submission (note + attachments + your command) is also archived to a
-      local "outbox" that can be browsed later with the standalone outbox.py viewer.
+      local "outbox" that can be browsed later in the Management Console (management_console.py).
     """
     try:
         if ctx:
@@ -2110,6 +2144,15 @@ async def assign_task_to_human(
                 "needs_continuation": False,
                 "platform": CURRENT_PLATFORM,
             }
+
+        # Resolve omitted params from the operator's configured defaults
+        # (fallback only — an AI-provided value always wins).
+        _defaults = human_loop_config.get_task_defaults()
+        if client_timeout_seconds is None:
+            client_timeout_seconds = int(_defaults.get("timeout_seconds", 240))
+        if max_result_bytes is None:
+            max_result_bytes = int(_defaults.get("max_result_bytes", DEFAULT_MAX_RESULT_BYTES))
+        attachments_enabled = bool(_defaults.get("attachments_enabled", True))
 
         loop = asyncio.get_running_loop()
         leg_seconds = compute_leg_seconds(client_timeout_seconds)
@@ -2138,7 +2181,7 @@ async def assign_task_to_human(
             new_id = uuid.uuid4().hex[:12]
             session = HumanTaskSession(
                 new_id, task_title, task_description, context_note, client_timeout_seconds, loop,
-                max_result_bytes=max_result_bytes)
+                max_result_bytes=max_result_bytes, attachments_enabled=attachments_enabled)
             session.advisory = composite_task_advisory(task_description)
             await _dialog_runner.run_dialog(
                 lambda root: session.attach_dialog(NotificationWindow(root, session)), timeout=30)
@@ -2156,6 +2199,7 @@ async def assign_task_to_human(
             session.context_note = context_note
             session.client_timeout_seconds = client_timeout_seconds
             session.max_result_bytes = max_result_bytes
+            session.attachments_enabled = attachments_enabled
             session.advisory = composite_task_advisory(task_description)
             idle = time.monotonic() - session.last_human_action_at
             if idle > FOLLOW_UP_NOTIFY_AFTER_SECONDS:
@@ -2322,10 +2366,12 @@ async def get_user_input(
     ctx: Context = None
 ) -> Dict[str, Any]:
     """
-    Create an input dialog window for the user to enter text, numbers, or other data.
-    
-    This tool opens a GUI dialog box where the user can input information that the LLM needs.
-    Perfect for getting specific details, clarifications, or data from the user.
+    Ask the user for ONE piece of single-line text/number input.
+
+    Ask a SINGLE focused question, then use the answer to decide what to ask next —
+    do NOT pack several questions into one `prompt`. If you need multiple pieces of
+    information, call this tool once per question in sequence, adapting as you go.
+    (`get_user_choice` for picking from options; `get_multiline_input` for long text.)
     """
     try:
         if ctx:
@@ -2386,10 +2432,11 @@ async def get_user_choice(
     ctx: Context = None
 ) -> Dict[str, Any]:
     """
-    Create a choice dialog window for the user to select from multiple options.
-    
-    This tool opens a GUI dialog box with a list of choices where the user can select
-    one or multiple options. Perfect for getting decisions, preferences, or selections from the user.
+    Ask the user to pick from options for ONE decision.
+
+    Present a SINGLE choice, then adapt based on what they pick — do NOT chain several
+    unrelated questions into one prompt. For a sequence of decisions, call this once per
+    decision, using each answer to shape the next.
     """
     try:
         if ctx:
@@ -2452,10 +2499,11 @@ async def get_multiline_input(
     ctx: Context = None
 ) -> Dict[str, Any]:
     """
-    Create a multi-line text input dialog for the user to enter longer text content.
-    
-    This tool opens a GUI dialog box with a large text area where the user can input
-    multiple lines of text. Perfect for getting detailed descriptions, code, or long-form content.
+    Ask the user for ONE piece of long-form text (a description, a document, code, etc.).
+
+    This is for a single open-ended answer that needs room to type — NOT a questionnaire.
+    Do NOT list several numbered questions in one `prompt` expecting them all answered in
+    one box; ask one focused question, read the answer, then ask the next and adapt.
     """
     try:
         if ctx:
@@ -2606,6 +2654,26 @@ async def show_info_message(
             "platform": CURRENT_PLATFORM
         }
 
+def _format_operator_profile():
+    """Human-readable block describing who the operator is, from the config file."""
+    p = human_loop_config.get_profile()
+    name = (p.get("name") or "").strip()
+    role = (p.get("role") or "").strip()
+    resp = (p.get("responsibilities") or "").strip()
+    comm = (p.get("communication") or "").strip()
+    lines = ["**ABOUT THE OPERATOR YOU ARE WORKING WITH:**"]
+    lines.append(f"- Name: {name}" if name else "- Name: (not provided)")
+    lines.append(f"- Role: {role}" if role else "- Role: (unspecified)")
+    if resp:
+        lines.append(f"- Responsibilities: {resp}")
+    if not role and not resp:
+        lines.append("- Scope: no role/responsibilities set — they can be assigned ANY task "
+                     "(within the delegation rules below).")
+    if comm:
+        lines.append(f"- How to communicate with them: {comm}")
+    return "\n".join(lines)
+
+
 # Add a prompt to get prompting guidance for LLMs
 @mcp.prompt()
 async def get_human_loop_prompt() -> Dict[str, str]:
@@ -2619,6 +2687,8 @@ async def get_human_loop_prompt() -> Dict[str, str]:
         "main_prompt": """
 You have access to Human-in-the-Loop tools that allow you to interact directly with users through GUI dialogs. Use these tools strategically to enhance task completion and user experience.
 
+**CORE PRINCIPLE — ASK ONE THING AT A TIME.** Do NOT front-load a big questionnaire (e.g. one dialog with 5 numbered questions and parenthetical explanations). Ask a SINGLE focused question, use the answer to decide the next one, and continue interactively. One dialog = one question. This applies to every input/choice/confirmation dialog, not just tasks: cramming multiple questions into one prompt is the information-gathering version of bundling multiple steps into one task — it removes your ability to adapt and reads like a chat message. Only combine fields when they are genuinely one inseparable unit (e.g. a start date AND end date of one range).
+
 **WHEN TO USE HUMAN-IN-THE-LOOP TOOLS:**
 
 1. **Ambiguous Requirements** - When user instructions are unclear or could have multiple interpretations
@@ -2630,14 +2700,15 @@ You have access to Human-in-the-Loop tools that allow you to interact directly w
 7. **Error Handling** - When encountering issues that require user guidance to resolve
 
 **AVAILABLE TOOLS:**
-- `get_user_input` - Single-line text/number input (names, values, paths, etc.)
-- `get_user_choice` - Multiple choice selection (pick from options)
-- `get_multiline_input` - Long-form text (descriptions, code, documents)
+- `get_user_input` - Single-line text/number input for ONE focused question (names, values, paths, etc.)
+- `get_user_choice` - Multiple choice selection for ONE decision (pick from options)
+- `get_multiline_input` - Long-form text for ONE open-ended answer (a description, code, a document) — not a multi-question form
 - `show_confirmation_dialog` - Yes/No decisions (confirmations, approvals)
 - `show_info_message` - Status updates and notifications
-- `assign_task_to_human` - Delegate ONE atomic physical-world ACTION and wait (long-running) for the human to report Completed/Failed/Still-progressing with an optional note and file/image attachments. Its report describes task execution, so: do NOT use it to ask questions or request information (use the input/choice tools for that), do NOT bundle multiple steps into one task (assign them as separate sequential tasks, adjusting each from the previous report), and keep `task_description` to a single actionable instruction (it's a work order, not a chat message). It first shows a non-focus-stealing ringing notification (View/Cancel). Uses a heartbeat protocol: always pass your own `client_timeout_seconds` and `max_result_bytes` (your client's tool-result size limit, e.g. 1000000 for Claude Desktop); when you get `status: "heartbeat"` or `status: "opened"` re-call with the same `task_id` (do not respond to the user in between). Completed/failed keep the session open for your review — re-call with the same `task_id` and updated `task_description` to request a re-submission (e.g. a smaller attachment). Cancel on the notification returns `status: "failed"`. Submissions are archived to a local outbox.
+- `assign_task_to_human` - Delegate ONE atomic action the assistant CANNOT do itself (must be handed to a human — a physical-world action is the common case) and wait (long-running) for the human to report Completed/Failed/Still-progressing with an optional note and file/image attachments. Its report describes task execution, so: do NOT use it to ask questions or request information (use the input/choice tools for that), do NOT bundle multiple steps into one task (assign them as separate sequential tasks, adjusting each from the previous report), and keep `task_description` to a single actionable instruction (it's a work order, not a chat message). It first shows a non-focus-stealing ringing notification (View/Cancel). Uses a heartbeat protocol: always pass your own `client_timeout_seconds` and `max_result_bytes` (your client's tool-result size limit); when you get `status: "heartbeat"` or `status: "opened"` re-call with the same `task_id` (do not respond to the user in between). Completed/failed keep the session open for your review — re-call with the same `task_id` and updated `task_description` to request a re-submission (e.g. a smaller attachment). Cancel on the notification returns `status: "failed"`. Submissions are archived to a local outbox.
 
 **BEST PRACTICES:**
+- Ask ONE focused question per dialog; let the answer shape the next question (do NOT front-load a multi-question form)
 - Ask specific, clear questions with context
 - Provide helpful default values when possible
 - Use confirmation dialogs before destructive actions
@@ -2677,7 +2748,7 @@ ASK YOURSELF:
 3. Could this action cause problems if wrong? → USE CONFIRMATION DIALOG
 4. Is this a long process the user should know about? → USE INFO MESSAGE
 5. Do I need detailed explanation or content? → USE MULTILINE INPUT
-6. Do I need the human to physically DO something in the real world (one action)? → USE assign_task_to_human
+6. Is there ONE action you CANNOT do yourself that a human must carry out (a physical-world action, or anything needing a person)? → USE assign_task_to_human
    - Asking a question is NOT a task — use the input/choice tools.
    - Several steps are NOT one task — assign them one at a time, sequentially.
 
@@ -2685,10 +2756,10 @@ AVOID OVERUSE:
 - Don't ask for information already provided
 - Don't seek confirmation for obviously safe operations
 - Don't interrupt flow for trivial decisions
-- Don't ask multiple questions when one comprehensive dialog would suffice
+- Don't front-load a questionnaire — ask one focused question at a time and adapt from each answer
 
 OPTIMIZE FOR USER EXPERIENCE:
-- Batch related questions together when possible
+- Ask incrementally: one question → use the answer → the next question. This beats one giant multi-question dialog and lets you adapt.
 - Provide context for why you need the information
 - Offer sensible defaults and suggestions
 - Make dialogs self-explanatory and actionable""",
@@ -2720,7 +2791,12 @@ OPTIMIZE FOR USER EXPERIENCE:
    - Show progress and intermediate results
    - Confirm successful completion of user-guided actions"""
     }
-    
+
+    # Prepend who the operator is so the assistant knows who it's serving.
+    profile_block = _format_operator_profile()
+    guidance["operator_profile"] = profile_block
+    guidance["main_prompt"] = profile_block + "\n" + guidance["main_prompt"]
+
     return guidance
 
 # Add a health check tool
@@ -2754,7 +2830,12 @@ async def health_check() -> Dict[str, Any]:
                 "show_info_message",
                 "assign_task_to_human",
                 "get_human_loop_prompt"
-            ]
+            ],
+            "operator": {
+                "name": (human_loop_config.get_profile().get("name") or "").strip() or None,
+                "profile_configured": bool((human_loop_config.get_profile().get("name") or "").strip()),
+            },
+            "config_path": human_loop_config.get_config_path(),
         }
     except Exception as e:
         return {

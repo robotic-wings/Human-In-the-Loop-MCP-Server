@@ -67,6 +67,7 @@ test = [
 [project.scripts]
 hitl-mcp-server = "human_loop_server:main"
 hitl_mcp_server = "human_loop_server:main"
+hitl-management-console = "management_console:main"
 
 [project.urls]
 Homepage = "https://github.com/GongRzhe/Human-In-the-Loop-MCP-Server"
@@ -79,11 +80,17 @@ Changelog = "https://github.com/GongRzhe/Human-In-the-Loop-MCP-Server/releases"
 packages = ["."]
 include = [
     "human_loop_server.py",
+    "human_loop_config.py",
+    "management_console.py",
+    "notify.wav",
 ]
 
 [tool.hatch.build.targets.sdist]
 include = [
     "human_loop_server.py",
+    "human_loop_config.py",
+    "management_console.py",
+    "notify.wav",
     "README.md",
     "LICENSE",
 ]

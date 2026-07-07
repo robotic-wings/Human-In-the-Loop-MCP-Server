@@ -16,7 +16,7 @@ A powerful **Model Context Protocol (MCP) Server** that enables AI assistants li
 - **Multi-line Input**: Collect longer text content, code, or detailed descriptions
 - **Confirmation Dialogs**: Ask for yes/no decisions before proceeding with actions
 - **Information Messages**: Display notifications, status updates, and results
-- **Delegate a Task to a Human**: Hand off a real-world task and wait (long-running) for the human to report **Completed / Failed / Still-progressing**, with an optional written note and file/image attachments. Starts with a non-focus-stealing **ringing notification** (so it doesn't interrupt), survives client tool-call timeouts via a heartbeat protocol, detects assistant disconnection, and archives every submission to a local **Outbox**.
+- **Delegate a Task to a Human**: Hand off one action the assistant can't do itself (a physical-world action is the common case) and wait (long-running) for the human to report **Completed / Failed / Still-progressing**, with an optional written note and file/image attachments. Starts with a non-focus-stealing **ringing notification** (so it doesn't interrupt), survives client tool-call timeouts via a heartbeat protocol, detects assistant disconnection, and archives every submission to a local **Outbox**.
 - **Health Check**: Monitor server status and GUI availability
 
 ### 🎨 Modern Cross-Platform GUI
@@ -218,7 +218,7 @@ result = await show_info_message(
 ```
 
 ### 6. `assign_task_to_human`
-Delegate **one atomic physical-world action** to a human and wait — potentially for a long time — for them to report back, optionally with a written note and file/image attachments.
+Delegate **one atomic action the assistant can't do itself** to a human and wait — potentially for a long time — for them to report back, optionally with a written note and file/image attachments. A physical-world action is the common case, but the defining trait is just that the assistant can't do it — anything requiring a person (their hands, presence, judgment, credentials, or access the assistant lacks) qualifies.
 
 **Scope — what this tool is (and is NOT) for.** The human's report describes *task execution*, so:
 - **Not for questions / information.** Don't use it to ask the human anything (a date, a status, a preference) — use `get_user_input` / `get_multiline_input` / `get_user_choice`. The report is a completion status, not an answer.
@@ -281,20 +281,32 @@ status = await health_check()
 # Returns detailed platform and functionality information
 ```
 
-## 📤 Outbox & Viewer
+## 🖥️ Management Console
+
+A standalone, tabbed GUI (`management_console.py`, classic Windows-9x styling) is the operator's control panel. Run it with:
+
+```bash
+python management_console.py    # or, if installed: hitl-management-console
+```
+
+Tabs:
+- **Outbox** — browse, open attachments in, and delete the archived task submissions (see below).
+- **User Profile** — your name, role, responsibilities, and how you'd like the AI to communicate with you. The server injects this into its guidance prompt so the assistant knows who it's working with. Leaving role/responsibilities empty means "can be assigned any task."
+- **Server** — bring the MCP server **Online / Offline** over HTTP on a chosen port/host. The console owns the process; closing the console takes the server Offline. (Point a URL-based MCP client at the shown `http://host:port/mcp` endpoint; dialogs pop on this machine's desktop.)
+- **Task Options** — default task timeout, default max result size, and whether file/image attachments are enabled. The timeout/size defaults are **fallbacks**: used only when the AI doesn't pass its own value.
+- **Notification** — pick the incoming-task ringtone (a `.wav`, or the bundled `notify.wav`), preview it, or mute.
+
+Settings persist to `~/.human_loop_config.json` (override with `HUMAN_LOOP_CONFIG`). The server reads this file live, so most changes apply without restarting it. Environment variables still win over the config file where both apply.
+
+> **Roadmap (not yet implemented):** the config schema is versioned and structured to grow toward multi-operator, enterprise use — per-user login, an operator `secret_key` the AI must present to call in, and organization "super accounts" that control which settings each user may change.
+
+## 📤 Outbox
 
 Every human submission sent through `assign_task_to_human` (the AI's command + description, the human's note, and copies of all attachments) is archived to disk so nothing is lost when the window is cleared or closed.
 
 - **Location:** `~/.human_loop_outbox/` by default, or set the `HUMAN_LOOP_OUTBOX_DIR` environment variable.
 - **Layout:** one directory per submission, each containing an `entry.json` and an `attachments/` folder with copies of the files.
-
-A standalone, dependency-free viewer (`outbox.py`, classic Windows 9x styling) lets you browse, open attachments, and delete entries:
-
-```bash
-python outbox.py
-# Uses the same location; override with:
-HUMAN_LOOP_OUTBOX_DIR=/path/to/outbox python outbox.py
-```
+- Browse/open/delete entries in the **Outbox** tab of the Management Console (above).
 
 ## 📋 Response Format
 
@@ -427,7 +439,9 @@ HITL_DEBUG=1 uvx hitl-mcp-server
 ```
 Human-In-the-Loop-MCP-Server/
 ├── human_loop_server.py       # Main server implementation
-├── outbox.py                 # Standalone Outbox viewer (Win 9x style)
+├── management_console.py      # Tabbed operator console (Outbox, Profile, Server, …)
+├── human_loop_config.py       # Shared config store (read by server + console)
+├── notify.wav                # Default notification ringtone
 ├── pyproject.toml            # Package configuration
 ├── README.md                 # Documentation
 ├── LICENSE                   # MIT License
