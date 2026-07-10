@@ -130,7 +130,39 @@ Then point a URL-based MCP client at `http://127.0.0.1:8000/mcp`. Notes:
 - The GUI dialogs still appear on **this machine's** desktop, so HTTP is mainly useful when the client runs on the same machine but connects by URL; a remote client's user won't see the local pop-ups.
 - Without the env var, behavior is unchanged (stdio).
 
+#### HTTPS / TLS (required by newer clients)
+
+Some clients — including recent **Claude Desktop** — only accept **HTTPS** URL connectors, and (being Electron/Chromium) they validate the certificate against your **system trust store**. A bare self-signed cert is therefore rejected with *"This Connection Is Not Private" / `ERR_CERT_AUTHORITY_INVALID`*. You need a cert issued by a CA that's installed in the trust store — which is exactly what [**mkcert**](https://github.com/FiloSottile/mkcert) sets up.
+
+**Recommended setup:**
+
+1. Install mkcert once: `brew install mkcert` (macOS; see the mkcert README for Linux/Windows).
+2. In the **Management Console → Server tab**: tick **Enable HTTPS**, click **Generate certificate…**. This runs `mkcert -install` (adds mkcert's local CA to your trust store — it may prompt for your password) and issues a cert into `~/.human_loop_certs/` with SANs for `localhost`/`127.0.0.1` and your bind host.
+3. **Go Online.** The endpoint becomes `https://host:port/mcp`.
+4. If Claude Desktop is already running, **restart it once** so it reloads the trust store.
+
+If mkcert isn't installed, **Generate** falls back to an `openssl` self-signed cert — usable for tools that let you bypass verification (e.g. `curl -k`), but **not** trusted by Claude Desktop until you trust it manually.
+
+To run the server directly instead of via the console, set the TLS env vars alongside the port:
+
+```bash
+HUMAN_LOOP_HTTP_PORT=8000 \
+HUMAN_LOOP_HTTPS=1 \
+HUMAN_LOOP_HTTPS_CERT=/path/to/server.crt \
+HUMAN_LOOP_HTTPS_KEY=/path/to/server.key \
+python human_loop_server.py
+# endpoint: https://127.0.0.1:8000/mcp
+```
+
+If `HUMAN_LOOP_HTTPS=1` but the cert/key file is missing, the server refuses to start with a clear message (exit code 2) rather than serving plaintext.
+
 ## 🛠️ Available Tools
+
+> **All interactive tools share one lifecycle.** Every tool below (and `assign_task_to_human`) first rings a small, **non-focus-stealing notification toast** (View / Cancel) instead of stealing focus, then waits with a **heartbeat** so a slow human never trips your client's tool-call timeout. Each accepts two extra optional parameters:
+> - `client_timeout_seconds` (int): your own per-tool-call timeout. The server returns `status: "heartbeat"` (nobody has answered yet) or `status: "opened"` (the human clicked View) safely before this deadline. On either, **re-call the same tool with the returned `interaction_id` and do not reply to the user in between.** Omit to use the server's configured default.
+> - `interaction_id` (str): leave empty to start; pass back the id from a `heartbeat`/`opened` response to keep the same dialog alive.
+>
+> The human's final answer arrives with `needs_continuation: false` and the tool's usual fields. Clicking **Cancel** on the notification returns the tool's cancelled/declined result.
 
 ### 1. `get_user_input`
 Get single-line text, numbers, or other data from users.
@@ -140,6 +172,7 @@ Get single-line text, numbers, or other data from users.
 - `prompt` (str): Question/prompt text  
 - `default_value` (str): Pre-filled value (optional)
 - `input_type` (str): "text", "integer", or "float" (default: "text")
+- `client_timeout_seconds` (int, optional), `interaction_id` (str, optional): the shared heartbeat protocol above.
 
 **Example Usage:**
 ```python
@@ -159,6 +192,7 @@ Present multiple options for user selection.
 - `prompt` (str): Question/prompt text
 - `choices` (List[str]): Available options
 - `allow_multiple` (bool): Allow multiple selections (default: false)
+- `client_timeout_seconds` (int, optional), `interaction_id` (str, optional): the shared heartbeat protocol above.
 
 **Example Usage:**
 ```python
@@ -177,6 +211,7 @@ Collect longer text content, code, or detailed descriptions.
 - `title` (str): Dialog window title
 - `prompt` (str): Question/prompt text
 - `default_value` (str): Pre-filled text (optional)
+- `client_timeout_seconds` (int, optional), `interaction_id` (str, optional): the shared heartbeat protocol above.
 
 **Example Usage:**
 ```python
@@ -193,6 +228,7 @@ Ask for yes/no confirmation before proceeding.
 **Parameters:**
 - `title` (str): Dialog window title
 - `message` (str): Confirmation message
+- `client_timeout_seconds` (int, optional), `interaction_id` (str, optional): the shared heartbeat protocol above.
 
 **Example Usage:**
 ```python
@@ -208,6 +244,7 @@ Display information, notifications, or status updates.
 **Parameters:**
 - `title` (str): Dialog window title
 - `message` (str): Information message
+- `client_timeout_seconds` (int, optional), `interaction_id` (str, optional): the shared heartbeat protocol above.
 
 **Example Usage:**
 ```python
@@ -283,7 +320,7 @@ status = await health_check()
 
 ## 🖥️ Management Console
 
-A standalone, tabbed GUI (`management_console.py`, classic Windows-9x styling) is the operator's control panel. Run it with:
+A standalone, tabbed GUI (`management_console.py`) is the operator's control panel. Run it with:
 
 ```bash
 python management_console.py    # or, if installed: hitl-management-console
@@ -291,8 +328,8 @@ python management_console.py    # or, if installed: hitl-management-console
 
 Tabs:
 - **Outbox** — browse, open attachments in, and delete the archived task submissions (see below).
-- **User Profile** — your name, role, responsibilities, and how you'd like the AI to communicate with you. The server injects this into its guidance prompt so the assistant knows who it's working with. Leaving role/responsibilities empty means "can be assigned any task."
-- **Server** — bring the MCP server **Online / Offline** over HTTP on a chosen port/host. The console owns the process; closing the console takes the server Offline. (Point a URL-based MCP client at the shown `http://host:port/mcp` endpoint; dialogs pop on this machine's desktop.)
+- **User Profile** — your name, role, responsibilities, and how you'd like the AI to communicate with you. The server surfaces this through channels the model actually reads: the MCP **`initialize` instructions** and the description of a dedicated **`get_operator_profile`** tool (tool descriptions are always in the model's context), plus a callable tool that returns it. (It is *not* only in the guidance prompt — MCP prompts are user-invoked and most clients never auto-load them.) Leaving role/responsibilities empty means "can be assigned any task." Because instructions/tool descriptions are read at server startup, **take the Server Offline then Online after editing your profile** to refresh what the AI sees.
+- **Server** — bring the MCP server **Online / Offline** over HTTP(S) on a chosen port/host. Tick **Enable HTTPS** to serve TLS (required by newer clients like Claude Desktop): point it at a PEM cert/key or click **Generate self-signed…** to create one via the system `openssl`. The console owns the process; closing the console takes the server Offline. (Point a URL-based MCP client at the shown `http(s)://host:port/mcp` endpoint; dialogs pop on this machine's desktop.)
 - **Task Options** — default task timeout, default max result size, and whether file/image attachments are enabled. The timeout/size defaults are **fallbacks**: used only when the AI doesn't pass its own value.
 - **Notification** — pick the incoming-task ringtone (a `.wav`, or the bundled `notify.wav`), preview it, or mute.
 
@@ -327,6 +364,9 @@ All tools return structured JSON responses:
 - `cancelled` (bool): Whether the user cancelled the dialog
 - `platform` (str): Operating system platform
 - `error` (str): Error message if operation failed
+- `status` (str, intermediate): `heartbeat` or `opened` while waiting (see the heartbeat protocol above); absent on the final answer
+- `needs_continuation` (bool): `true` on a `heartbeat`/`opened` response (re-call with the same `interaction_id`); `false` on the final answer
+- `interaction_id` (str): the id to pass back to continue the same dialog
 
 **Tool-Specific Fields:**
 - **get_user_input**: `user_input`, `input_type`
@@ -335,6 +375,28 @@ All tools return structured JSON responses:
 - **show_confirmation_dialog**: `confirmed`, `response`
 - **show_info_message**: `acknowledged`
 - **assign_task_to_human**: `status` (`heartbeat` / `opened` / `in_progress` / `completed` / `failed` / `cancelled` / `session_not_found` / `expired`), `human_action`, `needs_continuation`, `task_id`. Human submissions are returned as a content list (summary text + inline images/files) rather than a plain dict.
+
+## 🧭 Recommended System Prompt
+
+Give the AI a "commander" persona so it drives the whole mission itself and does all user interaction through the HITL tools. Fill in the two bracketed values to match your client's limits (the same ones you set in the Management Console's **Task Options** tab).
+
+```text
+You are a top-tier mastermind and commander, exceptionally skilled at personally
+directing and personally carrying out the missions the user entrusts to you. You can
+obtain information from the user, present information to the user, and hand off the
+concrete tasks you cannot do yourself for the user to perform. You can accept MCP tool
+results no larger than [SPECIFY SIZE HERE] bytes, and you will set the max_result_bytes
+argument to this value whenever you call assign_task_to_human; your MCP tool-call timeout
+is [SPECIFY TIMEOUT HERE] seconds.
+
+You follow the ReAct paradigm, but while reasoning you also plan holistically and think
+long-term so that the entire mission gets completed. After receiving a user request, you
+think about what to do next, then call a tool (a search tool, a HITL tool, or another
+tool); then, combining the prior context with the result this tool returned, you decide
+what to do next, and loop like this. Your text output is for your own internal thinking
+only — all interaction with the user happens through the HITL tools. Only when the mission
+is complete, or the user asks you to stop, may your text output stop.
+```
 
 ## 🧠 Best Practices for AI Integration
 

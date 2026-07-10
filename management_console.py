@@ -13,8 +13,6 @@ tabbed control panel for the operator:
   - Task Options  : default task timeout, default max result size, attachments on/off
   - Notification  : ringtone for incoming tasks + mute
 
-Classic Windows-9x styling (silver 3D widgets) via the ttk 'classic' theme.
-
 Run:  python management_console.py
 Settings are stored in ~/.human_loop_config.json (override $HUMAN_LOOP_CONFIG).
 The outbox archive matches the server: $HUMAN_LOOP_OUTBOX_DIR, else ~/.human_loop_outbox
@@ -43,7 +41,76 @@ PID_FILE = os.path.join(os.path.expanduser("~"), ".human_loop_server.pid")
 SERVER_LOG = os.path.join(os.path.expanduser("~"), ".human_loop_server.log")
 BUNDLED_RINGTONE = os.path.join(_HERE, "notify.wav")
 
+# Where auto-generated TLS material lives.
+CERT_DIR = os.path.join(os.path.expanduser("~"), ".human_loop_certs")
+DEFAULT_CERTFILE = os.path.join(CERT_DIR, "server.crt")
+DEFAULT_KEYFILE = os.path.join(CERT_DIR, "server.key")
+
 _server_python_cache = None
+
+
+def _cert_san_names(host):
+    """Loopback names plus the bind host, de-duplicated, order-stable."""
+    return list(dict.fromkeys([(host or "127.0.0.1").strip() or "127.0.0.1",
+                               "localhost", "127.0.0.1", "::1"]))
+
+
+def generate_trusted_cert(host, certfile=DEFAULT_CERTFILE, keyfile=DEFAULT_KEYFILE):
+    """Create a cert/key PEM pair for `host` (+ loopback names).
+
+    Prefers **mkcert**, which installs a locally-trusted CA into the OS/browser
+    trust stores so Electron/Chromium clients (Claude Desktop) accept the cert
+    without a security warning. Falls back to a bare **openssl** self-signed cert,
+    which the client must be told to trust manually.
+
+    Returns ``(certfile, keyfile, trusted)`` where ``trusted`` is True only for the
+    mkcert path. Raises RuntimeError (with a readable message) if neither tool is
+    available or generation fails.
+    """
+    os.makedirs(CERT_DIR, exist_ok=True)
+    host = (host or "127.0.0.1").strip() or "127.0.0.1"
+    names = _cert_san_names(host)
+
+    mkcert = shutil.which("mkcert")
+    if mkcert:
+        # Install the local CA into the system + browser trust stores (idempotent;
+        # may prompt for your password the first time).
+        subprocess.run([mkcert, "-install"], capture_output=True, text=True, timeout=180)
+        r = subprocess.run([mkcert, "-cert-file", certfile, "-key-file", keyfile] + names,
+                           capture_output=True, text=True, timeout=180)
+        if r.returncode == 0:
+            try:
+                os.chmod(keyfile, 0o600)
+            except OSError:
+                pass
+            return certfile, keyfile, True
+        # mkcert present but failed — fall through to self-signed.
+
+    openssl = shutil.which("openssl")
+    if not openssl:
+        raise RuntimeError(
+            "Neither mkcert nor openssl was found on PATH.\n\n"
+            "Install mkcert for a trusted certificate (recommended):\n"
+            "    brew install mkcert\n\n"
+            "…or install openssl, or point the certificate/key fields at an existing "
+            "PEM pair.")
+    san_str = ",".join(
+        (("IP:" + s) if s.replace(".", "").replace(":", "").isdigit() or ":" in s else ("DNS:" + s))
+        for s in names)
+    cmd = [
+        openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", keyfile, "-out", certfile,
+        "-days", "825", "-subj", f"/CN={host}",
+        "-addext", f"subjectAltName={san_str}",
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout or "openssl failed").strip())
+    try:
+        os.chmod(keyfile, 0o600)
+    except OSError:
+        pass
+    return certfile, keyfile, False
 
 
 def resolve_server_python():
@@ -80,7 +147,6 @@ def _read_tail(path, n=2500):
     except OSError:
         return ""
 
-# --- Classic Win 9x palette / fonts ---
 SILVER = "#C0C0C0"
 WHITE = "#FFFFFF"
 BLACK = "#000000"
@@ -610,18 +676,52 @@ class ServerTab:
         self.host = classic_entry(body, width=18)
         self.host.grid(row=1, column=1, sticky="w", pady=4)
 
+        # --- HTTPS / TLS ---
+        self.https_var = tk.BooleanVar(value=False)
+        self.https_chk = tk.Checkbutton(
+            body, text="Enable HTTPS  (required by Claude Desktop and other URL connectors)",
+            variable=self.https_var, command=self._toggle_https_fields,
+            bg=SILVER, activebackground=SILVER, font=CLASSIC_FONT, anchor="w")
+        self.https_chk.grid(row=2, column=0, columnspan=2, sticky="w", pady=(12, 2))
+
+        self.cert_lbl = classic_label(body, "Certificate (.pem):")
+        self.cert_lbl.grid(row=3, column=0, sticky="w", pady=4)
+        cert_row = tk.Frame(body, bg=SILVER)
+        cert_row.grid(row=3, column=1, sticky="ew", pady=4)
+        self.certfile = classic_entry(cert_row, width=30)
+        self.certfile.pack(side="left", fill="x", expand=True)
+        self.cert_browse = classic_button(cert_row, "Browse…", self._browse_cert, width=9)
+        self.cert_browse.pack(side="left", padx=(6, 0))
+
+        self.key_lbl = classic_label(body, "Private key (.pem):")
+        self.key_lbl.grid(row=4, column=0, sticky="w", pady=4)
+        key_row = tk.Frame(body, bg=SILVER)
+        key_row.grid(row=4, column=1, sticky="ew", pady=4)
+        self.keyfile = classic_entry(key_row, width=30)
+        self.keyfile.pack(side="left", fill="x", expand=True)
+        self.key_browse = classic_button(key_row, "Browse…", self._browse_key, width=9)
+        self.key_browse.pack(side="left", padx=(6, 0))
+
+        self.gen_btn = classic_button(body, "Generate certificate…", self._generate_cert, width=22)
+        self.gen_btn.grid(row=5, column=1, sticky="w", pady=(0, 2))
+        self.https_hint = classic_label(
+            body, "Claude Desktop only trusts CA-signed certs. Install mkcert "
+                  "(brew install mkcert) and click Generate for a\ncertificate it accepts; "
+                  "otherwise Generate makes a self-signed one you must trust manually.", fg=GRAY)
+        self.https_hint.grid(row=6, column=0, columnspan=2, sticky="w")
+
         self.status_var = tk.StringVar(value="● Offline")
         self.status_lbl = tk.Label(body, textvariable=self.status_var, bg=SILVER, fg=GRAY,
                                    font=CLASSIC_FONT_BOLD, anchor="w")
-        self.status_lbl.grid(row=2, column=0, columnspan=2, sticky="w", pady=(16, 4))
+        self.status_lbl.grid(row=7, column=0, columnspan=2, sticky="w", pady=(16, 4))
         self.endpoint_var = tk.StringVar(value="")
         self.endpoint_lbl = tk.Label(body, textvariable=self.endpoint_var, bg=SILVER, fg=BLACK,
                                      font=CLASSIC_FONT, anchor="w")
-        self.endpoint_lbl.grid(row=3, column=0, columnspan=2, sticky="w")
-        classic_label(body, "Going Online launches the MCP server over HTTP. Point a URL-based\n"
-                            "MCP client at the endpoint above. Dialogs pop on THIS machine's desktop.\n"
+        self.endpoint_lbl.grid(row=8, column=0, columnspan=2, sticky="w")
+        classic_label(body, "Going Online launches the MCP server. Point a URL-based MCP client at\n"
+                            "the endpoint above. Dialogs pop on THIS machine's desktop.\n"
                             "Closing this console takes the server Offline.", fg=GRAY).grid(
-            row=4, column=0, columnspan=2, sticky="w", pady=(12, 0))
+            row=9, column=0, columnspan=2, sticky="w", pady=(12, 0))
 
         bar = tk.Frame(self.frame, bg=SILVER, bd=1, relief="raised")
         bar.pack(side="bottom", fill="x")
@@ -635,7 +735,64 @@ class ServerTab:
     def _load(self):
         s = human_loop_config.load_config().get("server", {})
         self.port.delete(0, tk.END); self.port.insert(0, str(s.get("http_port", 8000)))
-        self.host.delete(0, tk.END); self.host.insert(0, str(s.get("http_host", "127.0.0.1")))
+        self.host.delete(0, tk.END); self.host.insert(0, str(s.get("http_host", "0.0.0.0")))
+        self.https_var.set(bool(s.get("https_enabled", False)))
+        self.certfile.delete(0, tk.END); self.certfile.insert(0, str(s.get("https_certfile", "")))
+        self.keyfile.delete(0, tk.END); self.keyfile.insert(0, str(s.get("https_keyfile", "")))
+        self._toggle_https_fields()
+
+    def _toggle_https_fields(self):
+        """Enable the TLS inputs only when HTTPS is checked (and we're offline)."""
+        on = self.https_var.get() and not self.is_online()
+        state = "normal" if on else "disabled"
+        for w in (self.certfile, self.keyfile, self.cert_browse, self.key_browse, self.gen_btn):
+            try:
+                w.config(state=state)
+            except Exception:
+                pass
+
+    def _browse_cert(self):
+        p = filedialog.askopenfilename(
+            title="Select TLS certificate (PEM)",
+            filetypes=[("PEM certificate", "*.pem *.crt *.cert"), ("All files", "*.*")])
+        if p:
+            self.certfile.delete(0, tk.END); self.certfile.insert(0, p)
+
+    def _browse_key(self):
+        p = filedialog.askopenfilename(
+            title="Select TLS private key (PEM)",
+            filetypes=[("PEM key", "*.pem *.key"), ("All files", "*.*")])
+        if p:
+            self.keyfile.delete(0, tk.END); self.keyfile.insert(0, p)
+
+    def _generate_cert(self):
+        host = self.host.get().strip() or "127.0.0.1"
+        try:
+            cert, key, trusted = generate_trusted_cert(host)
+        except Exception as e:
+            messagebox.showerror("Generate certificate", str(e))
+            return
+        self.certfile.delete(0, tk.END); self.certfile.insert(0, cert)
+        self.keyfile.delete(0, tk.END); self.keyfile.insert(0, key)
+        if trusted:
+            messagebox.showinfo(
+                "Generate certificate",
+                f"Created a locally-trusted certificate (via mkcert) for '{host}':\n\n"
+                f"{cert}\n{key}\n\n"
+                "mkcert also installed its local CA into your system trust store, so "
+                "Claude Desktop and browsers will accept it.\n\n"
+                "If the client is already running, restart it once so it reloads the "
+                "trust store.")
+        else:
+            messagebox.showwarning(
+                "Generate certificate",
+                f"Created a SELF-SIGNED certificate for '{host}':\n\n"
+                f"{cert}\n{key}\n\n"
+                "WARNING: self-signed certs are NOT trusted by Claude Desktop "
+                "(you'll see 'connection is not private' / ERR_CERT_AUTHORITY_INVALID).\n\n"
+                "For a certificate that just works, install mkcert and generate again:\n"
+                "    brew install mkcert\n\n"
+                "Otherwise you must manually trust this certificate in your OS keychain.")
 
     def is_online(self):
         if self.proc is not None and self.proc.poll() is None:
@@ -654,7 +811,8 @@ class ServerTab:
         self._render()
 
     def _endpoint(self):
-        return f"http://{self.host.get().strip() or '127.0.0.1'}:{self.port.get().strip()}/mcp"
+        scheme = "https" if self.https_var.get() else "http"
+        return f"{scheme}://{self.host.get().strip() or '127.0.0.1'}:{self.port.get().strip()}/mcp"
 
     def toggle(self):
         if self.is_online():
@@ -678,13 +836,45 @@ class ServerTab:
                 "    uv run python management_console.py\n"
                 "(or create a .venv next to these files with fastmcp installed).")
             return
+        https_on = self.https_var.get()
+        cert = self.certfile.get().strip()
+        key = self.keyfile.get().strip()
+        if https_on:
+            # Offer to generate a self-signed pair if none is configured yet.
+            if not cert and not key:
+                if messagebox.askyesno(
+                        "HTTPS",
+                        "HTTPS is enabled but no certificate is set.\n\n"
+                        "Generate one now? (mkcert is used for a trusted certificate "
+                        "if installed; otherwise a self-signed one you must trust.)"):
+                    try:
+                        cert, key, _trusted = generate_trusted_cert(host)
+                        self.certfile.delete(0, tk.END); self.certfile.insert(0, cert)
+                        self.keyfile.delete(0, tk.END); self.keyfile.insert(0, key)
+                    except Exception as e:
+                        messagebox.showerror("Server", f"Could not generate a certificate:\n{e}")
+                        return
+                else:
+                    return
+            missing = [name for name, p in (("certificate", cert), ("private key", key))
+                       if not p or not os.path.isfile(p)]
+            if missing:
+                messagebox.showwarning(
+                    "Server", f"The TLS {' and '.join(missing)} file is missing.\n\n"
+                              "Pick an existing PEM file or generate a self-signed pair.")
+                return
         cfg = human_loop_config.load_config()
-        cfg["server"] = {"http_port": int(port), "http_host": host}
+        cfg["server"] = {
+            "http_port": int(port), "http_host": host,
+            "https_enabled": https_on, "https_certfile": cert, "https_keyfile": key,
+        }
         try:
             human_loop_config.save_config(cfg)
         except Exception:
             pass
         env = dict(os.environ, HUMAN_LOOP_HTTP_PORT=port, HUMAN_LOOP_HTTP_HOST=host)
+        if https_on:
+            env.update(HUMAN_LOOP_HTTPS="1", HUMAN_LOOP_HTTPS_CERT=cert, HUMAN_LOOP_HTTPS_KEY=key)
         try:
             self._logf = open(SERVER_LOG, "w")
             self.proc = subprocess.Popen([py, SERVER_SCRIPT], env=env,
@@ -752,6 +942,7 @@ class ServerTab:
             self.toggle_btn.config(text="Go Offline")
             self.port.config(state="disabled")
             self.host.config(state="disabled")
+            self.https_chk.config(state="disabled")
         else:
             self.status_var.set("● Offline")
             self.status_lbl.config(fg=GRAY)
@@ -759,6 +950,8 @@ class ServerTab:
             self.toggle_btn.config(text="Go Online")
             self.port.config(state="normal")
             self.host.config(state="normal")
+            self.https_chk.config(state="normal")
+        self._toggle_https_fields()
 
     def shutdown(self):
         """Called when the console is closing: stop a server we own."""

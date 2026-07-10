@@ -46,8 +46,46 @@ def _out(*args):
     sys.stderr.write(" ".join(str(a) for a in args) + "\n")
     sys.stderr.flush()
 
-# Initialize the MCP server
-mcp = FastMCP("Human-in-the-Loop Server")
+
+def _format_operator_profile():
+    """Human-readable block describing who the operator is, from the config file.
+
+    This must reach the model through channels it ACTUALLY reads — MCP prompts are
+    user-invoked and most clients never load them, so we surface the profile via
+    the server `instructions` (the initialize response) and tool descriptions
+    instead. Read at server startup; edit the profile then take the server
+    Offline/Online in the Management Console to refresh it.
+    """
+    p = human_loop_config.get_profile()
+    name = (p.get("name") or "").strip()
+    role = (p.get("role") or "").strip()
+    resp = (p.get("responsibilities") or "").strip()
+    comm = (p.get("communication") or "").strip()
+    lines = ["ABOUT THE HUMAN OPERATOR YOU ARE ASSISTING:"]
+    lines.append(f"- Name: {name}" if name else "- Name: (not provided)")
+    lines.append(f"- Role: {role}" if role else "- Role: (unspecified)")
+    if resp:
+        lines.append(f"- Responsibilities: {resp}")
+    if not role and not resp:
+        lines.append("- Scope: no role/responsibilities set — they can be assigned ANY task.")
+    if comm:
+        lines.append(f"- How to communicate with them: {comm}")
+    return "\n".join(lines)
+
+
+def _server_instructions():
+    """The MCP `instructions` string (delivered in the initialize response)."""
+    return (
+        "This server lets you interact with a human operator through GUI dialogs "
+        "(ask questions, get choices/confirmations, and delegate real-world tasks) "
+        "and to know who that operator is.\n\n"
+        + _format_operator_profile()
+    )
+
+
+# Initialize the MCP server. `instructions` rides along in the initialize
+# response so clients that surface it give the model the operator's identity.
+mcp = FastMCP("Human-in-the-Loop Server", instructions=_server_instructions())
 
 # --------------------------------------------------------------------------- #
 # Outbox: local, on-disk archive of everything the human sends to the AI
@@ -659,6 +697,29 @@ def configure_window_for_platform(window):
     except Exception as e:
         _out(f"Warning: Platform-specific window configuration failed: {e}")
 
+
+def keep_notification_in_front(window):
+    """Make a ringing HITL notification visible above every normal window.
+
+    Setting ``-topmost`` before a Toplevel has been mapped is not sufficient on
+    every window manager (notably macOS), so callers also re-apply this once the
+    window becomes visible.
+    """
+    try:
+        window.attributes("-topmost", True)
+        window.lift()
+        if IS_MACOS:
+            configure_macos_app()
+        window.focus_force()
+    except Exception as e:
+        _out(f"Warning: could not bring HITL notification to front: {e}")
+
+def content_text_height(text, minh=2, cap=8):
+    """Line count to request for a bounded prompt/message Text: fits short content,
+    caps tall content (which then scrolls)."""
+    return min(max(minh, len((text or "").splitlines()) + 1), cap)
+
+
 def build_readonly_text(parent, content, theme_colors, height=6, width=None):
     """A bounded, scrollable Text that is read-only but still selectable/copyable.
     Used for any potentially long body/message so it scrolls instead of clipping
@@ -697,164 +758,255 @@ def build_readonly_text(parent, content, theme_colors, height=6, width=None):
     return wrap, txt
 
 
-def create_input_dialog(root, title: str, prompt: str, default_value: str = "", input_type: str = "text"):
-    """Build a modern input dialog as a child of the shared root (main thread)."""
-    try:
-        return ModernInputDialog(root, title, prompt, default_value, input_type).result
-    except Exception as e:
-        _out(f"Error in input dialog: {e}")
-        return None
+class _LegAwareWindow:
+    """Shared countdown + disconnect-watchdog + close for any window that must live
+    across heartbeats (the notification toast and every dialog).
 
-def show_confirmation(root, title: str, message: str):
-    """Build a modern confirmation dialog on the shared root (main thread)."""
-    try:
-        return ModernConfirmationDialog(root, title, message).result
-    except Exception as e:
-        _out(f"Error in confirmation dialog: {e}")
-        return False
+    A subclass must set ``self._top`` (its Toplevel) and ``self.session`` and call
+    ``self._init_leg()``. It may override ``_render_status`` (to show countdown/
+    disconnect state), ``_on_autoclose`` (what to do when the assistant goes
+    silent), and ``_ring_stop`` (windows that ring)."""
 
-def show_info(root, title: str, message: str):
-    """Build a modern info dialog on the shared root (main thread)."""
-    try:
-        return ModernInfoDialog(root, title, message).result
-    except Exception as e:
-        _out(f"Error in info dialog: {e}")
-        return False
+    WARN_SECONDS = 10
 
-class ModernInputDialog:
-    def __init__(self, parent, title, prompt, default_value="", input_type="text"):
-        self.result = None
-        self.input_type = input_type
-        
-        # Get theme colors
-        self.theme_colors = get_theme_colors()
-        
-        # Create the dialog window
-        self.dialog = tk.Toplevel(parent)
-        self.dialog.title(title)
-        self.dialog.grab_set()
-        self.dialog.resizable(False, False)
-        
-        # Apply modern window styling
-        configure_modern_window(self.dialog)
-        
-        # Set size based on platform
-        if IS_WINDOWS:
-            self.dialog.geometry("420x300")
-        else:
-            self.dialog.geometry("400x285")
+    def _init_leg(self):
+        self._alive = True
+        self._leg_seconds = None
+        self._last_contact = None
+        self._ui_after = None
 
-        self.center_window()
-        
-        # Create the main frame
-        main_frame = tk.Frame(self.dialog, bg=self.theme_colors["bg_primary"])
-        main_frame.pack(fill="both", expand=True, padx=24, pady=20)
-        
-        # Title label
-        title_label = tk.Label(
-            main_frame,
-            text=title,
-            bg=self.theme_colors["bg_primary"],
-            fg=self.theme_colors["fg_primary"],
-            font=get_title_font(),
-            anchor="w"
-        )
-        title_label.pack(fill="x", pady=(0, 8))
-        
-        # Prompt label
-        prompt_label = tk.Label(
-            main_frame,
-            text=prompt,
-            bg=self.theme_colors["bg_primary"],
-            fg=self.theme_colors["fg_secondary"],
-            font=get_system_font(),
-            wraplength=350,
-            justify="left",
-            anchor="w"
-        )
-        prompt_label.pack(fill="x", pady=(0, 20))
-        
-        # Input field
-        input_frame = tk.Frame(main_frame, bg=self.theme_colors["bg_primary"])
-        input_frame.pack(fill="x", pady=(0, 24))
-        
-        self.entry = tk.Entry(
-            input_frame,
-            font=get_system_font(),
-            bg=self.theme_colors["bg_primary"],
-            fg=self.theme_colors["fg_primary"],
-            relief="solid",
-            borderwidth=1,
-            highlightthickness=1,
-            highlightcolor=self.theme_colors["accent_color"],
-            highlightbackground=self.theme_colors["border_color"],
-            insertbackground=self.theme_colors["accent_color"]
-        )
-        self.entry.pack(fill="x", ipady=8, ipadx=12)
-        
-        if default_value:
-            self.entry.insert(0, default_value)
-            self.entry.select_range(0, tk.END)
-        # Live validation as the user types (enables/disables OK for numeric types).
-        self.entry.bind("<KeyRelease>", self._validate)
+    def begin_countdown(self, leg_seconds):
+        """Called each time the assistant checks in (starts a new wait leg)."""
+        self._leg_seconds = max(1, leg_seconds)
+        self._last_contact = time.monotonic()
+        if self._ui_after is None:
+            self._ui_tick()
 
-        # Inline validation hint, shown only when the value doesn't match input_type.
-        self.hint_label = tk.Label(
-            main_frame, text="", bg=self.theme_colors["bg_primary"],
-            fg=self.theme_colors.get("error_color", self.theme_colors["fg_secondary"]),
-            font=get_system_font(), anchor="w", justify="left")
-        self.hint_label.pack(fill="x", pady=(0, 12))
+    @staticmethod
+    def _fmt(seconds):
+        seconds = max(0, int(seconds))
+        return f"{seconds // 60:d}:{seconds % 60:02d}"
 
-        # Button frame
-        button_frame = tk.Frame(main_frame, bg=self.theme_colors["bg_primary"])
-        button_frame.pack(fill="x")
-        
-        # Create modern buttons
-        self.ok_button = create_modern_button(
-            button_frame, "OK", self.ok_clicked, "primary", self.theme_colors
-        )
-        self.ok_button.pack(side=tk.RIGHT, padx=(8, 0))
-        
-        self.cancel_button = create_modern_button(
-            button_frame, "Cancel", self.cancel_clicked, "secondary", self.theme_colors
-        )
-        self.cancel_button.pack(side=tk.RIGHT)
-        
-        # Handle window close and keyboard shortcuts
-        self.dialog.protocol("WM_DELETE_WINDOW", self.cancel_clicked)
-        self.dialog.bind('<Return>', lambda e: self.ok_clicked())
-        self.dialog.bind('<Escape>', lambda e: self.cancel_clicked())
-        
-        # Focus on entry, set initial OK enabled/disabled state.
-        self.entry.focus_set()
-        self._validate()
+    def _ui_tick(self):
+        if not self._alive:
+            self._ui_after = None
+            return
+        if self._last_contact is None:
+            self._ui_after = self._top.after(500, self._ui_tick)
+            return
+        idle = time.monotonic() - self._last_contact
+        leg = self._leg_seconds or 1
+        over = idle - leg
+        if over >= AUTO_CLOSE_AFTER_SECONDS:
+            self._on_autoclose()
+            return
+        try:
+            self._render_status(leg - idle, over, idle)
+        except Exception:
+            pass
+        self._ui_after = self._top.after(1000, self._ui_tick)
 
-        # Wait for dialog completion
-        self.dialog.wait_window()
+    def _render_status(self, remaining, over, idle):
+        """Default: no visible status. Override to update a label."""
 
-    def center_window(self):
-        """Center the dialog window on screen"""
-        self.dialog.update_idletasks()
-        width = self.dialog.winfo_width()
-        height = self.dialog.winfo_height()
-        screen_width = self.dialog.winfo_screenwidth()
-        screen_height = self.dialog.winfo_screenheight()
-        x = (screen_width // 2) - (width // 2)
-        y = (screen_height // 2) - (height // 2)
+    def _on_autoclose(self):
+        """Default: tell the async side the assistant went silent, then close."""
+        try:
+            self.session.submit_from_ui({"kind": "decline", "reason": "assistant_disconnected"})
+        except Exception:
+            pass
+        self.close()
 
+    def _ring_stop(self):
+        """Hook for windows that play a ringtone."""
+
+    def close(self):
+        self._alive = False
+        try:
+            self._ring_stop()
+        except Exception:
+            pass
+        if self._ui_after:
+            try:
+                self._top.after_cancel(self._ui_after)
+            except Exception:
+                pass
+            self._ui_after = None
+        try:
+            self._top.destroy()
+        except Exception:
+            pass
+        try:
+            if getattr(self.session, "dialog", None) is self:
+                self.session.dialog = None
+        except Exception:
+            pass
+
+    def _center_window(self):
+        w = self._top
+        w.update_idletasks()
+        width = w.winfo_width()
+        height = w.winfo_height()
+        sw = w.winfo_screenwidth()
+        sh = w.winfo_screenheight()
+        x = (sw // 2) - (width // 2)
+        y = (sh // 2) - (height // 2)
         if IS_MACOS:
             y = max(50, y - 50)
         elif IS_WINDOWS:
             y = max(30, y - 30)
+        w.geometry(f"{width}x{height}+{x}+{y}")
 
-        self.dialog.geometry(f"{width}x{height}+{x}+{y}")
+
+class InteractionDialog(_LegAwareWindow):
+    """Non-modal dialog skeleton shared by the simple input/choice/confirm/etc.
+    dialogs. Replaces the old modal ``wait_window()`` classes: results flow to the
+    async side via ``session.submit_from_ui`` instead of blocking.
+
+    Layout (pack): title (top), bounded scrollable prompt, [body — subclass fills,
+    expands], hidden status/countdown label, buttons pinned to the bottom.
+    Subclasses override ``_build_body``/``_build_buttons`` and call ``self._submit``.
+    """
+
+    HAS_BODY = True   # False for message-only dialogs (confirm/info)
+
+    def __init__(self, parent, session):
+        self.parent = parent
+        self.session = session
+        self.theme_colors = get_theme_colors()
+        self._init_leg()
+        p = session.params or {}
+        c = self.theme_colors
+
+        self._top = tk.Toplevel(parent)
+        self._top.title(p.get("title") or "")
+        self._top.resizable(True, True)
+        self._top.minsize(*self._minsize())
+        configure_modern_window(self._top)   # raise/focus — fine, the human clicked View
+        gw, gh = self._geometry()
+        self._top.geometry(f"{gw}x{gh}")
+
+        main = tk.Frame(self._top, bg=c["bg_primary"])
+        main.pack(fill="both", expand=True, padx=24, pady=20)
+
+        tk.Label(main, text=p.get("title") or "", bg=c["bg_primary"], fg=c["fg_primary"],
+                 font=get_title_font(), anchor="w", justify="left",
+                 wraplength=520).pack(side="top", fill="x", pady=(0, 8))
+
+        # Buttons pinned to the bottom so a long prompt can never push them off.
+        self._button_bar = tk.Frame(main, bg=c["bg_primary"])
+        self._button_bar.pack(side="bottom", fill="x", pady=(12, 0))
+
+        # Hidden-by-default countdown/disconnect status line.
+        self.status_label = tk.Label(main, text="", bg=c["bg_primary"], fg=c["fg_secondary"],
+                                     font=get_system_font(), anchor="w", justify="left")
+        if SHOW_CONNECTION_STATUS:
+            self.status_label.pack(side="bottom", fill="x", pady=(6, 0))
+
+        prompt = p.get("prompt")
+        if prompt:
+            cap = 8 if self.HAS_BODY else 16
+            pf, _ = build_readonly_text(main, prompt, c, height=content_text_height(prompt, cap=cap))
+            pf.pack(side="top", fill="x" if self.HAS_BODY else "both",
+                    expand=not self.HAS_BODY, pady=(0, 12))
+
+        if self.HAS_BODY:
+            self._body = tk.Frame(main, bg=c["bg_primary"])
+            self._body.pack(side="top", fill="both", expand=True)
+            self._build_body(self._body)
+
+        self._build_buttons(self._button_bar)
+
+        self._top.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._top.update_idletasks()
+        self._center_window()
+
+    # ---- overridable geometry / body / buttons ---- #
+    def _minsize(self):
+        return (380, 300)
+
+    def _geometry(self):
+        return (460, 360) if IS_WINDOWS else (440, 345)
+
+    def _build_body(self, parent):
+        pass
+
+    def _build_buttons(self, parent):
+        pass
+
+    # ---- status rendering (disconnect warning) ---- #
+    def _render_status(self, remaining, over, idle):
+        if not self._alive:
+            return
+        c = self.theme_colors
+        if over >= DISCONNECT_GRACE_SECONDS:
+            self.status_label.config(
+                text="The assistant may have disconnected — this dialog will close soon.",
+                fg=c.get("error_color", c["fg_secondary"]))
+        elif remaining > self.WARN_SECONDS:
+            self.status_label.config(
+                text=f"Assistant connected · next check-in in {self._fmt(remaining)}",
+                fg=c["fg_secondary"])
+        else:
+            self.status_label.config(
+                text="Syncing with assistant… (your work is safe)", fg=c["fg_secondary"])
+
+    # ---- result plumbing ---- #
+    def _submit(self, payload):
+        if not self._alive:
+            return
+        self.session.submit_from_ui(payload)
+        self.close()
+
+    def _on_close(self):
+        # Window closed via the window manager == cancel.
+        if not self._alive:
+            return
+        self.session.submit_from_ui({"cancelled": True})
+        self.close()
+
+
+class InputDialog(InteractionDialog):
+    """Single-line text / number input (was ModernInputDialog)."""
+
+    def _minsize(self):
+        return (360, 300)
+
+    def _geometry(self):
+        return (440, 360) if IS_WINDOWS else (420, 345)
+
+    def _build_body(self, parent):
+        p = self.session.params
+        self.input_type = p.get("input_type", "text")
+        c = self.theme_colors
+        self.entry = tk.Entry(
+            parent, font=get_system_font(), bg=c["bg_primary"], fg=c["fg_primary"],
+            relief="solid", borderwidth=1, highlightthickness=1,
+            highlightcolor=c["accent_color"], highlightbackground=c["border_color"],
+            insertbackground=c["accent_color"])
+        self.entry.pack(fill="x", ipady=8, ipadx=12, pady=(0, 8))
+        dv = p.get("default_value") or ""
+        if dv:
+            self.entry.insert(0, dv)
+            self.entry.select_range(0, tk.END)
+        self.entry.bind("<KeyRelease>", self._validate)
+        self.hint_label = tk.Label(
+            parent, text="", bg=c["bg_primary"],
+            fg=c.get("error_color", c["fg_secondary"]),
+            font=get_system_font(), anchor="w", justify="left")
+        self.hint_label.pack(fill="x")
+        self.entry.focus_set()
+
+    def _build_buttons(self, parent):
+        c = self.theme_colors
+        self.ok_button = create_modern_button(parent, "OK", self._ok, "primary", c)
+        self.ok_button.pack(side=tk.RIGHT, padx=(8, 0))
+        create_modern_button(parent, "Cancel", self._cancel, "secondary", c).pack(side=tk.RIGHT)
+        self._top.bind('<Return>', lambda e: self._ok())
+        self._top.bind('<Escape>', lambda e: self._cancel())
+        self._validate()
 
     def _parse_current(self):
-        """Return (is_valid, parsed_value) for the current entry text.
-
-        For integer/float, an empty or unparseable value is INVALID (so OK is
-        blocked — cancel via the Cancel button). Text is always valid.
-        """
         raw = self.entry.get()
         value = raw.strip()
         if self.input_type == "integer":
@@ -871,11 +1023,9 @@ class ModernInputDialog:
                 return (True, float(value))
             except ValueError:
                 return (False, None)
-        # text: any content is acceptable; empty means "no input" (→ cancelled).
         return (True, raw if raw else None)
 
     def _validate(self, *_):
-        """Enable/disable OK and show a hint based on the current value."""
         valid, _v = self._parse_current()
         try:
             self.ok_button.configure(state="normal" if valid else "disabled")
@@ -887,497 +1037,166 @@ class ModernInputDialog:
         else:
             self.hint_label.config(text="")
 
-    def ok_clicked(self):
+    def _ok(self):
         valid, parsed = self._parse_current()
         if not valid:
-            # OK is disabled in this state; also guard the Enter-key path.
             self._validate()
             return
-        self.result = parsed
-        self.dialog.destroy()
-    
-    def cancel_clicked(self):
-        self.result = None
-        self.dialog.destroy()
+        self._submit({"value": parsed})
 
-class ModernConfirmationDialog:
-    def __init__(self, parent, title, message):
-        self.result = False
-        
-        # Get theme colors
-        self.theme_colors = get_theme_colors()
-        
-        # Create the dialog window
-        self.dialog = tk.Toplevel(parent)
-        self.dialog.title(title)
-        self.dialog.grab_set()
-        self.dialog.resizable(True, True)
-        self.dialog.minsize(380, 210)
+    def _cancel(self):
+        self._submit({"cancelled": True})
 
-        # Apply modern window styling
-        configure_modern_window(self.dialog)
 
-        # Create the main frame
-        main_frame = tk.Frame(self.dialog, bg=self.theme_colors["bg_primary"])
-        main_frame.pack(fill="both", expand=True, padx=24, pady=20)
+class ChoiceBody(InteractionDialog):
+    """Pick one/many from a list (was ChoiceDialog)."""
 
-        # Title label
-        title_label = tk.Label(
-            main_frame,
-            text=title,
-            bg=self.theme_colors["bg_primary"],
-            fg=self.theme_colors["fg_primary"],
-            font=get_title_font(),
-            anchor="w"
-        )
-        title_label.pack(side="top", fill="x", pady=(0, 12))
+    def _minsize(self):
+        return (400, 340)
 
-        # Buttons pinned to the BOTTOM first, so they stay visible with long text.
-        button_frame = tk.Frame(main_frame, bg=self.theme_colors["bg_primary"])
-        button_frame.pack(side="bottom", fill="x", pady=(16, 0))
-        self.yes_button = create_modern_button(
-            button_frame, "Yes", self.yes_clicked, "primary", self.theme_colors
-        )
-        self.yes_button.pack(side=tk.RIGHT, padx=(8, 0))
-        self.no_button = create_modern_button(
-            button_frame, "No", self.no_clicked, "secondary", self.theme_colors
-        )
-        self.no_button.pack(side=tk.RIGHT)
-
-        # Message in a scrollable, read-only box so long text scrolls instead of
-        # clipping / pushing the buttons off-screen.
-        msg_height = min(max(3, len((message or "").splitlines()) + 1), 16)
-        msg_frame, _ = build_readonly_text(
-            main_frame, message, self.theme_colors, height=msg_height, width=48)
-        msg_frame.pack(side="top", fill="both", expand=True)
-
-        self.dialog.update_idletasks()
-        self.center_window()
-
-        # Handle window close and keyboard shortcuts
-        self.dialog.protocol("WM_DELETE_WINDOW", self.no_clicked)
-        self.dialog.bind('<Return>', lambda e: self.yes_clicked())
-        self.dialog.bind('<Escape>', lambda e: self.no_clicked())
-        
-        # Focus on No button by default (safer)
-        self.no_button.focus_set()
-        
-        # Wait for dialog completion
-        self.dialog.wait_window()
-    
-    def center_window(self):
-        """Center the dialog window on screen"""
-        self.dialog.update_idletasks()
-        width = self.dialog.winfo_width()
-        height = self.dialog.winfo_height()
-        screen_width = self.dialog.winfo_screenwidth()
-        screen_height = self.dialog.winfo_screenheight()
-        x = (screen_width // 2) - (width // 2)
-        y = (screen_height // 2) - (height // 2)
-        
+    def _geometry(self):
         if IS_MACOS:
-            y = max(50, y - 50)
-        elif IS_WINDOWS:
-            y = max(30, y - 30)
-            
-        self.dialog.geometry(f"{width}x{height}+{x}+{y}")
-    
-    def yes_clicked(self):
-        self.result = True
-        self.dialog.destroy()
-    
-    def no_clicked(self):
-        self.result = False
-        self.dialog.destroy()
+            return (480, 460)
+        if IS_WINDOWS:
+            return (500, 480)
+        return (450, 430)
 
-class ModernInfoDialog:
-    def __init__(self, parent, title, message):
-        self.result = True
-        
-        # Get theme colors
-        self.theme_colors = get_theme_colors()
-        
-        # Create the dialog window
-        self.dialog = tk.Toplevel(parent)
-        self.dialog.title(title)
-        self.dialog.grab_set()
-        self.dialog.resizable(True, True)
-        self.dialog.minsize(360, 200)
-
-        # Apply modern window styling
-        configure_modern_window(self.dialog)
-
-        # Create the main frame
-        main_frame = tk.Frame(self.dialog, bg=self.theme_colors["bg_primary"])
-        main_frame.pack(fill="both", expand=True, padx=24, pady=20)
-
-        # Title label
-        title_label = tk.Label(
-            main_frame,
-            text=title,
-            bg=self.theme_colors["bg_primary"],
-            fg=self.theme_colors["fg_primary"],
-            font=get_title_font(),
-            anchor="w"
-        )
-        title_label.pack(side="top", fill="x", pady=(0, 12))
-
-        # Button frame pinned to the BOTTOM first, so it is always visible even
-        # when the message is long.
-        button_frame = tk.Frame(main_frame, bg=self.theme_colors["bg_primary"])
-        button_frame.pack(side="bottom", fill="x", pady=(16, 0))
-        self.ok_button = create_modern_button(
-            button_frame, "OK", self.ok_clicked, "primary", self.theme_colors
-        )
-        self.ok_button.pack(side=tk.RIGHT)
-
-        # Message in a scrollable, read-only box so long text scrolls instead of
-        # clipping / pushing the button off-screen.
-        msg_height = min(max(3, len((message or "").splitlines()) + 1), 16)
-        msg_frame, _ = build_readonly_text(
-            main_frame, message, self.theme_colors, height=msg_height, width=46)
-        msg_frame.pack(side="top", fill="both", expand=True)
-
-        self.dialog.update_idletasks()
-        self.center_window()
-
-        # Handle window close and keyboard shortcuts
-        self.dialog.protocol("WM_DELETE_WINDOW", self.ok_clicked)
-        self.dialog.bind('<Return>', lambda e: self.ok_clicked())
-        self.dialog.bind('<Escape>', lambda e: self.ok_clicked())
-
-        # Focus on OK button
-        self.ok_button.focus_set()
-
-        # Wait for dialog completion
-        self.dialog.wait_window()
-    
-    def center_window(self):
-        """Center the dialog window on screen"""
-        self.dialog.update_idletasks()
-        width = self.dialog.winfo_width()
-        height = self.dialog.winfo_height()
-        screen_width = self.dialog.winfo_screenwidth()
-        screen_height = self.dialog.winfo_screenheight()
-        x = (screen_width // 2) - (width // 2)
-        y = (screen_height // 2) - (height // 2)
-        
-        if IS_MACOS:
-            y = max(50, y - 50)
-        elif IS_WINDOWS:
-            y = max(30, y - 30)
-            
-        self.dialog.geometry(f"{width}x{height}+{x}+{y}")
-    
-    def ok_clicked(self):
-        self.result = True
-        self.dialog.destroy()
-
-def create_choice_dialog(root, title: str, prompt: str, choices: List[str], allow_multiple: bool = False):
-    """Build a choice dialog as a child of the shared root (main thread)."""
-    try:
-        return ChoiceDialog(root, title, prompt, choices, allow_multiple).result
-    except Exception as e:
-        _out(f"Error in choice dialog: {e}")
-        return None
-
-def create_multiline_input_dialog(root, title: str, prompt: str, default_value: str = ""):
-    """Build a multi-line text input dialog on the shared root (main thread)."""
-    try:
-        return MultilineInputDialog(root, title, prompt, default_value).result
-    except Exception as e:
-        _out(f"Error in multiline dialog: {e}")
-        return None
-
-class ChoiceDialog:
-    def __init__(self, parent, title, prompt, choices, allow_multiple=False):
-        self.result = None
-        
-        # Get theme colors
-        self.theme_colors = get_theme_colors()
-        
-        # Create the dialog window
-        self.dialog = tk.Toplevel(parent)
-        self.dialog.title(title)
-        self.dialog.grab_set()
-        self.dialog.resizable(True, True)
-        
-        # Apply modern window styling
-        configure_modern_window(self.dialog)
-        
-        # Set size based on platform
-        if IS_MACOS:
-            self.dialog.geometry("480x400")
-        elif IS_WINDOWS:
-            self.dialog.geometry("500x420")
-        else:
-            self.dialog.geometry("450x350")
-        
-        self.center_window()
-        
-        # Create the main frame with modern styling
-        main_frame = tk.Frame(self.dialog, bg=self.theme_colors["bg_primary"])
-        main_frame.pack(fill="both", expand=True, padx=24, pady=20)
-        
-        # Configure grid weights
-        main_frame.columnconfigure(0, weight=1)
-        main_frame.rowconfigure(1, weight=1)
-        
-        # Add modern title label
-        title_label = tk.Label(
-            main_frame, 
-            text=title,
-            bg=self.theme_colors["bg_primary"],
-            fg=self.theme_colors["fg_primary"],
-            font=get_title_font(),
-            anchor="w"
-        )
-        title_label.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        
-        # Add prompt label with modern styling
-        prompt_label = tk.Label(
-            main_frame,
-            text=prompt,
-            bg=self.theme_colors["bg_primary"],
-            fg=self.theme_colors["fg_secondary"],
-            font=get_system_font(),
-            wraplength=450,
-            justify="left",
-            anchor="w"
-        )
-        prompt_label.grid(row=1, column=0, sticky="ew", pady=(0, 20))
-        
-        # Create choice selection widget with modern container
-        list_container = tk.Frame(main_frame, bg=self.theme_colors["bg_primary"])
-        list_container.grid(row=2, column=0, sticky="nsew", pady=(0, 24))
-        list_container.columnconfigure(0, weight=1)
-        list_container.rowconfigure(0, weight=1)
-        
-        # Modern listbox with styling
-        if allow_multiple:
-            self.listbox = tk.Listbox(list_container, selectmode=tk.MULTIPLE, height=8)
-        else:
-            self.listbox = tk.Listbox(list_container, selectmode=tk.SINGLE, height=8)
-        
+    def _build_body(self, parent):
+        p = self.session.params
+        allow_multiple = p.get("allow_multiple", False)
+        choices = p.get("choices") or []
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+        self.listbox = tk.Listbox(
+            parent, selectmode=tk.MULTIPLE if allow_multiple else tk.SINGLE, height=8)
         apply_modern_style(self.listbox, "listbox", self.theme_colors)
-        
-        for choice in choices:
-            self.listbox.insert(tk.END, choice)
+        for ch in choices:
+            self.listbox.insert(tk.END, ch)
         self.listbox.grid(row=0, column=0, sticky="nsew", padx=(0, 2))
-        
-        # Modern scrollbar
-        scrollbar = tk.Scrollbar(list_container, orient="vertical", command=self.listbox.yview)
-        apply_modern_style(scrollbar, "scrollbar", self.theme_colors)
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        self.listbox.configure(yscrollcommand=scrollbar.set)
-        
-        # Modern button frame
-        button_frame = tk.Frame(main_frame, bg=self.theme_colors["bg_primary"])
-        button_frame.grid(row=3, column=0, sticky="ew")
-        
-        # Create modern buttons
-        self.ok_button = create_modern_button(
-            button_frame, "OK", self.ok_clicked, "primary", self.theme_colors
-        )
-        self.ok_button.pack(side=tk.RIGHT, padx=(8, 0))
-        
-        self.cancel_button = create_modern_button(
-            button_frame, "Cancel", self.cancel_clicked, "secondary", self.theme_colors
-        )
-        self.cancel_button.pack(side=tk.RIGHT)
-        
-        # Handle window close
-        self.dialog.protocol("WM_DELETE_WINDOW", self.cancel_clicked)
-        
-        # Focus on listbox
-        self.listbox.focus_set()
+        sb = tk.Scrollbar(parent, orient="vertical", command=self.listbox.yview)
+        apply_modern_style(sb, "scrollbar", self.theme_colors)
+        sb.grid(row=0, column=1, sticky="ns")
+        self.listbox.configure(yscrollcommand=sb.set)
         if choices:
-            self.listbox.selection_set(0)  # Select first item by default
-        
-        # Platform-specific final setup
-        if IS_MACOS:
-            self.dialog.after(100, lambda: self.listbox.focus_set())
-        
-        # Add keyboard shortcuts
-        self.dialog.bind('<Return>', lambda e: self.ok_clicked())
-        self.dialog.bind('<Escape>', lambda e: self.cancel_clicked())
-        
-        # Wait for the dialog to complete
-        self.dialog.wait_window()
-    
-    def center_window(self):
-        """Center the dialog window on screen"""
-        self.dialog.update_idletasks()
-        width = self.dialog.winfo_width()
-        height = self.dialog.winfo_height()
-        
-        # Get screen dimensions
-        screen_width = self.dialog.winfo_screenwidth()
-        screen_height = self.dialog.winfo_screenheight()
-        
-        # Calculate center position
-        x = (screen_width // 2) - (width // 2)
-        y = (screen_height // 2) - (height // 2)
-        
-        # Platform-specific adjustments
-        if IS_MACOS:
-            y = max(50, y - 50)
-        elif IS_WINDOWS:
-            y = max(30, y - 30)
-        
-        self.dialog.geometry(f"{width}x{height}+{x}+{y}")
-    
-    def ok_clicked(self):
-        selection = self.listbox.curselection()
-        if selection:
-            selected_items = [self.listbox.get(i) for i in selection]
-            self.result = selected_items if len(selected_items) > 1 else selected_items[0]
-        self.dialog.destroy()
-    
-    def cancel_clicked(self):
-        self.result = None
-        self.dialog.destroy()
+            self.listbox.selection_set(0)
+        self.listbox.focus_set()
 
-class MultilineInputDialog:
-    def __init__(self, parent, title, prompt, default_value=""):
-        self.result = None
-        
-        # Get theme colors
-        self.theme_colors = get_theme_colors()
-        
-        # Create the dialog window
-        self.dialog = tk.Toplevel(parent)
-        self.dialog.title(title)
-        self.dialog.grab_set()
-        self.dialog.resizable(True, True)
-        
-        # Apply modern window styling
-        configure_modern_window(self.dialog)
-        
-        # Set size based on platform
+    def _build_buttons(self, parent):
+        c = self.theme_colors
+        create_modern_button(parent, "OK", self._ok, "primary", c).pack(side=tk.RIGHT, padx=(8, 0))
+        create_modern_button(parent, "Cancel", self._cancel, "secondary", c).pack(side=tk.RIGHT)
+        self._top.bind('<Return>', lambda e: self._ok())
+        self._top.bind('<Escape>', lambda e: self._cancel())
+
+    def _ok(self):
+        sel = self.listbox.curselection()
+        if not sel:
+            self._submit({"cancelled": True})
+            return
+        items = [self.listbox.get(i) for i in sel]
+        self._submit({"value": items if len(items) > 1 else items[0]})
+
+    def _cancel(self):
+        self._submit({"cancelled": True})
+
+
+class MultilineBody(InteractionDialog):
+    """Long-form text input (was MultilineInputDialog)."""
+
+    def _minsize(self):
+        return (460, 380)
+
+    def _geometry(self):
         if IS_MACOS:
-            self.dialog.geometry("580x480")
-        elif IS_WINDOWS:
-            self.dialog.geometry("600x500")
-        else:
-            self.dialog.geometry("550x450")
-        
-        self.center_window()
-        
-        # Create the main frame with modern styling
-        main_frame = tk.Frame(self.dialog, bg=self.theme_colors["bg_primary"])
-        main_frame.pack(fill="both", expand=True, padx=24, pady=20)
-        
-        # Configure grid weights
-        main_frame.columnconfigure(0, weight=1)
-        main_frame.rowconfigure(2, weight=1)
-        
-        # Add modern title label
-        title_label = tk.Label(
-            main_frame,
-            text=title,
-            bg=self.theme_colors["bg_primary"],
-            fg=self.theme_colors["fg_primary"],
-            font=get_title_font(),
-            anchor="w"
-        )
-        title_label.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        
-        # Add prompt label with modern styling
-        prompt_label = tk.Label(
-            main_frame,
-            text=prompt,
-            bg=self.theme_colors["bg_primary"],
-            fg=self.theme_colors["fg_secondary"],
-            font=get_system_font(),
-            wraplength=520,
-            justify="left",
-            anchor="w"
-        )
-        prompt_label.grid(row=1, column=0, sticky="ew", pady=(0, 20))
-        
-        # Create text widget container with modern styling
-        text_container = tk.Frame(main_frame, bg=self.theme_colors["bg_primary"])
-        text_container.grid(row=2, column=0, sticky="nsew", pady=(0, 24))
-        text_container.columnconfigure(0, weight=1)
-        text_container.rowconfigure(0, weight=1)
-        
-        # Modern text widget
-        self.text_widget = tk.Text(text_container, height=12)
+            return (580, 480)
+        if IS_WINDOWS:
+            return (600, 500)
+        return (550, 450)
+
+    def _build_body(self, parent):
+        p = self.session.params
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+        self.text_widget = tk.Text(parent, height=12)
         apply_modern_style(self.text_widget, "text", self.theme_colors)
         self.text_widget.grid(row=0, column=0, sticky="nsew", padx=(0, 2))
-        
-        # Modern scrollbar for text widget
-        text_scrollbar = tk.Scrollbar(text_container, orient="vertical", command=self.text_widget.yview)
-        apply_modern_style(text_scrollbar, "scrollbar", self.theme_colors)
-        text_scrollbar.grid(row=0, column=1, sticky="ns")
-        self.text_widget.configure(yscrollcommand=text_scrollbar.set)
-        
-        # Set default value with better formatting
-        if default_value:
-            self.text_widget.insert("1.0", default_value)
-        
-        # Modern button frame
-        button_frame = tk.Frame(main_frame, bg=self.theme_colors["bg_primary"])
-        button_frame.grid(row=3, column=0, sticky="ew")
-        
-        # Create modern buttons
-        self.ok_button = create_modern_button(
-            button_frame, "OK", self.ok_clicked, "primary", self.theme_colors
-        )
-        self.ok_button.pack(side=tk.RIGHT, padx=(8, 0))
-        
-        self.cancel_button = create_modern_button(
-            button_frame, "Cancel", self.cancel_clicked, "secondary", self.theme_colors
-        )
-        self.cancel_button.pack(side=tk.RIGHT)
-        
-        # Handle window close
-        self.dialog.protocol("WM_DELETE_WINDOW", self.cancel_clicked)
-        
-        # Focus on text widget
+        sb = tk.Scrollbar(parent, orient="vertical", command=self.text_widget.yview)
+        apply_modern_style(sb, "scrollbar", self.theme_colors)
+        sb.grid(row=0, column=1, sticky="ns")
+        self.text_widget.configure(yscrollcommand=sb.set)
+        dv = p.get("default_value") or ""
+        if dv:
+            self.text_widget.insert("1.0", dv)
         self.text_widget.focus_set()
-        
-        # Platform-specific final setup
-        if IS_MACOS:
-            self.dialog.after(100, lambda: self.text_widget.focus_set())
-        
-        # Add keyboard shortcuts
-        self.dialog.bind('<Control-Return>', lambda e: self.ok_clicked())
-        self.dialog.bind('<Escape>', lambda e: self.cancel_clicked())
-        
-        # Wait for the dialog to complete
-        self.dialog.wait_window()
-    
-    def center_window(self):
-        """Center the dialog window on screen"""
-        self.dialog.update_idletasks()
-        width = self.dialog.winfo_width()
-        height = self.dialog.winfo_height()
-        
-        # Get screen dimensions
-        screen_width = self.dialog.winfo_screenwidth()
-        screen_height = self.dialog.winfo_screenheight()
-        
-        # Calculate center position
-        x = (screen_width // 2) - (width // 2)
-        y = (screen_height // 2) - (height // 2)
-        
-        # Platform-specific adjustments
-        if IS_MACOS:
-            y = max(50, y - 50)
-        elif IS_WINDOWS:
-            y = max(30, y - 30)
-        
-        self.dialog.geometry(f"{width}x{height}+{x}+{y}")
-    
-    def ok_clicked(self):
-        self.result = self.text_widget.get("1.0", tk.END).strip()
-        self.dialog.destroy()
-    
-    def cancel_clicked(self):
-        self.result = None
-        self.dialog.destroy()
+
+    def _build_buttons(self, parent):
+        c = self.theme_colors
+        create_modern_button(parent, "OK", self._ok, "primary", c).pack(side=tk.RIGHT, padx=(8, 0))
+        create_modern_button(parent, "Cancel", self._cancel, "secondary", c).pack(side=tk.RIGHT)
+        self._top.bind('<Control-Return>', lambda e: self._ok())
+        self._top.bind('<Escape>', lambda e: self._cancel())
+
+    def _ok(self):
+        self._submit({"value": self.text_widget.get("1.0", tk.END).strip()})
+
+    def _cancel(self):
+        self._submit({"cancelled": True})
+
+
+class ConfirmBody(InteractionDialog):
+    """Yes/No confirmation (was ModernConfirmationDialog). The message is shown as
+    the base 'prompt'."""
+
+    HAS_BODY = False
+
+    def _minsize(self):
+        return (380, 210)
+
+    def _geometry(self):
+        return (440, 240) if IS_WINDOWS else (420, 230)
+
+    def _build_buttons(self, parent):
+        c = self.theme_colors
+        create_modern_button(parent, "Yes", lambda: self._submit({"value": True}),
+                             "primary", c).pack(side=tk.RIGHT, padx=(8, 0))
+        create_modern_button(parent, "No", lambda: self._submit({"value": False}),
+                             "secondary", c).pack(side=tk.RIGHT)
+        self._top.bind('<Return>', lambda e: self._submit({"value": True}))
+        self._top.bind('<Escape>', lambda e: self._submit({"value": False}))
+
+    def _on_close(self):
+        # Closing a confirmation == "No".
+        if not self._alive:
+            return
+        self.session.submit_from_ui({"value": False})
+        self.close()
+
+
+class InfoBody(InteractionDialog):
+    """Information message with an OK acknowledgement (was ModernInfoDialog)."""
+
+    HAS_BODY = False
+
+    def _minsize(self):
+        return (360, 200)
+
+    def _geometry(self):
+        return (420, 300) if IS_WINDOWS else (400, 285)
+
+    def _build_buttons(self, parent):
+        c = self.theme_colors
+        create_modern_button(parent, "OK", lambda: self._submit({"value": True}),
+                             "primary", c).pack(side=tk.RIGHT)
+        self._top.bind('<Return>', lambda e: self._submit({"value": True}))
+        self._top.bind('<Escape>', lambda e: self._submit({"value": True}))
+
+    def _on_close(self):
+        # Closing an info dialog == acknowledged.
+        if not self._alive:
+            return
+        self.session.submit_from_ui({"value": True})
+        self.close()
+
 
 # --------------------------------------------------------------------------- #
 # Long-running "assign a task to a human" dialog + session
@@ -1385,10 +1204,10 @@ class MultilineInputDialog:
 
 # Registry of live task sessions, keyed by task_id. Lives on the server process
 # and survives across multiple tool invocations (heartbeat continuations).
-_task_sessions: "Dict[str, HumanTaskSession]" = {}
+_sessions: "Dict[str, InteractionSession]" = {}
 
 
-class HumanTaskSession:
+class InteractionSession:
     """Server-side state for one delegated human task.
 
     Persists across heartbeat continuations. The async tool (MCP background
@@ -1400,13 +1219,18 @@ class HumanTaskSession:
 
     MAX_LIFETIME_SECONDS = 30 * 60  # orphan safety net
 
-    def __init__(self, task_id, task_title, task_description, context_note,
-                 client_timeout_seconds, loop, max_result_bytes=DEFAULT_MAX_RESULT_BYTES,
-                 attachments_enabled=True):
-        self.task_id = task_id
-        self.task_title = task_title
-        self.task_description = task_description
-        self.context_note = context_note
+    def __init__(self, session_id, kind, params, client_timeout_seconds, loop, make_body,
+                 max_result_bytes=DEFAULT_MAX_RESULT_BYTES, attachments_enabled=True):
+        self.id = session_id
+        self.task_id = session_id            # alias used by the tools/notification
+        self.kind = kind                     # "task" | "input" | "choice" | ...
+        self.params = dict(params or {})     # dialog-specific args (title/prompt/choices/...)
+        self.make_body = make_body           # factory: (root, session) -> the body dialog
+        # Task-facing fields (the task dialog reads these directly; simple dialogs
+        # read from params instead). Seeded from params.
+        self.task_title = self.params.get("task_title") or self.params.get("title", "")
+        self.task_description = self.params.get("task_description", "")
+        self.context_note = self.params.get("context_note", "")
         self.client_timeout_seconds = client_timeout_seconds
         self.max_result_bytes = max_result_bytes
         self.attachments_enabled = attachments_enabled
@@ -1451,21 +1275,17 @@ class HumanTaskSession:
         return (time.monotonic() - self.last_seen) > self.MAX_LIFETIME_SECONDS
 
 
-class NotificationWindow:
-    """Small, non-focus-stealing top-right toast that rings before the full task
-    window opens. View opens the task window (instantly, on the main thread);
-    Cancel reports the task failed. Participates in the heartbeat/disconnect
-    machinery (``begin_countdown``/``close``) so a ringing orphan can't survive
-    the assistant going away."""
+class NotificationWindow(_LegAwareWindow):
+    """Small, always-on-top top-right toast that rings before the real dialog
+    opens. View opens the dialog (via ``session.make_body``); Cancel declines. Uses
+    the shared leg/disconnect machinery so a ringing orphan can't outlive the
+    assistant going away."""
 
     def __init__(self, parent, session):
         self.parent = parent
         self.session = session
         self.theme_colors = get_theme_colors()
-        self._alive = True
-        self._leg_seconds = None
-        self._last_contact = None
-        self._ui_after = None
+        self._init_leg()
         # Operator-configured ringtone / mute (falls back to the bundled sound).
         _notif = human_loop_config.get_notification()
         self._muted = bool(_notif.get("muted", False))
@@ -1473,7 +1293,8 @@ class NotificationWindow:
 
         c = self.theme_colors
         self.win = tk.Toplevel(parent)
-        self.win.title("New task")
+        self._top = self.win
+        self.win.title("Request from the assistant")
         self.win.resizable(False, False)
         self.win.configure(bg=c["bg_primary"])
         w, h = 360, 175
@@ -1482,24 +1303,38 @@ class NotificationWindow:
         except Exception:
             sw = 1440
         self.win.geometry(f"{w}x{h}+{max(0, sw - w - 24)}+24")
-        # Visible above other windows, but DELIBERATELY do NOT steal focus:
-        # no configure_window_for_platform / configure_macos_app / lift / focus_force.
-        try:
-            self.win.attributes("-topmost", True)
-        except Exception:
-            pass
+        # A ringing HITL request must not disappear behind the currently active
+        # application. Re-assert after mapping because some window managers
+        # ignore topmost/focus requests made while a Toplevel is still hidden.
+        keep_notification_in_front(self.win)
+        self.win.after_idle(lambda: keep_notification_in_front(self.win))
+        self.win.after(150, lambda: keep_notification_in_front(self.win))
+
+        # Button bar is pinned to the WINDOW bottom FIRST, so View/Cancel are
+        # ALWAYS visible no matter how tall the preview/heading get.
+        btns = tk.Frame(self.win, bg=c["bg_primary"])
+        btns.pack(side="bottom", fill="x", padx=16, pady=(0, 14))
+        create_modern_button(btns, "View", self._on_view, "primary", c).pack(side=tk.RIGHT, padx=(8, 0))
+        create_modern_button(btns, "Cancel", self._on_cancel, "secondary", c).pack(side=tk.RIGHT)
 
         main = tk.Frame(self.win, bg=c["bg_primary"])
-        main.pack(fill="both", expand=True, padx=16, pady=14)
+        main.pack(side="top", fill="both", expand=True, padx=16, pady=(14, 6))
 
-        tk.Label(main, text="You have a new task", bg=c["bg_primary"],
-                 fg=c["fg_primary"], font=get_title_font(), anchor="w",
-                 justify="left").pack(fill="x", pady=(0, 6))
+        heading = session.params.get("notify_heading") or "The assistant needs you"
+        # wraplength so a long heading wraps to a second line instead of clipping.
+        tk.Label(main, text=heading, bg=c["bg_primary"], fg=c["fg_primary"],
+                 font=get_title_font(), anchor="w", justify="left",
+                 wraplength=324).pack(fill="x", pady=(0, 6))
 
-        title = session.task_title or "(untitled task)"
-        if len(title) > 120:
-            title = title[:117] + "…"
-        tk.Label(main, text=title, bg=c["bg_primary"], fg=c["fg_secondary"],
+        # The toast is a short teaser, not the content: collapse whitespace/newlines
+        # to a single wrapped block and truncate, so it can't grow tall enough to
+        # crowd out the buttons. The full content is in the dialog opened by View.
+        preview = (session.params.get("notify_preview") or session.task_title
+                   or session.params.get("title") or "(request)")
+        preview = " ".join(preview.split())
+        if len(preview) > 100:
+            preview = preview[:99] + "…"
+        tk.Label(main, text=preview, bg=c["bg_primary"], fg=c["fg_secondary"],
                  font=get_system_font(), anchor="w", justify="left",
                  wraplength=324).pack(fill="x", pady=(0, 4))
 
@@ -1507,57 +1342,42 @@ class NotificationWindow:
             main, text="Ringing… choose View or Cancel.",
             bg=c["bg_primary"], fg=c["fg_secondary"], font=get_system_font(),
             anchor="w", justify="left", wraplength=324)
-        self.status_label.pack(fill="x", pady=(0, 10))
-
-        btns = tk.Frame(main, bg=c["bg_primary"])
-        btns.pack(fill="x", side="bottom")
-        create_modern_button(btns, "View", self._on_view, "primary", c).pack(side=tk.RIGHT, padx=(8, 0))
-        create_modern_button(btns, "Cancel", self._on_cancel, "secondary", c).pack(side=tk.RIGHT)
+        self.status_label.pack(fill="x", pady=(0, 4))
 
         self.win.protocol("WM_DELETE_WINDOW", self._on_cancel)
+        # Size the toast to its content (capped) so a long/CJK preview can't clip.
+        self.win.update_idletasks()
+        h = min(max(160, self.win.winfo_reqheight()), 340)
+        try:
+            sw = self.win.winfo_screenwidth()
+        except Exception:
+            sw = 1440
+        self.win.geometry(f"360x{h}+{max(0, sw - 360 - 24)}+24")
         if not self._muted:
             self.ring.start()
 
-    # participates in the session's leg/disconnect machinery
-    def begin_countdown(self, leg_seconds):
-        self._leg_seconds = max(1, leg_seconds)
-        self._last_contact = time.monotonic()
-        if self._ui_after is None:
-            self._ui_tick()
+    def _ring_stop(self):
+        self.ring.stop()
 
-    def _ui_tick(self):
-        if not self._alive:
-            self._ui_after = None
-            return
-        if self._last_contact is None:
-            self._ui_after = self.win.after(500, self._ui_tick)
-            return
-        over = (time.monotonic() - self._last_contact) - (self._leg_seconds or 1)
-        if over >= AUTO_CLOSE_AFTER_SECONDS:
-            self._disconnect_autoclose()
-            return
-        if over >= DISCONNECT_GRACE_SECONDS:
-            try:
-                self.status_label.config(
-                    text="The assistant may have disconnected - this notification will close soon.",
-                    fg=self.theme_colors.get("error_color", self.theme_colors["fg_secondary"]))
-            except Exception:
-                pass
-        self._ui_after = self.win.after(1000, self._ui_tick)
+    def _render_status(self, remaining, over, idle):
+        if over >= DISCONNECT_GRACE_SECONDS and self._alive:
+            self.status_label.config(
+                text="The assistant may have disconnected - this notification will close soon.",
+                fg=self.theme_colors.get("error_color", self.theme_colors["fg_secondary"]))
 
     def _on_view(self):
         if not self._alive:
             return
         self.ring.stop()
-        # Open the full task window immediately (this runs on the main thread), so
-        # it appears the instant the human clicks - no AI round-trip needed.
+        # Open the real dialog immediately (main thread) via the session factory,
+        # so it appears the instant the human clicks - no AI round-trip needed.
         try:
-            win = HumanTaskDialog(self.parent, self.session)
+            win = self.session.make_body(self.parent, self.session)
             self.session.attach_dialog(win)
             win.begin_countdown(compute_leg_seconds(self.session.client_timeout_seconds))
         except Exception as e:
-            _out(f"Warning: failed to open task window: {e}")
-        self.close()  # closes the toast; session.dialog now points at the task window
+            _out(f"Warning: failed to open dialog: {e}")
+        self.close()  # closes the toast; session.dialog now points at the real dialog
         self.session.submit_from_ui({"kind": "view"})
 
     def _on_cancel(self):
@@ -1567,55 +1387,23 @@ class NotificationWindow:
         self.session.submit_from_ui({"kind": "decline"})
         self.close()
 
-    def _disconnect_autoclose(self):
-        if not self._alive:
-            return
-        self.ring.stop()
-        self.session.submit_from_ui({"kind": "decline", "reason": "assistant_disconnected"})
-        self.close()
 
-    def close(self):
-        self._alive = False
-        try:
-            self.ring.stop()
-        except Exception:
-            pass
-        if self._ui_after:
-            try:
-                self.win.after_cancel(self._ui_after)
-            except Exception:
-                pass
-            self._ui_after = None
-        try:
-            self.win.destroy()
-        except Exception:
-            pass
-        try:
-            if self.session.dialog is self:
-                self.session.dialog = None
-        except Exception:
-            pass
-
-
-class HumanTaskDialog:
+class HumanTaskDialog(_LegAwareWindow):
     """Persistent (non-modal, no ``wait_window``) task dialog with a live
     countdown. Built on the main thread; button handlers push submissions to the
-    owning :class:`HumanTaskSession`."""
-
-    WARN_SECONDS = 10  # last-N-seconds "please pause" warning
+    owning :class:`InteractionSession`. Uses the shared leg/disconnect machinery;
+    overrides ``_render_status`` (rich countdown) and ``_on_autoclose`` (archive)."""
 
     def __init__(self, parent, session):
         self.session = session
         self.theme_colors = get_theme_colors()
         self.attachments = []          # list[str] of chosen file paths
-        self._alive = True
-        self._leg_seconds = None       # current wait-leg length
-        self._last_contact = None      # monotonic time of last assistant check-in
-        self._ui_after = None          # recurring liveness/countdown tick id
+        self._init_leg()
 
         c = self.theme_colors
         self._tid8 = session.task_id[:8]
         self.dialog = tk.Toplevel(parent)
+        self._top = self.dialog
         self.dialog.title(f"Task from assistant - {session.task_title}  [{self._tid8}]")
         self.dialog.resizable(True, True)
         configure_modern_window(self.dialog)
@@ -1782,37 +1570,13 @@ class HumanTaskDialog:
         self._update_size_counter()
 
     # ---------------- liveness / countdown / watchdog ---------------- #
-    def begin_countdown(self, leg_seconds):
-        """Called each time the assistant checks in (starts a new wait leg).
-        Resets the 'last contact' clock; the single always-on tick renders it."""
-        self._leg_seconds = max(1, leg_seconds)
-        self._last_contact = time.monotonic()
-        if self._ui_after is None:      # start the recurring tick once
-            self._ui_tick()
-
-    @staticmethod
-    def _fmt(seconds):
-        seconds = max(0, int(seconds))
-        return f"{seconds // 60:d}:{seconds % 60:02d}"
-
-    def _ui_tick(self):
-        """One always-running 1s tick that shows connection liveness, warns
-        before each sync, detects assistant disconnection, and finally auto-saves
-        the draft + closes the window so nothing is ever silently orphaned."""
+    def _render_status(self, remaining, over, idle):
+        """Rich countdown/disconnect rendering into the (usually hidden) label."""
         if not self._alive:
-            self._ui_after = None
             return
-        if self._last_contact is None:
-            self._ui_after = self.dialog.after(500, self._ui_tick)
-            return
-
-        idle = time.monotonic() - self._last_contact
-        leg = self._leg_seconds or 1
-        remaining = leg - idle
-        opened = self.session.created_wall.strftime("%H:%M:%S")
         c = self.theme_colors
         warn_c = c.get("error_color", c["fg_secondary"])
-
+        opened = self.session.created_wall.strftime("%H:%M:%S")
         if remaining > self.WARN_SECONDS:
             self.countdown_label.config(
                 text=f"Assistant connected · next check-in in {self._fmt(remaining)}   "
@@ -1823,25 +1587,19 @@ class HumanTaskDialog:
                 text=f"Syncing shortly - you may pause a moment; your work is saved.   "
                      f"(task {self._tid8})",
                 fg=c["fg_secondary"])
+        elif over < DISCONNECT_GRACE_SECONDS:
+            self.countdown_label.config(
+                text=f"Waiting for the assistant to check in…   (task {self._tid8})",
+                fg=c["fg_secondary"])
         else:
-            over = idle - leg
-            if over < DISCONNECT_GRACE_SECONDS:
-                self.countdown_label.config(
-                    text=f"Waiting for the assistant to check in…   (task {self._tid8})",
-                    fg=c["fg_secondary"])
-            elif over < AUTO_CLOSE_AFTER_SECONDS:
-                left = AUTO_CLOSE_AFTER_SECONDS - over
-                self.countdown_label.config(
-                    text=(f"The assistant may have disconnected (silent {int(idle)}s). "
-                          f"Your work is safe - this window will auto-save & close in {self._fmt(left)} "
-                          f"if it stays silent."),
-                    fg=warn_c)
-            else:
-                self._autosave_and_close()
-                return
-        self._ui_after = self.dialog.after(1000, self._ui_tick)
+            left = AUTO_CLOSE_AFTER_SECONDS - over
+            self.countdown_label.config(
+                text=(f"The assistant may have disconnected (silent {int(idle)}s). "
+                      f"Your work is safe - this window will auto-save & close in {self._fmt(left)} "
+                      f"if it stays silent."),
+                fg=warn_c)
 
-    def _autosave_and_close(self):
+    def _on_autoclose(self):
         """Assistant went silent for too long: archive whatever the human drafted
         (so it's never lost) and close the orphaned window."""
         if not self._alive:
@@ -1937,39 +1695,7 @@ class HumanTaskDialog:
         self.session.submit_from_ui(payload)
         self.close()
 
-    def close(self):
-        self._alive = False
-        if self._ui_after:
-            try:
-                self.dialog.after_cancel(self._ui_after)
-            except Exception:
-                pass
-            self._ui_after = None
-        try:
-            self.dialog.destroy()
-        except Exception:
-            pass
-        # Detach from the session so a re-call knows the window is gone and
-        # reopens a fresh one instead of driving a destroyed widget.
-        try:
-            if self.session.dialog is self:
-                self.session.dialog = None
-        except Exception:
-            pass
-
-    def _center_window(self):
-        self.dialog.update_idletasks()
-        width = self.dialog.winfo_width()
-        height = self.dialog.winfo_height()
-        screen_width = self.dialog.winfo_screenwidth()
-        screen_height = self.dialog.winfo_screenheight()
-        x = (screen_width // 2) - (width // 2)
-        y = (screen_height // 2) - (height // 2)
-        if IS_MACOS:
-            y = max(50, y - 50)
-        elif IS_WINDOWS:
-            y = max(30, y - 30)
-        self.dialog.geometry(f"{width}x{height}+{x}+{y}")
+    # close() and _center_window() come from _LegAwareWindow (self._top == self.dialog).
 
 # MCP Tools
 
@@ -2059,6 +1785,184 @@ def _build_submission_result(session, payload, needs_continuation, archived_dir)
     return [summary_text, *images, *files]
 
 
+def _keepalive_resp(status, session, message):
+    """A heartbeat/opened keepalive return (the AI should re-call, not reply)."""
+    resp = {
+        "success": True,
+        "status": status,
+        "human_action": False,
+        "needs_continuation": True,
+        "interaction_id": session.id,
+        "task_id": session.id,
+        "platform": CURRENT_PLATFORM,
+        "message": message,
+    }
+    if session.advisory:
+        resp["advisory"] = session.advisory
+    return resp
+
+
+def _simple_terminal(session, payload, result_builder):
+    """Terminal handling shared by the simple (one-shot) dialogs: drop the session
+    and build the tool-specific result dict from the payload."""
+    session.dialog = None
+    _sessions.pop(session.id, None)
+    return result_builder(session, payload)
+
+
+def _task_on_submit(session, payload):
+    """assign_task_to_human's rich submission handling (archive + in_progress /
+    completed-review / terminal)."""
+    status = payload.get("status", "in_progress")
+    terminal = payload.get("terminal", status in ("completed", "failed", "cancelled"))
+    if payload.get("already_archived"):
+        archived_dir = payload.get("archived_dir")
+    elif payload.get("body") or payload.get("attachment_paths"):
+        archived_dir = archive_to_outbox(
+            {
+                "task_id": session.task_id,
+                "status": status,
+                "human_action": payload.get("human_action", True),
+                "task_title": session.task_title,
+                "task_description": session.task_description,
+                "context_note": session.context_note,
+                "client_timeout_seconds": session.client_timeout_seconds,
+                "body": payload.get("body", ""),
+            },
+            payload.get("attachment_paths", []),
+        )
+    else:
+        archived_dir = None
+
+    session.dialog = None
+    session.last_seen = time.monotonic()
+    if payload.get("human_action", True):
+        session.last_human_action_at = session.last_seen
+
+    if status in ("completed", "failed"):
+        # Keep the session dormant for AI review / re-submission.
+        return _build_submission_result(session, payload, needs_continuation=False, archived_dir=archived_dir)
+    if terminal:
+        _sessions.pop(session.id, None)
+        return _build_submission_result(session, payload, needs_continuation=False, archived_dir=archived_dir)
+    # in_progress: dormant, may reopen with the same task_id.
+    return _build_submission_result(session, payload, needs_continuation=True, archived_dir=archived_dir)
+
+
+def _task_on_decline(session, payload):
+    """assign_task_to_human: Cancel on the notification (or disconnect) == FAILED."""
+    session.dialog = None
+    _sessions.pop(session.id, None)
+    disc = payload.get("reason") == "assistant_disconnected"
+    return {
+        "success": True,
+        "status": "failed",
+        "human_action": not disc,
+        "needs_continuation": False,
+        "task_id": session.id,
+        "interaction_id": session.id,
+        "reason": payload.get("reason", "declined_via_notification"),
+        "message": ("The human declined the task from the notification popup; treat the task as FAILED."
+                    if not disc else
+                    "The notification auto-closed because you had gone silent; the task was not accepted."),
+        "platform": CURRENT_PLATFORM,
+    }
+
+
+async def _run_interaction(*, kind, params, client_timeout_seconds, session_id, ctx,
+                           make_body, on_submit, on_decline,
+                           max_result_bytes=DEFAULT_MAX_RESULT_BYTES, attachments_enabled=True,
+                           advisory=None, tool_name="tool"):
+    """Shared notification + ring + heartbeat + disconnect-watchdog orchestration for
+    every interactive tool. New interactions ring an always-on-top notification
+    toast; the human clicks View to open the actual dialog; the wait is kept alive
+    across the client's timeout via heartbeats. `on_submit`/`on_decline` are the
+    tool-specific terminal handlers."""
+    if not ensure_gui_initialized():
+        return {"success": False, "error": "GUI system not available",
+                "needs_continuation": False, "platform": CURRENT_PLATFORM}
+
+    loop = asyncio.get_running_loop()
+    leg_seconds = compute_leg_seconds(client_timeout_seconds)
+
+    # Reap abandoned/dormant sessions (window closed, AI never re-called).
+    for sid, sess in list(_sessions.items()):
+        if sess.is_expired():
+            _dialog_runner.submit(lambda root, s=sess: s.close())
+            _sessions.pop(sid, None)
+
+    session = _sessions.get(session_id) if session_id else None
+    if session_id and session is None:
+        return {"success": False, "status": "session_not_found",
+                "interaction_id": session_id, "task_id": session_id, "needs_continuation": False,
+                "message": ("No such id (it was answered/cancelled, or the session expired after "
+                            "inactivity). Start again by calling without an id."),
+                "platform": CURRENT_PLATFORM}
+
+    if session is None:
+        # Brand-new: create the session and RING the non-focus-stealing toast.
+        new_id = uuid.uuid4().hex[:12]
+        session = InteractionSession(new_id, kind, params, client_timeout_seconds, loop, make_body,
+                                     max_result_bytes=max_result_bytes,
+                                     attachments_enabled=attachments_enabled)
+        session.advisory = advisory
+        await _dialog_runner.run_dialog(
+            lambda root: session.attach_dialog(NotificationWindow(root, session)), timeout=30)
+        _sessions[new_id] = session
+        if ctx:
+            await ctx.info(f"Notified human ({kind}, id={new_id})")
+    elif session.dialog is None and session.updates.empty():
+        # Continuation whose window closed (task in_progress dormancy). Refresh
+        # params; re-notify after a long gap, else reopen the dialog directly.
+        session.params = dict(params or {})
+        session.task_title = session.params.get("task_title") or session.params.get("title", "")
+        session.task_description = session.params.get("task_description", "")
+        session.context_note = session.params.get("context_note", "")
+        session.client_timeout_seconds = client_timeout_seconds
+        session.max_result_bytes = max_result_bytes
+        session.attachments_enabled = attachments_enabled
+        session.make_body = make_body
+        session.advisory = advisory
+        idle = time.monotonic() - session.last_human_action_at
+        if idle > FOLLOW_UP_NOTIFY_AFTER_SECONDS:
+            await _dialog_runner.run_dialog(
+                lambda root: session.attach_dialog(NotificationWindow(root, session)), timeout=30)
+        else:
+            await _dialog_runner.run_dialog(
+                lambda root: session.attach_dialog(session.make_body(root, session)), timeout=30)
+    # else: a payload is already buffered (window auto-closed) — deliver it below.
+
+    # Start / refresh this leg's countdown (only if a window is open).
+    if session.dialog is not None:
+        _dialog_runner.submit(lambda root: session.begin_leg(leg_seconds))
+
+    # Await a human response OR the heartbeat deadline.
+    try:
+        payload = await asyncio.wait_for(session.updates.get(), timeout=leg_seconds)
+    except asyncio.TimeoutError:
+        if session.is_expired():
+            _dialog_runner.submit(lambda root: session.close())
+            _sessions.pop(session.id, None)
+            return {"success": False, "status": "expired", "interaction_id": session.id,
+                    "task_id": session.id, "needs_continuation": False,
+                    "message": "The dialog exceeded its max lifetime and was closed.",
+                    "platform": CURRENT_PLATFORM}
+        return _keepalive_resp(
+            "heartbeat", session,
+            "Keepalive only - the human hasn't responded yet. Do NOT respond to the user or reason about "
+            f"content; immediately call {tool_name} again with the same id to keep the dialog alive.")
+
+    kind_ev = payload.get("kind")
+    if kind_ev == "view":
+        return _keepalive_resp(
+            "opened", session,
+            f"The human opened the dialog. Keep waiting - call {tool_name} again with the same id and do "
+            "NOT respond to the user in the meantime.")
+    if kind_ev == "decline":
+        return on_decline(session, payload)
+    return on_submit(session, payload)
+
+
 @mcp.tool()
 async def assign_task_to_human(
     task_title: Annotated[str, Field(description="Short imperative title of the ONE action (e.g. 'Photograph the north wall'). Not a question.")],
@@ -2136,216 +2040,27 @@ async def assign_task_to_human(
     try:
         if ctx:
             await ctx.info(f"assign_task_to_human: '{task_title}' (task_id={task_id or 'new'})")
-
-        if not ensure_gui_initialized():
-            return {
-                "success": False,
-                "error": "GUI system not available",
-                "needs_continuation": False,
-                "platform": CURRENT_PLATFORM,
-            }
-
-        # Resolve omitted params from the operator's configured defaults
-        # (fallback only — an AI-provided value always wins).
         _defaults = human_loop_config.get_task_defaults()
         if client_timeout_seconds is None:
             client_timeout_seconds = int(_defaults.get("timeout_seconds", 240))
         if max_result_bytes is None:
             max_result_bytes = int(_defaults.get("max_result_bytes", DEFAULT_MAX_RESULT_BYTES))
         attachments_enabled = bool(_defaults.get("attachments_enabled", True))
-
-        loop = asyncio.get_running_loop()
-        leg_seconds = compute_leg_seconds(client_timeout_seconds)
-
-        # Reap abandoned/dormant sessions (window closed, AI never re-called).
-        for sid, sess in list(_task_sessions.items()):
-            if sess.is_expired():
-                _dialog_runner.submit(lambda root, s=sess: s.close())
-                _task_sessions.pop(sid, None)
-
-        session = _task_sessions.get(task_id) if task_id else None
-        if task_id and session is None:
-            return {
-                "success": False,
-                "status": "session_not_found",
-                "task_id": task_id,
-                "needs_continuation": False,
-                "message": ("No such task_id (it was cancelled/declined, or the session expired "
-                            "after inactivity). Start a new task by calling without a task_id."),
-                "platform": CURRENT_PLATFORM,
-            }
-
-        if session is None:
-            # Brand-new task: create the session and RING a non-focus-stealing
-            # notification toast first (don't rudely pop the full window).
-            new_id = uuid.uuid4().hex[:12]
-            session = HumanTaskSession(
-                new_id, task_title, task_description, context_note, client_timeout_seconds, loop,
-                max_result_bytes=max_result_bytes, attachments_enabled=attachments_enabled)
-            session.advisory = composite_task_advisory(task_description)
-            await _dialog_runner.run_dialog(
-                lambda root: session.attach_dialog(NotificationWindow(root, session)), timeout=30)
-            _task_sessions[new_id] = session
-            if ctx:
-                await ctx.info(f"Notified human of new task (task_id={new_id})")
-        elif session.dialog is None and session.updates.empty():
-            # Continuation of an existing task whose window closed after a prior
-            # interim ("in_progress") submission. Carry over the latest
-            # command/description/context. If a lot of time has passed since the
-            # human last acted, treat it as a "follow-up" and ring the toast
-            # again; if the assistant is re-engaging quickly, reopen directly.
-            session.task_title = task_title
-            session.task_description = task_description
-            session.context_note = context_note
-            session.client_timeout_seconds = client_timeout_seconds
-            session.max_result_bytes = max_result_bytes
-            session.attachments_enabled = attachments_enabled
-            session.advisory = composite_task_advisory(task_description)
-            idle = time.monotonic() - session.last_human_action_at
-            if idle > FOLLOW_UP_NOTIFY_AFTER_SECONDS:
-                await _dialog_runner.run_dialog(
-                    lambda root: session.attach_dialog(NotificationWindow(root, session)), timeout=30)
-                if ctx:
-                    await ctx.info(f"Follow-up: re-notified human (task_id={session.task_id}, idle={int(idle)}s)")
-            else:
-                await _dialog_runner.run_dialog(
-                    lambda root: session.attach_dialog(HumanTaskDialog(root, session)), timeout=30)
-                if ctx:
-                    await ctx.info(f"Reopened human task dialog (task_id={session.task_id})")
-        # else (session.dialog is None but a payload is already buffered): the
-        # window auto-closed after the assistant went silent; deliver that
-        # buffered result below instead of reopening a window.
-
-        # Start / refresh this leg's countdown on the main thread (only if a
-        # window is actually open).
-        if session.dialog is not None:
-            _dialog_runner.submit(lambda root: session.begin_leg(leg_seconds))
-
-        # Await a human submission OR the heartbeat deadline.
-        try:
-            payload = await asyncio.wait_for(session.updates.get(), timeout=leg_seconds)
-        except asyncio.TimeoutError:
-            if session.is_expired():
-                _dialog_runner.submit(lambda root: session.close())
-                _task_sessions.pop(session.task_id, None)
-                return {
-                    "success": False,
-                    "status": "expired",
-                    "task_id": session.task_id,
-                    "needs_continuation": False,
-                    "message": "The human task dialog exceeded its max lifetime and was closed.",
-                    "platform": CURRENT_PLATFORM,
-                }
-            if ctx:
-                await ctx.debug(f"Heartbeat (no human action yet) for task_id={session.task_id}")
-            resp = {
-                "success": True,
-                "status": "heartbeat",
-                "human_action": False,
-                "needs_continuation": True,
-                "task_id": session.task_id,
-                "message": ("Keepalive only - the human has not submitted anything yet. Do NOT respond to "
-                            "the user or reason about task content. Immediately call assign_task_to_human "
-                            "again with the same task_id to keep the dialog alive."),
-                "platform": CURRENT_PLATFORM,
-            }
-            if session.advisory:
-                resp["advisory"] = session.advisory
-            return resp
-
-        # --- Notification-toast events (before the task window is involved) --- #
-        kind = payload.get("kind")
-        if kind == "view":
-            # The human clicked "View" - the toast handler already opened the full
-            # task window instantly. Keep waiting for their actual report.
-            if ctx:
-                await ctx.info(f"Human opened the task window (task_id={session.task_id})")
-            resp = {
-                "success": True,
-                "status": "opened",
-                "human_action": False,
-                "needs_continuation": True,
-                "task_id": session.task_id,
-                "message": ("The human opened the task window. Keep waiting - call assign_task_to_human "
-                            "again with the same task_id and do NOT respond to the user in the meantime."),
-                "platform": CURRENT_PLATFORM,
-            }
-            if session.advisory:
-                resp["advisory"] = session.advisory
-            return resp
-        if kind == "decline":
-            # The human clicked "Cancel" on the notification (or it auto-closed on
-            # disconnect) - treat the task as failed.
-            session.dialog = None
-            _task_sessions.pop(session.task_id, None)
-            declined_disconnect = payload.get("reason") == "assistant_disconnected"
-            if ctx:
-                await ctx.info(f"Human declined the task via notification (task_id={session.task_id})")
-            return {
-                "success": True,
-                "status": "failed",
-                "human_action": not declined_disconnect,
-                "needs_continuation": False,
-                "task_id": session.task_id,
-                "reason": payload.get("reason", "declined_via_notification"),
-                "message": ("The human declined the task from the notification popup; treat the task as FAILED."
-                            if not declined_disconnect else
-                            "The notification auto-closed because you had gone silent; the task was not accepted."),
-                "platform": CURRENT_PLATFORM,
-            }
-
-        # A submission arrived (human action, or an auto-save from a disconnected window).
-        status = payload.get("status", "in_progress")
-        terminal = payload.get("terminal", status in ("completed", "failed", "cancelled"))
-
-        if payload.get("already_archived"):
-            # The dialog auto-saved the draft itself (disconnect watchdog).
-            archived_dir = payload.get("archived_dir")
-        elif payload.get("body") or payload.get("attachment_paths"):
-            archived_dir = archive_to_outbox(
-                {
-                    "task_id": session.task_id,
-                    "status": status,
-                    "human_action": payload.get("human_action", True),
-                    "task_title": session.task_title,
-                    "task_description": session.task_description,
-                    "context_note": session.context_note,
-                    "client_timeout_seconds": session.client_timeout_seconds,
-                    "body": payload.get("body", ""),
-                },
-                payload.get("attachment_paths", []),
-            )
-        else:
-            archived_dir = None
-
-        if ctx:
-            await ctx.info(f"Human submission: status={status}, task_id={session.task_id}, "
-                           f"archived={'yes' if archived_dir else 'no'}")
-
-        # The dialog closed itself on submit (one window == one submission).
-        session.dialog = None
-        session.last_seen = time.monotonic()
-        if payload.get("human_action", True):
-            session.last_human_action_at = session.last_seen
-
-        if status in ("completed", "failed"):
-            # Do NOT destroy the session yet — keep it dormant for AI review. If
-            # the deliverable is insufficient (or the client rejected the result,
-            # or an attachment was omitted for size), the assistant can re-call
-            # with the same task_id + updated task_description to request a
-            # re-submission. Abandoned sessions are reaped by is_expired.
-            return _build_submission_result(session, payload, needs_continuation=False, archived_dir=archived_dir)
-
-        if terminal:
-            # cancelled / declined / disconnected — genuinely terminal.
-            _task_sessions.pop(session.task_id, None)
-            return _build_submission_result(session, payload, needs_continuation=False, archived_dir=archived_dir)
-
-        # in_progress: the window is closed and the task is NOT finished. Keep the
-        # session dormant so the assistant MAY reopen a fresh window by calling
-        # again with the same task_id (e.g. with a follow-up in context_note).
-        return _build_submission_result(session, payload, needs_continuation=True, archived_dir=archived_dir)
-
+        params = {
+            "task_title": task_title,
+            "task_description": task_description,
+            "context_note": context_note,
+            "notify_heading": "You have a new task",
+            "notify_preview": task_title,
+        }
+        return await _run_interaction(
+            kind="task", params=params, client_timeout_seconds=client_timeout_seconds,
+            session_id=task_id, ctx=ctx,
+            make_body=lambda root, s: HumanTaskDialog(root, s),
+            on_submit=_task_on_submit, on_decline=_task_on_decline,
+            max_result_bytes=max_result_bytes, attachments_enabled=attachments_enabled,
+            advisory=composite_task_advisory(task_description),
+            tool_name="assign_task_to_human")
     except Exception as e:
         if ctx:
             await ctx.error(f"Error in assign_task_to_human: {str(e)}")
@@ -2357,71 +2072,79 @@ async def assign_task_to_human(
         }
 
 
+# --- Heartbeat protocol shared by the simple interactive tools below ---------
+# All five tools ring an always-on-top notification, wait across the client's
+# timeout via heartbeats, and reuse _run_interaction. Each supplies a result_builder
+# that maps the dialog's {"value"}/{"cancelled"} payload to its own legacy result dict.
+_HEARTBEAT_TIMEOUT_FIELD = Annotated[Optional[int], Field(description=(
+    "YOUR OWN per-tool-call timeout, in seconds. The server returns a 'heartbeat'/'opened' "
+    "response safely before this deadline so you can immediately re-call and keep the dialog "
+    "alive. If omitted, the server's configured default is used."))]
+_INTERACTION_ID_FIELD = Annotated[Optional[str], Field(description=(
+    "Leave empty to START. On a 'heartbeat' or 'opened' response, re-call with the "
+    "interaction_id from the previous call to keep the SAME dialog alive (do NOT respond to "
+    "the user in between)."))]
+
+
+def _simple_timeout_default(client_timeout_seconds):
+    if client_timeout_seconds is None:
+        return int(human_loop_config.get_task_defaults().get("timeout_seconds", 240))
+    return client_timeout_seconds
+
+
 @mcp.tool()
 async def get_user_input(
     title: Annotated[str, Field(description="Title of the input dialog window")],
-    prompt: Annotated[str, Field(description="The prompt/question to show to the user")],
+    prompt: Annotated[str, Field(description="The single focused question to show the user")],
     default_value: Annotated[str, Field(description="Default value to pre-fill in the input field")] = "",
     input_type: Annotated[Literal["text", "integer", "float"], Field(description="Type of input expected")] = "text",
-    ctx: Context = None
+    client_timeout_seconds: _HEARTBEAT_TIMEOUT_FIELD = None,
+    interaction_id: _INTERACTION_ID_FIELD = None,
+    ctx: Context = None,
 ) -> Dict[str, Any]:
     """
     Ask the user for ONE piece of single-line text/number input.
 
-    Ask a SINGLE focused question, then use the answer to decide what to ask next —
+    Ask a SINGLE focused question, then use the answer to decide what to ask next -
     do NOT pack several questions into one `prompt`. If you need multiple pieces of
     information, call this tool once per question in sequence, adapting as you go.
     (`get_user_choice` for picking from options; `get_multiline_input` for long text.)
+
+    Window lifecycle & heartbeat: this rings an always-on-top notification toast; the
+    human clicks View to open the input dialog. Pass `client_timeout_seconds`; on a
+    'heartbeat' or 'opened' status re-call with the returned `interaction_id` and do NOT
+    reply to the user until they submit or cancel.
     """
     try:
         if ctx:
-            await ctx.info(f"Requesting user input: {prompt}")
-        
-        # Ensure GUI is initialized
-        if not ensure_gui_initialized():
-            return {
-                "success": False,
-                "error": "GUI system not available",
-                "cancelled": False,
-                "platform": CURRENT_PLATFORM
-            }
-        
-        # Build the dialog on the main thread (required by tkinter/macOS)
-        result = await _dialog_runner.run_dialog(
-            lambda root: create_input_dialog(root, title, prompt, default_value, input_type),
-            timeout=300,  # 5 minute timeout
-        )
+            await ctx.info(f"get_user_input: {prompt}")
+        client_timeout_seconds = _simple_timeout_default(client_timeout_seconds)
+        params = {"title": title, "prompt": prompt, "default_value": default_value,
+                  "input_type": input_type,
+                  "notify_heading": "The assistant needs some input", "notify_preview": prompt or title}
 
-        if result is not None:
-            if ctx:
-                await ctx.info(f"User provided input: {result}")
-            return {
-                "success": True,
-                "user_input": result,
-                "input_type": input_type,
-                "cancelled": False,
-                "platform": CURRENT_PLATFORM
-            }
-        else:
-            if ctx:
-                await ctx.warning("User cancelled the input dialog")
-            return {
-                "success": False,
-                "user_input": None,
-                "input_type": input_type,
-                "cancelled": True,
-                "platform": CURRENT_PLATFORM
-            }
-    
+        def rb(session, payload):
+            if payload.get("cancelled") or payload.get("kind") == "decline" or payload.get("value") is None:
+                return {"success": False, "user_input": None, "input_type": input_type,
+                        "cancelled": True, "interaction_id": session.id,
+                        "needs_continuation": False, "platform": CURRENT_PLATFORM}
+            return {"success": True, "user_input": payload.get("value"), "input_type": input_type,
+                    "cancelled": False, "interaction_id": session.id,
+                    "needs_continuation": False, "platform": CURRENT_PLATFORM}
+
+        return await _run_interaction(
+            kind="input", params=params, client_timeout_seconds=client_timeout_seconds,
+            session_id=interaction_id, ctx=ctx,
+            make_body=lambda root, s: InputDialog(root, s),
+            on_submit=lambda s, p: _simple_terminal(s, p, rb),
+            on_decline=lambda s, p: _simple_terminal(s, p, rb),
+            tool_name="get_user_input")
     except Exception as e:
         if ctx:
-            await ctx.error(f"Error creating input dialog: {str(e)}")
-        return {
-            "success": False,
-            "error": str(e),
-            "cancelled": False,
-            "platform": CURRENT_PLATFORM
-        }
+            await ctx.error(f"Error in get_user_input: {str(e)}")
+        return {"success": False, "error": str(e), "cancelled": False,
+                "needs_continuation": False, "platform": CURRENT_PLATFORM}
+
 
 @mcp.tool()
 async def get_user_choice(
@@ -2429,249 +2152,223 @@ async def get_user_choice(
     prompt: Annotated[str, Field(description="The prompt/question to show to the user")],
     choices: Annotated[List[str], Field(description="List of choices to present to the user")],
     allow_multiple: Annotated[bool, Field(description="Whether user can select multiple choices")] = False,
-    ctx: Context = None
+    client_timeout_seconds: _HEARTBEAT_TIMEOUT_FIELD = None,
+    interaction_id: _INTERACTION_ID_FIELD = None,
+    ctx: Context = None,
 ) -> Dict[str, Any]:
     """
     Ask the user to pick from options for ONE decision.
 
-    Present a SINGLE choice, then adapt based on what they pick — do NOT chain several
+    Present a SINGLE choice, then adapt based on what they pick - do NOT chain several
     unrelated questions into one prompt. For a sequence of decisions, call this once per
     decision, using each answer to shape the next.
+
+    Window lifecycle & heartbeat: this rings an always-on-top notification toast; the
+    human clicks View to open the dialog. Pass `client_timeout_seconds`; on a 'heartbeat' or
+    'opened' status re-call with the returned `interaction_id` and do NOT reply to the user
+    until they submit or cancel.
     """
     try:
         if ctx:
-            await ctx.info(f"Requesting user choice: {prompt}")
-            await ctx.debug(f"Available choices: {choices}")
-        
-        # Ensure GUI is initialized
-        if not ensure_gui_initialized():
-            return {
-                "success": False,
-                "error": "GUI system not available",
-                "cancelled": False,
-                "platform": CURRENT_PLATFORM
-            }
-        
-        # Build the dialog on the main thread (required by tkinter/macOS)
-        result = await _dialog_runner.run_dialog(
-            lambda root: create_choice_dialog(root, title, prompt, choices, allow_multiple),
-            timeout=300,  # 5 minute timeout
-        )
+            await ctx.info(f"get_user_choice: {prompt}")
+        client_timeout_seconds = _simple_timeout_default(client_timeout_seconds)
+        params = {"title": title, "prompt": prompt, "choices": choices,
+                  "allow_multiple": allow_multiple,
+                  "notify_heading": "The assistant needs you to choose", "notify_preview": prompt or title}
 
-        if result is not None:
-            if ctx:
-                await ctx.info(f"User selected: {result}")
-            return {
-                "success": True,
-                "selected_choice": result,
-                "selected_choices": result if isinstance(result, list) else [result],
-                "allow_multiple": allow_multiple,
-                "cancelled": False,
-                "platform": CURRENT_PLATFORM
-            }
-        else:
-            if ctx:
-                await ctx.warning("User cancelled the choice dialog")
-            return {
-                "success": False,
-                "selected_choice": None,
-                "selected_choices": [],
-                "allow_multiple": allow_multiple,
-                "cancelled": True,
-                "platform": CURRENT_PLATFORM
-            }
-    
+        def rb(session, payload):
+            if payload.get("cancelled") or payload.get("kind") == "decline" or payload.get("value") is None:
+                return {"success": False, "selected_choice": None, "selected_choices": [],
+                        "allow_multiple": allow_multiple, "cancelled": True,
+                        "interaction_id": session.id, "needs_continuation": False,
+                        "platform": CURRENT_PLATFORM}
+            val = payload.get("value")
+            return {"success": True, "selected_choice": val,
+                    "selected_choices": val if isinstance(val, list) else [val],
+                    "allow_multiple": allow_multiple, "cancelled": False,
+                    "interaction_id": session.id, "needs_continuation": False,
+                    "platform": CURRENT_PLATFORM}
+
+        return await _run_interaction(
+            kind="choice", params=params, client_timeout_seconds=client_timeout_seconds,
+            session_id=interaction_id, ctx=ctx,
+            make_body=lambda root, s: ChoiceBody(root, s),
+            on_submit=lambda s, p: _simple_terminal(s, p, rb),
+            on_decline=lambda s, p: _simple_terminal(s, p, rb),
+            tool_name="get_user_choice")
     except Exception as e:
         if ctx:
-            await ctx.error(f"Error creating choice dialog: {str(e)}")
-        return {
-            "success": False,
-            "error": str(e),
-            "cancelled": False,
-            "platform": CURRENT_PLATFORM
-        }
+            await ctx.error(f"Error in get_user_choice: {str(e)}")
+        return {"success": False, "error": str(e), "cancelled": False,
+                "needs_continuation": False, "platform": CURRENT_PLATFORM}
+
 
 @mcp.tool()
 async def get_multiline_input(
     title: Annotated[str, Field(description="Title of the input dialog window")],
     prompt: Annotated[str, Field(description="The prompt/question to show to the user")],
     default_value: Annotated[str, Field(description="Default text to pre-fill in the text area")] = "",
-    ctx: Context = None
+    client_timeout_seconds: _HEARTBEAT_TIMEOUT_FIELD = None,
+    interaction_id: _INTERACTION_ID_FIELD = None,
+    ctx: Context = None,
 ) -> Dict[str, Any]:
     """
     Ask the user for ONE piece of long-form text (a description, a document, code, etc.).
 
-    This is for a single open-ended answer that needs room to type — NOT a questionnaire.
+    This is for a single open-ended answer that needs room to type - NOT a questionnaire.
     Do NOT list several numbered questions in one `prompt` expecting them all answered in
     one box; ask one focused question, read the answer, then ask the next and adapt.
+
+    Window lifecycle & heartbeat: this rings an always-on-top notification toast; the
+    human clicks View to open the dialog. Pass `client_timeout_seconds`; on a 'heartbeat' or
+    'opened' status re-call with the returned `interaction_id` and do NOT reply to the user
+    until they submit or cancel.
     """
     try:
         if ctx:
-            await ctx.info(f"Requesting multiline user input: {prompt}")
-        
-        # Ensure GUI is initialized
-        if not ensure_gui_initialized():
-            return {
-                "success": False,
-                "error": "GUI system not available",
-                "cancelled": False,
-                "platform": CURRENT_PLATFORM
-            }
-        
-        # Build the dialog on the main thread (required by tkinter/macOS)
-        result = await _dialog_runner.run_dialog(
-            lambda root: create_multiline_input_dialog(root, title, prompt, default_value),
-            timeout=300,  # 5 minute timeout
-        )
+            await ctx.info(f"get_multiline_input: {prompt}")
+        client_timeout_seconds = _simple_timeout_default(client_timeout_seconds)
+        params = {"title": title, "prompt": prompt, "default_value": default_value,
+                  "notify_heading": "The assistant needs some input", "notify_preview": prompt or title}
 
-        if result is not None:
-            if ctx:
-                await ctx.info(f"User provided multiline input ({len(result)} characters)")
-            return {
-                "success": True,
-                "user_input": result,
-                "character_count": len(result),
-                "line_count": len(result.split('\n')),
-                "cancelled": False,
-                "platform": CURRENT_PLATFORM
-            }
-        else:
-            if ctx:
-                await ctx.warning("User cancelled the multiline input dialog")
-            return {
-                "success": False,
-                "user_input": None,
-                "cancelled": True,
-                "platform": CURRENT_PLATFORM
-            }
-    
+        def rb(session, payload):
+            if payload.get("cancelled") or payload.get("kind") == "decline" or payload.get("value") is None:
+                return {"success": False, "user_input": None, "cancelled": True,
+                        "interaction_id": session.id, "needs_continuation": False,
+                        "platform": CURRENT_PLATFORM}
+            v = payload.get("value") or ""
+            return {"success": True, "user_input": v, "character_count": len(v),
+                    "line_count": len(v.split("\n")), "cancelled": False,
+                    "interaction_id": session.id, "needs_continuation": False,
+                    "platform": CURRENT_PLATFORM}
+
+        return await _run_interaction(
+            kind="multiline", params=params, client_timeout_seconds=client_timeout_seconds,
+            session_id=interaction_id, ctx=ctx,
+            make_body=lambda root, s: MultilineBody(root, s),
+            on_submit=lambda s, p: _simple_terminal(s, p, rb),
+            on_decline=lambda s, p: _simple_terminal(s, p, rb),
+            tool_name="get_multiline_input")
     except Exception as e:
         if ctx:
-            await ctx.error(f"Error creating multiline input dialog: {str(e)}")
-        return {
-            "success": False,
-            "error": str(e),
-            "cancelled": False,
-            "platform": CURRENT_PLATFORM
-        }
+            await ctx.error(f"Error in get_multiline_input: {str(e)}")
+        return {"success": False, "error": str(e), "cancelled": False,
+                "needs_continuation": False, "platform": CURRENT_PLATFORM}
+
 
 @mcp.tool()
 async def show_confirmation_dialog(
     title: Annotated[str, Field(description="Title of the confirmation dialog")],
     message: Annotated[str, Field(description="The message to show to the user")],
-    ctx: Context = None
+    client_timeout_seconds: _HEARTBEAT_TIMEOUT_FIELD = None,
+    interaction_id: _INTERACTION_ID_FIELD = None,
+    ctx: Context = None,
 ) -> Dict[str, Any]:
     """
     Show a confirmation dialog with Yes/No buttons.
-    
-    This tool displays a message to the user and asks for confirmation.
-    Perfect for getting approval before proceeding with an action.
+
+    Displays a message and asks for confirmation - perfect for getting approval before
+    proceeding with an action.
+
+    Window lifecycle & heartbeat: this rings an always-on-top notification toast; the
+    human clicks View to open the dialog. Pass `client_timeout_seconds`; on a 'heartbeat' or
+    'opened' status re-call with the returned `interaction_id` and do NOT reply to the user
+    until they answer.
     """
     try:
         if ctx:
-            await ctx.info(f"Requesting user confirmation: {message}")
-        
-        # Ensure GUI is initialized
-        if not ensure_gui_initialized():
-            return {
-                "success": False,
-                "error": "GUI system not available",
-                "confirmed": False,
-                "platform": CURRENT_PLATFORM
-            }
-        
-        # Build the dialog on the main thread (required by tkinter/macOS)
-        result = await _dialog_runner.run_dialog(
-            lambda root: show_confirmation(root, title, message),
-            timeout=300,  # 5 minute timeout
-        )
+            await ctx.info(f"show_confirmation_dialog: {message}")
+        client_timeout_seconds = _simple_timeout_default(client_timeout_seconds)
+        params = {"title": title, "prompt": message,
+                  "notify_heading": "The assistant needs your confirmation",
+                  "notify_preview": message or title}
 
-        if ctx:
-            await ctx.info(f"User confirmation result: {'Yes' if result else 'No'}")
-        
-        return {
-            "success": True,
-            "confirmed": result,
-            "response": "yes" if result else "no",
-            "platform": CURRENT_PLATFORM
-        }
-    
+        def rb(session, payload):
+            if payload.get("kind") == "decline":
+                return {"success": True, "confirmed": False, "response": "no", "cancelled": True,
+                        "interaction_id": session.id, "needs_continuation": False,
+                        "platform": CURRENT_PLATFORM}
+            val = bool(payload.get("value"))
+            return {"success": True, "confirmed": val, "response": "yes" if val else "no",
+                    "interaction_id": session.id, "needs_continuation": False,
+                    "platform": CURRENT_PLATFORM}
+
+        return await _run_interaction(
+            kind="confirm", params=params, client_timeout_seconds=client_timeout_seconds,
+            session_id=interaction_id, ctx=ctx,
+            make_body=lambda root, s: ConfirmBody(root, s),
+            on_submit=lambda s, p: _simple_terminal(s, p, rb),
+            on_decline=lambda s, p: _simple_terminal(s, p, rb),
+            tool_name="show_confirmation_dialog")
     except Exception as e:
         if ctx:
-            await ctx.error(f"Error showing confirmation dialog: {str(e)}")
-        return {
-            "success": False,
-            "error": str(e),
-            "confirmed": False,
-            "platform": CURRENT_PLATFORM
-        }
+            await ctx.error(f"Error in show_confirmation_dialog: {str(e)}")
+        return {"success": False, "error": str(e), "confirmed": False,
+                "needs_continuation": False, "platform": CURRENT_PLATFORM}
+
 
 @mcp.tool()
 async def show_info_message(
     title: Annotated[str, Field(description="Title of the information dialog")],
     message: Annotated[str, Field(description="The information message to show to the user")],
-    ctx: Context = None
+    client_timeout_seconds: _HEARTBEAT_TIMEOUT_FIELD = None,
+    interaction_id: _INTERACTION_ID_FIELD = None,
+    ctx: Context = None,
 ) -> Dict[str, Any]:
     """
     Show an information message to the user.
-    
-    This tool displays an informational message dialog to notify the user about something.
-    The user just needs to click OK to acknowledge the message.
+
+    Displays an informational message dialog to notify the user about something; the user
+    just clicks OK to acknowledge.
+
+    Window lifecycle & heartbeat: this rings an always-on-top notification toast; the
+    human clicks View to open the message. Pass `client_timeout_seconds`; on a 'heartbeat' or
+    'opened' status re-call with the returned `interaction_id` and do NOT reply to the user
+    until they acknowledge (or cancel the notification).
     """
     try:
         if ctx:
-            await ctx.info(f"Showing info message to user: {message}")
-        
-        # Ensure GUI is initialized
-        if not ensure_gui_initialized():
-            return {
-                "success": False,
-                "error": "GUI system not available",
-                "platform": CURRENT_PLATFORM
-            }
-        
-        # Build the dialog on the main thread (required by tkinter/macOS)
-        result = await _dialog_runner.run_dialog(
-            lambda root: show_info(root, title, message),
-            timeout=300,  # 5 minute timeout
-        )
+            await ctx.info(f"show_info_message: {message}")
+        client_timeout_seconds = _simple_timeout_default(client_timeout_seconds)
+        params = {"title": title, "prompt": message,
+                  "notify_heading": "The assistant has an update",
+                  "notify_preview": message or title}
 
-        if ctx:
-            await ctx.info("Info message acknowledged by user")
-        
-        return {
-            "success": True,
-            "acknowledged": result,
-            "platform": CURRENT_PLATFORM
-        }
-    
+        def rb(session, payload):
+            acknowledged = payload.get("kind") != "decline"
+            return {"success": True, "acknowledged": acknowledged,
+                    "interaction_id": session.id, "needs_continuation": False,
+                    "platform": CURRENT_PLATFORM}
+
+        return await _run_interaction(
+            kind="info", params=params, client_timeout_seconds=client_timeout_seconds,
+            session_id=interaction_id, ctx=ctx,
+            make_body=lambda root, s: InfoBody(root, s),
+            on_submit=lambda s, p: _simple_terminal(s, p, rb),
+            on_decline=lambda s, p: _simple_terminal(s, p, rb),
+            tool_name="show_info_message")
     except Exception as e:
         if ctx:
-            await ctx.error(f"Error showing info message: {str(e)}")
-        return {
-            "success": False,
-            "error": str(e),
-            "platform": CURRENT_PLATFORM
-        }
+            await ctx.error(f"Error in show_info_message: {str(e)}")
+        return {"success": False, "error": str(e),
+                "needs_continuation": False, "platform": CURRENT_PLATFORM}
 
-def _format_operator_profile():
-    """Human-readable block describing who the operator is, from the config file."""
+@mcp.tool(description=(
+    "Returns the human operator's profile (name, role, responsibilities, and how they "
+    "want you to communicate) so you know WHO you are assisting. "
+    + _format_operator_profile()
+))
+async def get_operator_profile() -> Dict[str, Any]:
+    """Read the current operator profile from the server's config."""
     p = human_loop_config.get_profile()
-    name = (p.get("name") or "").strip()
-    role = (p.get("role") or "").strip()
-    resp = (p.get("responsibilities") or "").strip()
-    comm = (p.get("communication") or "").strip()
-    lines = ["**ABOUT THE OPERATOR YOU ARE WORKING WITH:**"]
-    lines.append(f"- Name: {name}" if name else "- Name: (not provided)")
-    lines.append(f"- Role: {role}" if role else "- Role: (unspecified)")
-    if resp:
-        lines.append(f"- Responsibilities: {resp}")
-    if not role and not resp:
-        lines.append("- Scope: no role/responsibilities set — they can be assigned ANY task "
-                     "(within the delegation rules below).")
-    if comm:
-        lines.append(f"- How to communicate with them: {comm}")
-    return "\n".join(lines)
+    return {
+        "name": (p.get("name") or "").strip(),
+        "role": (p.get("role") or "").strip(),
+        "responsibilities": (p.get("responsibilities") or "").strip(),
+        "communication": (p.get("communication") or "").strip(),
+        "summary": _format_operator_profile(),
+        "platform": CURRENT_PLATFORM,
+    }
 
 
 # Add a prompt to get prompting guidance for LLMs
@@ -2705,7 +2402,11 @@ You have access to Human-in-the-Loop tools that allow you to interact directly w
 - `get_multiline_input` - Long-form text for ONE open-ended answer (a description, code, a document) — not a multi-question form
 - `show_confirmation_dialog` - Yes/No decisions (confirmations, approvals)
 - `show_info_message` - Status updates and notifications
-- `assign_task_to_human` - Delegate ONE atomic action the assistant CANNOT do itself (must be handed to a human — a physical-world action is the common case) and wait (long-running) for the human to report Completed/Failed/Still-progressing with an optional note and file/image attachments. Its report describes task execution, so: do NOT use it to ask questions or request information (use the input/choice tools for that), do NOT bundle multiple steps into one task (assign them as separate sequential tasks, adjusting each from the previous report), and keep `task_description` to a single actionable instruction (it's a work order, not a chat message). It first shows a non-focus-stealing ringing notification (View/Cancel). Uses a heartbeat protocol: always pass your own `client_timeout_seconds` and `max_result_bytes` (your client's tool-result size limit); when you get `status: "heartbeat"` or `status: "opened"` re-call with the same `task_id` (do not respond to the user in between). Completed/failed keep the session open for your review — re-call with the same `task_id` and updated `task_description` to request a re-submission (e.g. a smaller attachment). Cancel on the notification returns `status: "failed"`. Submissions are archived to a local outbox.
+- `get_operator_profile` - Read WHO you are assisting (the human operator's name, role, and communication preferences)
+
+**ALL INTERACTIVE TOOLS SHARE ONE HEARTBEAT PROTOCOL:** Every tool above (and `assign_task_to_human`) first rings a small, always-on-top notification toast in the corner (View / Cancel), then waits with a heartbeat so a slow human never trips your tool-call timeout. Always pass your own `client_timeout_seconds`. When a call returns `status: "heartbeat"` or `status: "opened"`, do NOT respond to the user or reason about content — immediately re-call the SAME tool with the returned `interaction_id` (for `assign_task_to_human`, `task_id`) to keep the same dialog alive. The human's final answer comes back with `needs_continuation: false` and the tool's usual fields (`user_input` / `selected_choice` / `confirmed` / `acknowledged`). Cancel on the notification returns the tool's cancelled/declined result.
+
+- `assign_task_to_human` - Delegate ONE atomic action the assistant CANNOT do itself (must be handed to a human — a physical-world action is the common case) and wait (long-running) for the human to report Completed/Failed/Still-progressing with an optional note and file/image attachments. Its report describes task execution, so: do NOT use it to ask questions or request information (use the input/choice tools for that), do NOT bundle multiple steps into one task (assign them as separate sequential tasks, adjusting each from the previous report), and keep `task_description` to a single actionable instruction (it's a work order, not a chat message). It first shows an always-on-top ringing notification (View/Cancel). Uses a heartbeat protocol: always pass your own `client_timeout_seconds` and `max_result_bytes` (your client's tool-result size limit); when you get `status: "heartbeat"` or `status: "opened"` re-call with the same `task_id` (do not respond to the user in between). Completed/failed keep the session open for your review — re-call with the same `task_id` and updated `task_description` to request a re-submission (e.g. a smaller attachment). Cancel on the notification returns `status: "failed"`. Submissions are archived to a local outbox.
 
 **BEST PRACTICES:**
 - Ask ONE focused question per dialog; let the answer shape the next question (do NOT front-load a multi-question form)
@@ -2829,6 +2530,7 @@ async def health_check() -> Dict[str, Any]:
                 "show_confirmation_dialog",
                 "show_info_message",
                 "assign_task_to_human",
+                "get_operator_profile",
                 "get_human_loop_prompt"
             ],
             "operator": {
@@ -2875,10 +2577,29 @@ def main():
     # Transport: default stdio (client launches us as a subprocess). Set
     # HUMAN_LOOP_HTTP_PORT to instead serve over HTTP on that port so a client
     # can connect by URL. The GUI is still local to THIS machine's desktop.
+    # Set HUMAN_LOOP_HTTPS=1 (with HUMAN_LOOP_HTTPS_CERT / _KEY) to serve TLS,
+    # which newer MCP clients (e.g. Claude Desktop) now require for URL connectors.
     http_port = os.environ.get("HUMAN_LOOP_HTTP_PORT")
     http_host = os.environ.get("HUMAN_LOOP_HTTP_HOST", "127.0.0.1")
+    https_enabled = os.environ.get("HUMAN_LOOP_HTTPS", "").strip().lower() in ("1", "true", "yes", "on")
+    https_cert = os.environ.get("HUMAN_LOOP_HTTPS_CERT", "").strip()
+    https_key = os.environ.get("HUMAN_LOOP_HTTPS_KEY", "").strip()
+    uvicorn_config = None
+    scheme = "http"
+    if http_port and https_enabled:
+        # Validate the cert/key up front so we fail with a clear message rather
+        # than an opaque uvicorn traceback deep in the server thread.
+        missing = [label for label, p in (("certificate", https_cert), ("private key", https_key))
+                   if not p or not os.path.isfile(p)]
+        if missing:
+            _out(f"ERROR: HTTPS is enabled but the {' and '.join(missing)} file is missing or unset.")
+            _out("Set HUMAN_LOOP_HTTPS_CERT and HUMAN_LOOP_HTTPS_KEY to existing PEM files "
+                 "(or generate a self-signed pair from the Management Console's Server tab).")
+            sys.exit(2)
+        uvicorn_config = {"ssl_certfile": https_cert, "ssl_keyfile": https_key}
+        scheme = "https"
     if http_port:
-        _out(f"Starting MCP server on http://{http_host}:{http_port} (HTTP transport)...")
+        _out(f"Starting MCP server on {scheme}://{http_host}:{http_port} ({scheme.upper()} transport)...")
         _out("Note: HTTP mode is long-running; stop it with Ctrl+C. The GUI dialogs "
               "appear on this machine's desktop only.")
     else:
@@ -2892,7 +2613,10 @@ def main():
     def _serve():
         try:
             if http_port:
-                mcp.run(transport="http", host=http_host, port=int(http_port))
+                kwargs = {"transport": "http", "host": http_host, "port": int(http_port)}
+                if uvicorn_config:
+                    kwargs["uvicorn_config"] = uvicorn_config
+                mcp.run(**kwargs)
             else:
                 mcp.run()
         finally:
