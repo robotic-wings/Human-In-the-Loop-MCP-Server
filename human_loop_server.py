@@ -88,11 +88,16 @@ def _server_instructions():
 mcp = FastMCP("Human-in-the-Loop Server", instructions=_server_instructions())
 
 # --------------------------------------------------------------------------- #
-# Outbox: local, on-disk archive of everything the human sends to the AI
+# Logs: local, on-disk archive of every human-in-the-loop interaction
+# (every tool that asks the human for input, not just delegated tasks).
 # --------------------------------------------------------------------------- #
+LOGS_ENV_VAR = "HUMAN_LOOP_LOGS_DIR"
+DEFAULT_LOGS_DIR = os.path.join(os.path.expanduser("~"), ".human_loop_logs")
+# Legacy names (older releases called this the "outbox"); still honored so a
+# prior archive keeps working and its entries stay visible.
 OUTBOX_ENV_VAR = "HUMAN_LOOP_OUTBOX_DIR"
 DEFAULT_OUTBOX_DIR = os.path.join(os.path.expanduser("~"), ".human_loop_outbox")
-OUTBOX_SCHEMA_VERSION = 1
+LOGS_SCHEMA_VERSION = 2
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 
@@ -181,9 +186,24 @@ def compute_leg_seconds(client_timeout_seconds: int) -> int:
     return max(1, ct - margin)
 
 
-def get_outbox_dir() -> str:
-    """Resolve the outbox directory (env override, else default)."""
-    return os.environ.get(OUTBOX_ENV_VAR) or DEFAULT_OUTBOX_DIR
+def get_logs_dir() -> str:
+    """Resolve the logs directory.
+
+    Precedence: HUMAN_LOOP_LOGS_DIR, then the legacy HUMAN_LOOP_OUTBOX_DIR, then
+    the new default ~/.human_loop_logs — unless it doesn't exist yet but a legacy
+    ~/.human_loop_outbox does, in which case keep using the legacy one so old
+    entries aren't orphaned.
+    """
+    env = os.environ.get(LOGS_ENV_VAR) or os.environ.get(OUTBOX_ENV_VAR)
+    if env:
+        return env
+    if not os.path.isdir(DEFAULT_LOGS_DIR) and os.path.isdir(DEFAULT_OUTBOX_DIR):
+        return DEFAULT_OUTBOX_DIR
+    return DEFAULT_LOGS_DIR
+
+
+# Backwards-compatible alias (older internal callers / tests).
+get_outbox_dir = get_logs_dir
 
 
 def _sanitize_for_path(text: str, max_len: int = 40) -> str:
@@ -206,17 +226,19 @@ def _dedupe_name(existing: set, name: str) -> str:
     return result
 
 
-def archive_to_outbox(entry: Dict[str, Any], attachment_paths: List[str]) -> Optional[str]:
-    """Persist one submission (command + human reply + attachments) to the outbox.
+def archive_log(entry: Dict[str, Any], attachment_paths: List[str]) -> Optional[str]:
+    """Persist one interaction (the assistant's request + the human's response +
+    any attachments) to the logs directory.
 
-    Writes to a temporary directory first, then atomically renames it into place
-    so a viewer never observes a half-written entry. Returns the final entry
-    directory path, or None on failure (failures are swallowed - archiving must
-    never crash the tool).
+    Used by every human-in-the-loop tool, not just delegated tasks. Writes to a
+    temporary directory first, then atomically renames it into place so a viewer
+    never observes a half-written entry. Returns the final entry directory path,
+    or None on failure (failures are swallowed - logging must never crash a tool).
     """
     try:
-        outbox = get_outbox_dir()
-        os.makedirs(outbox, exist_ok=True)
+        logs = get_logs_dir()
+        os.makedirs(logs, exist_ok=True)
+        outbox = logs
 
         now = datetime.now(timezone.utc)
         ts = now.strftime("%Y%m%dT%H%M%S_%f")
@@ -256,8 +278,10 @@ def archive_to_outbox(entry: Dict[str, Any], attachment_paths: List[str]) -> Opt
                 })
 
         record = {
-            "schema_version": OUTBOX_SCHEMA_VERSION,
+            "schema_version": LOGS_SCHEMA_VERSION,
             "entry_id": entry_id,
+            "tool": entry.get("tool", "assign_task_to_human"),
+            "kind": entry.get("kind", "task"),
             "task_id": entry.get("task_id"),
             "created_at": now.isoformat(),
             "status": status,
@@ -278,7 +302,7 @@ def archive_to_outbox(entry: Dict[str, Any], attachment_paths: List[str]) -> Opt
         os.replace(tmp_dir, final_dir)
         return final_dir
     except Exception as e:
-        _out(f"Warning: failed to archive submission to outbox: {e}")
+        _out(f"Warning: failed to write interaction to logs: {e}")
         try:
             if 'tmp_dir' in locals() and os.path.exists(tmp_dir):
                 shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -945,7 +969,7 @@ class InteractionDialog(_LegAwareWindow):
                 fg=c.get("error_color", c["fg_secondary"]))
         elif remaining > self.WARN_SECONDS:
             self.status_label.config(
-                text=f"Assistant connected · next check-in in {self._fmt(remaining)}",
+                text=f"Assistant connected. Next check-in in {self._fmt(remaining)}",
                 fg=c["fg_secondary"])
         else:
             self.status_label.config(
@@ -1579,8 +1603,8 @@ class HumanTaskDialog(_LegAwareWindow):
         opened = self.session.created_wall.strftime("%H:%M:%S")
         if remaining > self.WARN_SECONDS:
             self.countdown_label.config(
-                text=f"Assistant connected · next check-in in {self._fmt(remaining)}   "
-                     f"(task {self._tid8} · opened {opened})",
+                text=f"Assistant connected. Next check-in in {self._fmt(remaining)}   "
+                     f"(task {self._tid8}, opened {opened})",
                 fg=c["fg_secondary"])
         elif remaining > 0:
             self.countdown_label.config(
@@ -1609,8 +1633,10 @@ class HumanTaskDialog(_LegAwareWindow):
         archived = None
         try:
             if body or paths:
-                archived = archive_to_outbox(
+                archived = archive_log(
                     {
+                        "tool": "assign_task_to_human",
+                        "kind": "task",
                         "task_id": self.session.task_id,
                         "status": "disconnected_autosave",
                         "human_action": False,
@@ -1704,7 +1730,7 @@ def _build_submission_result(session, payload, needs_continuation, archived_dir)
 
     Returns ``[summary_text, *Image(...), *File(...)]``. Images the model can see;
     other files come back as embedded resources. Oversized attachments are not
-    inlined - they are referenced by path (and are safe in the outbox archive).
+    inlined - they are referenced by path (and are safe in the logs archive).
     """
     status = payload.get("status", "in_progress")
     body = payload.get("body", "")
@@ -1713,7 +1739,7 @@ def _build_submission_result(session, payload, needs_continuation, archived_dir)
     # Hard cap the encoded result to the client's budget so it can NEVER be
     # rejected as "too large" (which would lose the deliverable). Anything that
     # doesn't fit is referenced by path instead of inlined; it is still safe in
-    # the outbox archive, and the AI can request a smaller re-submission.
+    # the logs archive, and the AI can request a smaller re-submission.
     limit = getattr(session, "max_result_bytes", DEFAULT_MAX_RESULT_BYTES) or DEFAULT_MAX_RESULT_BYTES
     encoded_budget = max(0, limit - RESULT_OVERHEAD_BYTES - len((body or "").encode("utf-8")))
 
@@ -1738,7 +1764,7 @@ def _build_submission_result(session, payload, needs_continuation, archived_dir)
                 any_omitted = True
                 entry["path_reference"] = p
                 entry["note"] = ("omitted from the result to stay under max_result_bytes; "
-                                 "the full file is saved in the outbox archive")
+                                 "the full file is saved in the logs archive")
             manifest.append(entry)
         except Exception as e:
             manifest.append({"name": name, "error": str(e)})
@@ -1755,7 +1781,7 @@ def _build_submission_result(session, payload, needs_continuation, archived_dir)
         "body": body,
         "attachments": manifest,
         "attachments_omitted_for_size": any_omitted,
-        "outbox_entry": archived_dir,
+        "log_entry": archived_dir,
         "platform": CURRENT_PLATFORM,
     }
     if payload.get("reason"):
@@ -1780,7 +1806,7 @@ def _build_submission_result(session, payload, needs_continuation, archived_dir)
     header = headers.get(status, "Human submission.")
     if disconnected:
         header = ("The task window auto-closed because it detected the assistant had stopped checking in. "
-                  "Any draft the human had typed was auto-saved to the outbox and is included below.")
+                  "Any draft the human had typed was auto-saved to the logs and is included below.")
     summary_text = header + "\n\n" + json.dumps(summary, ensure_ascii=False, indent=2)
     return [summary_text, *images, *files]
 
@@ -1802,12 +1828,71 @@ def _keepalive_resp(status, session, message):
     return resp
 
 
+# kind -> the tool name the human saw, for the logs.
+_KIND_TO_TOOL = {
+    "input": "get_user_input",
+    "choice": "get_user_choice",
+    "multiline": "get_multiline_input",
+    "confirm": "show_confirmation_dialog",
+    "info": "show_info_message",
+    "task": "assign_task_to_human",
+}
+
+
+def _log_interaction(session, result):
+    """Archive one simple-tool interaction (prompt shown + the human's answer) to
+    the logs, so the Management Console records every human-in-the-loop call - not
+    only delegated tasks. Best-effort; never raises."""
+    kind = session.kind
+    p = session.params or {}
+    title = (p.get("title") or "").strip()
+    prompt = p.get("prompt") or ""
+    cancelled = bool(result.get("cancelled"))
+
+    if kind in ("input", "multiline"):
+        status = "cancelled" if cancelled else "answered"
+        response = "" if cancelled else str(result.get("user_input") or "")
+    elif kind == "choice":
+        status = "cancelled" if cancelled else "answered"
+        response = ", ".join(str(x) for x in (result.get("selected_choices") or []))
+    elif kind == "confirm":
+        if cancelled:
+            status, response = "cancelled", "(dismissed via notification)"
+        else:
+            yes = bool(result.get("confirmed"))
+            status, response = ("confirmed", "Yes") if yes else ("declined", "No")
+    elif kind == "info":
+        acked = bool(result.get("acknowledged"))
+        status, response = ("acknowledged", "(acknowledged)") if acked else ("dismissed", "(dismissed)")
+    else:
+        status, response = ("done", "")
+
+    tool = _KIND_TO_TOOL.get(kind, kind)
+    archive_log({
+        "tool": tool,
+        "kind": kind,
+        "task_id": session.id,
+        "status": status,
+        "human_action": True,
+        "task_title": title or tool,
+        "task_description": prompt,
+        "context_note": "",
+        "client_timeout_seconds": session.client_timeout_seconds,
+        "body": response,
+    }, [])
+
+
 def _simple_terminal(session, payload, result_builder):
-    """Terminal handling shared by the simple (one-shot) dialogs: drop the session
-    and build the tool-specific result dict from the payload."""
+    """Terminal handling shared by the simple (one-shot) dialogs: drop the session,
+    build the tool-specific result dict, and log the interaction."""
     session.dialog = None
     _sessions.pop(session.id, None)
-    return result_builder(session, payload)
+    result = result_builder(session, payload)
+    try:
+        _log_interaction(session, result)
+    except Exception as e:
+        _out(f"Warning: failed to log interaction: {e}")
+    return result
 
 
 def _task_on_submit(session, payload):
@@ -1818,8 +1903,10 @@ def _task_on_submit(session, payload):
     if payload.get("already_archived"):
         archived_dir = payload.get("archived_dir")
     elif payload.get("body") or payload.get("attachment_paths"):
-        archived_dir = archive_to_outbox(
+        archived_dir = archive_log(
             {
+                "tool": "assign_task_to_human",
+                "kind": "task",
                 "task_id": session.task_id,
                 "status": status,
                 "human_action": payload.get("human_action", True),
@@ -2019,7 +2106,7 @@ async def assign_task_to_human(
       human's report from the task window. The session is kept open for your REVIEW — NOT
       destroyed. If the deliverable is insufficient, or `attachments_omitted_for_size` is true
       (an attachment was too big to inline under `max_result_bytes` and was referenced by
-      path / saved to the outbox), you MAY call again with the SAME `task_id` and an updated
+      path / saved to the logs), you MAY call again with the SAME `task_id` and an updated
       `task_description` (e.g. "please attach a smaller photo") to request a re-submission.
       If satisfied, simply stop — the session is reaped automatically.
     - Terminal outcomes (needs_continuation=false, task_id is gone, NOT resubmittable) — check
@@ -2030,12 +2117,12 @@ async def assign_task_to_human(
         * `status: "cancelled"` (no reason) — the human closed the task window without reporting.
         * `reason: "assistant_disconnected"` (status "failed" from the notification or
           "cancelled" from the task window) — the dialog auto-closed after you went silent; any
-          draft the human had typed is auto-saved to the outbox and included.
+          draft the human had typed is auto-saved to the logs and included.
     - Pass `max_result_bytes` = your client's max tool-result size. The human sees a live size
       counter and cannot submit anything whose encoded size would exceed it, and the server
       hard-caps the result to that budget — so a deliverable is never rejected as "too large".
     - Every human submission (note + attachments + your command) is also archived to a
-      local "outbox" that can be browsed later in the Management Console (management_console.py).
+      local "logs" archive that can be browsed later in the Management Console (management_console.py).
     """
     try:
         if ctx:
@@ -2406,7 +2493,7 @@ You have access to Human-in-the-Loop tools that allow you to interact directly w
 
 **ALL INTERACTIVE TOOLS SHARE ONE HEARTBEAT PROTOCOL:** Every tool above (and `assign_task_to_human`) first rings a small, always-on-top notification toast in the corner (View / Cancel), then waits with a heartbeat so a slow human never trips your tool-call timeout. Always pass your own `client_timeout_seconds`. When a call returns `status: "heartbeat"` or `status: "opened"`, do NOT respond to the user or reason about content — immediately re-call the SAME tool with the returned `interaction_id` (for `assign_task_to_human`, `task_id`) to keep the same dialog alive. The human's final answer comes back with `needs_continuation: false` and the tool's usual fields (`user_input` / `selected_choice` / `confirmed` / `acknowledged`). Cancel on the notification returns the tool's cancelled/declined result.
 
-- `assign_task_to_human` - Delegate ONE atomic action the assistant CANNOT do itself (must be handed to a human — a physical-world action is the common case) and wait (long-running) for the human to report Completed/Failed/Still-progressing with an optional note and file/image attachments. Its report describes task execution, so: do NOT use it to ask questions or request information (use the input/choice tools for that), do NOT bundle multiple steps into one task (assign them as separate sequential tasks, adjusting each from the previous report), and keep `task_description` to a single actionable instruction (it's a work order, not a chat message). It first shows an always-on-top ringing notification (View/Cancel). Uses a heartbeat protocol: always pass your own `client_timeout_seconds` and `max_result_bytes` (your client's tool-result size limit); when you get `status: "heartbeat"` or `status: "opened"` re-call with the same `task_id` (do not respond to the user in between). Completed/failed keep the session open for your review — re-call with the same `task_id` and updated `task_description` to request a re-submission (e.g. a smaller attachment). Cancel on the notification returns `status: "failed"`. Submissions are archived to a local outbox.
+- `assign_task_to_human` - Delegate ONE atomic action the assistant CANNOT do itself (must be handed to a human — a physical-world action is the common case) and wait (long-running) for the human to report Completed/Failed/Still-progressing with an optional note and file/image attachments. Its report describes task execution, so: do NOT use it to ask questions or request information (use the input/choice tools for that), do NOT bundle multiple steps into one task (assign them as separate sequential tasks, adjusting each from the previous report), and keep `task_description` to a single actionable instruction (it's a work order, not a chat message). It first shows an always-on-top ringing notification (View/Cancel). Uses a heartbeat protocol: always pass your own `client_timeout_seconds` and `max_result_bytes` (your client's tool-result size limit); when you get `status: "heartbeat"` or `status: "opened"` re-call with the same `task_id` (do not respond to the user in between). Completed/failed keep the session open for your review — re-call with the same `task_id` and updated `task_description` to request a re-submission (e.g. a smaller attachment). Cancel on the notification returns `status: "failed"`. Every interaction is recorded to a local logs archive.
 
 **BEST PRACTICES:**
 - Ask ONE focused question per dialog; let the answer shape the next question (do NOT front-load a multi-question form)

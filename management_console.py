@@ -5,7 +5,8 @@ Management Console for the Human-in-the-Loop MCP Server.
 A small, self-contained (stdlib-only, + the sibling human_loop_config module)
 tabbed control panel for the operator:
 
-  - Outbox        : browse / open / delete the archived task submissions
+  - Logs          : browse / open / delete the recorded interactions (every tool
+                    that asks the human for input, plus delegated tasks)
   - User Profile  : who you are (name/role/responsibilities) + how the AI should
                     talk to you; the server injects this into its guidance prompt
   - Server        : bring the MCP HTTP server Online / Offline (the console owns
@@ -15,7 +16,8 @@ tabbed control panel for the operator:
 
 Run:  python management_console.py
 Settings are stored in ~/.human_loop_config.json (override $HUMAN_LOOP_CONFIG).
-The outbox archive matches the server: $HUMAN_LOOP_OUTBOX_DIR, else ~/.human_loop_outbox
+The logs archive matches the server: $HUMAN_LOOP_LOGS_DIR (or legacy
+$HUMAN_LOOP_OUTBOX_DIR), else ~/.human_loop_logs (or legacy ~/.human_loop_outbox).
 """
 
 import json
@@ -31,6 +33,9 @@ from datetime import datetime
 import human_loop_config
 
 # --- Must match human_loop_server.py (kept duplicated to stay dependency-free) ---
+LOGS_ENV_VAR = "HUMAN_LOOP_LOGS_DIR"
+DEFAULT_LOGS_DIR = os.path.join(os.path.expanduser("~"), ".human_loop_logs")
+# Legacy names (older releases called this the "outbox"); still honored.
 OUTBOX_ENV_VAR = "HUMAN_LOOP_OUTBOX_DIR"
 DEFAULT_OUTBOX_DIR = os.path.join(os.path.expanduser("~"), ".human_loop_outbox")
 
@@ -158,8 +163,15 @@ CLASSIC_FONT_BOLD = ("MS Sans Serif", 9, "bold")
 FIXED_FONT = ("Courier New", 10)
 
 
-def get_outbox_dir() -> str:
-    return os.environ.get(OUTBOX_ENV_VAR) or DEFAULT_OUTBOX_DIR
+def get_logs_dir() -> str:
+    """Match human_loop_server.get_logs_dir(): new env/dir, with a legacy fallback
+    so a prior outbox archive stays visible."""
+    env = os.environ.get(LOGS_ENV_VAR) or os.environ.get(OUTBOX_ENV_VAR)
+    if env:
+        return env
+    if not os.path.isdir(DEFAULT_LOGS_DIR) and os.path.isdir(DEFAULT_OUTBOX_DIR):
+        return DEFAULT_OUTBOX_DIR
+    return DEFAULT_LOGS_DIR
 
 
 def open_with_os_default(path: str) -> None:
@@ -211,9 +223,10 @@ def classic_label(parent, text, bold=False, fg=BLACK):
 
 
 # ========================================================================= #
-# Outbox tab (the former OutboxViewer, reparented into a tab)
+# Logs tab: browse every human-in-the-loop interaction (inputs, choices,
+# confirmations, info messages, and delegated tasks).
 # ========================================================================= #
-class OutboxTab:
+class LogsTab:
     def __init__(self, parent):
         self.frame = tk.Frame(parent, bg=SILVER)
         self.entries = []
@@ -224,19 +237,23 @@ class OutboxTab:
     def _build_body(self):
         top = tk.Frame(self.frame, bg=SILVER, bd=1, relief="sunken")
         top.pack(side="top", fill="x", padx=6, pady=(6, 0))
-        self.dir_var = tk.StringVar(value=f"Outbox: {get_outbox_dir()}")
+        self.dir_var = tk.StringVar(value=f"Logs: {get_logs_dir()}")
         tk.Label(top, textvariable=self.dir_var, bg=SILVER, fg=BLACK,
                  font=CLASSIC_FONT, anchor="w").pack(side="left", padx=4, pady=2)
 
-        body = tk.Frame(self.frame, bg=SILVER)
+        # Entries (left) and Details (right) live in a horizontal PanedWindow so
+        # the divider can be dragged to widen/narrow the list. The right pane's
+        # minsize plus a sash clamp keep the list within a sensible width band.
+        body = tk.PanedWindow(self.frame, orient="horizontal", bg=SILVER,
+                              sashrelief="raised", sashwidth=7, sashpad=0, bd=0,
+                              opaqueresize=True)
         body.pack(side="top", fill="both", expand=True, padx=6, pady=6)
 
         left = tk.Frame(body, bg=SILVER)
-        left.pack(side="left", fill="both", expand=False)
         classic_label(left, "Entries (newest first):", bold=True).pack(side="top", fill="x")
         list_wrap = tk.Frame(left, bg=SILVER, bd=2, relief="sunken")
         list_wrap.pack(side="top", fill="both", expand=True)
-        self.listbox = tk.Listbox(list_wrap, width=42, bg=WHITE, fg=BLACK,
+        self.listbox = tk.Listbox(list_wrap, width=28, bg=WHITE, fg=BLACK,
                                   font=CLASSIC_FONT, bd=0, relief="flat",
                                   highlightthickness=0, activestyle="none",
                                   selectbackground=NAVY, selectforeground=WHITE,
@@ -248,7 +265,6 @@ class OutboxTab:
         self.listbox.bind("<<ListboxSelect>>", self._on_select)
 
         right = tk.Frame(body, bg=SILVER)
-        right.pack(side="left", fill="both", expand=True, padx=(6, 0))
         classic_label(right, "Details:", bold=True).pack(side="top", fill="x")
         det_wrap = tk.Frame(right, bg=SILVER, bd=2, relief="sunken")
         det_wrap.pack(side="top", fill="both", expand=True)
@@ -275,6 +291,35 @@ class OutboxTab:
         self.att_listbox.configure(yscrollcommand=att_scroll.set)
         self.att_listbox.bind("<Double-Button-1>", lambda e: self.open_attachment())
 
+        # Assemble the panes. Both have a minsize so the list can't get too
+        # narrow and (because the details pane reserves its own minsize) can't
+        # swallow the whole width; a sash clamp gives a firm upper bound too.
+        self._paned = body
+        body.add(left, minsize=self.LIST_MIN_WIDTH, stretch="never",
+                 width=self.LIST_DEFAULT_WIDTH)
+        body.add(right, minsize=self.DETAILS_MIN_WIDTH, stretch="always")
+        body.bind("<B1-Motion>", self._clamp_sash)
+        body.bind("<ButtonRelease-1>", self._clamp_sash)
+
+    # Width band for the entries pane (px).
+    LIST_MIN_WIDTH = 220
+    LIST_MAX_WIDTH = 520
+    LIST_DEFAULT_WIDTH = 320
+    DETAILS_MIN_WIDTH = 340
+
+    def _clamp_sash(self, event=None):
+        """Keep the draggable divider within [LIST_MIN_WIDTH, LIST_MAX_WIDTH]."""
+        try:
+            x = self._paned.sash_coord(0)[0]
+        except Exception:
+            return
+        nx = max(self.LIST_MIN_WIDTH, min(self.LIST_MAX_WIDTH, x))
+        if nx != x:
+            try:
+                self._paned.sash_place(0, nx, 1)
+            except Exception:
+                pass
+
     def _build_buttons(self):
         bar = tk.Frame(self.frame, bg=SILVER, bd=1, relief="raised")
         bar.pack(side="bottom", fill="x")
@@ -286,13 +331,13 @@ class OutboxTab:
 
     def refresh(self):
         self.entries = []
-        outbox = get_outbox_dir()
-        self.dir_var.set(f"Outbox: {outbox}")
-        if os.path.isdir(outbox):
-            for name in os.listdir(outbox):
+        logs = get_logs_dir()
+        self.dir_var.set(f"Logs: {logs}")
+        if os.path.isdir(logs):
+            for name in os.listdir(logs):
                 if name.startswith("."):
                     continue
-                entry_dir = os.path.join(outbox, name)
+                entry_dir = os.path.join(logs, name)
                 meta_path = os.path.join(entry_dir, "entry.json")
                 if not os.path.isfile(meta_path):
                     continue
@@ -310,7 +355,11 @@ class OutboxTab:
         self.listbox.delete(0, tk.END)
         for e in self.entries:
             r = e["record"]
-            label = f'{_fmt_timestamp(r.get("created_at", ""))}  [{r.get("status", "?")}]  {r.get("task_title", "")}'
+            tool = r.get("tool", "assign_task_to_human")
+            title = (r.get("task_title", "") or "(untitled)").replace("\n", " ")
+            # Title first so entries are distinguishable, then status, tool, time.
+            label = (f'{title}    [{r.get("status", "?")}]    {tool}    '
+                     f'{_fmt_timestamp(r.get("created_at", ""))}')
             self.listbox.insert(tk.END, label)
 
         self._set_details("")
@@ -330,13 +379,18 @@ class OutboxTab:
         if not entry:
             return
         r = entry["record"]
+        is_task = r.get("kind", "task") == "task"
+        req_label = ("Task description (from the assistant):" if is_task
+                     else "Prompt / question shown to you:")
+        resp_label = "Human's report:" if is_task else "Your response:"
         lines = [
-            f'Task title:   {r.get("task_title", "")}',
+            f'Tool:         {r.get("tool", "assign_task_to_human")}',
+            f'Title:        {r.get("task_title", "")}',
             f'Status:       {r.get("status", "")}',
             f'When:         {_fmt_timestamp(r.get("created_at", ""))}',
-            f'Task ID:      {r.get("task_id", "")}',
+            f'ID:           {r.get("task_id", "")}',
             "",
-            "Task description (from the assistant):",
+            req_label,
             (r.get("task_description", "") or "(none)"),
         ]
         if r.get("context_note"):
@@ -344,7 +398,7 @@ class OutboxTab:
         lines += [
             "",
             "-" * 60,
-            "Human's report:",
+            resp_label,
             (r.get("body", "") or "(no text)"),
         ]
         self._set_details("\n".join(lines))
@@ -390,7 +444,7 @@ class OutboxTab:
             return
         title = entry["record"].get("task_title", "")
         if not messagebox.askyesno("Delete Entry",
-                                   f"Permanently delete this outbox entry?\n\n{title}"):
+                                   f"Permanently delete this log entry?\n\n{title}"):
             return
         try:
             shutil.rmtree(entry["dir"])
@@ -981,13 +1035,13 @@ class ManagementConsole:
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(side="top", fill="both", expand=True, padx=6, pady=6)
 
-        self.outbox_tab = OutboxTab(self.notebook)
+        self.logs_tab = LogsTab(self.notebook)
         self.profile_tab = ProfileTab(self.notebook)
         self.server_tab = ServerTab(self.notebook, self)
         self.task_tab = TaskOptionsTab(self.notebook)
         self.notif_tab = NotificationTab(self.notebook)
 
-        self.notebook.add(self.outbox_tab.frame, text="  Outbox  ")
+        self.notebook.add(self.logs_tab.frame, text="  Logs  ")
         self.notebook.add(self.profile_tab.frame, text="  User Profile  ")
         self.notebook.add(self.server_tab.frame, text="  Server  ")
         self.notebook.add(self.task_tab.frame, text="  Task Options  ")
@@ -1030,8 +1084,8 @@ class ManagementConsole:
 
     def _on_tab_changed(self, event=None):
         try:
-            if self.notebook.tab(self.notebook.select(), "text").strip() == "Outbox":
-                self.outbox_tab.refresh()
+            if self.notebook.tab(self.notebook.select(), "text").strip() == "Logs":
+                self.logs_tab.refresh()
         except tk.TclError:
             pass
 
@@ -1041,7 +1095,7 @@ class ManagementConsole:
             "HITL Management Console\n"
             "Human-in-the-Loop MCP Server\n\n"
             f"Config: {human_loop_config.get_config_path()}\n"
-            f"Outbox: {get_outbox_dir()}")
+            f"Logs: {get_logs_dir()}")
 
     def _on_close(self):
         self.server_tab.shutdown()

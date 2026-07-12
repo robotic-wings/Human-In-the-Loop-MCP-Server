@@ -16,7 +16,7 @@ A powerful **Model Context Protocol (MCP) Server** that enables AI assistants li
 - **Multi-line Input**: Collect longer text content, code, or detailed descriptions
 - **Confirmation Dialogs**: Ask for yes/no decisions before proceeding with actions
 - **Information Messages**: Display notifications, status updates, and results
-- **Delegate a Task to a Human**: Hand off one action the assistant can't do itself (a physical-world action is the common case) and wait (long-running) for the human to report **Completed / Failed / Still-progressing**, with an optional written note and file/image attachments. Starts with a non-focus-stealing **ringing notification** (so it doesn't interrupt), survives client tool-call timeouts via a heartbeat protocol, detects assistant disconnection, and archives every submission to a local **Outbox**.
+- **Delegate a Task to a Human**: Hand off one action the assistant can't do itself (a physical-world action is the common case) and wait (long-running) for the human to report **Completed / Failed / Still-progressing**, with an optional written note and file/image attachments. Starts with a non-focus-stealing **ringing notification** (so it doesn't interrupt), survives client tool-call timeouts via a heartbeat protocol, detects assistant disconnection, and records every interaction (inputs, choices, confirmations, and delegated tasks) to a local **Logs** archive.
 - **Health Check**: Monitor server status and GUI availability
 
 ### 🎨 Modern Cross-Platform GUI
@@ -293,9 +293,9 @@ Claude Desktop enforces a hard ~4-minute per-tool-call timeout that cannot be di
 The single open window is **reused** across heartbeats (never re-created), and the leg the server waits is always strictly shorter than your `client_timeout_seconds`, so the heartbeat is guaranteed to reach you before your client kills the call.
 
 **Liveness & disconnect safety (so no zombie windows):**
-The window continuously shows its connection state — `Assistant connected · next check-in in m:ss (task <id> · opened <time>)` — refreshed on every heartbeat, and displays the short `task_id` + open time so duplicate windows are easy to tell apart. If the assistant stops checking in (conversation ended, client died, or it forgot to re-call), the window shows `The assistant may have disconnected…` and, after a further grace period, **auto-saves any draft the human typed to the Outbox and closes itself** — so a human never keeps typing into a dead task, and their work is never lost. If the assistant later reconnects with that `task_id`, it receives the auto-saved content as a terminal `cancelled` result (with `reason: "assistant_disconnected"`).
+The window continuously shows its connection state — `Assistant connected · next check-in in m:ss (task <id> · opened <time>)` — refreshed on every heartbeat, and displays the short `task_id` + open time so duplicate windows are easy to tell apart. If the assistant stops checking in (conversation ended, client died, or it forgot to re-call), the window shows `The assistant may have disconnected…` and, after a further grace period, **auto-saves any draft the human typed to the Logs and closes itself** — so a human never keeps typing into a dead task, and their work is never lost. If the assistant later reconnects with that `task_id`, it receives the auto-saved content as a terminal `cancelled` result (with `reason: "assistant_disconnected"`).
 
-Human submissions with attachments are returned as **content blocks**: images inline (the model can see them) and other files as embedded resources. The task window shows a **live submission-size counter** (text + attachments vs your `max_result_bytes`); if it would exceed the budget the three submit buttons grey out until the human trims it. As a hard safety, the server also caps the returned result to the budget — anything that doesn't fit is referenced by path instead of inlined (and is still saved in full to the Outbox), so a result is never rejected as "too large". Every submission is also archived to the **Outbox** (see below).
+Human submissions with attachments are returned as **content blocks**: images inline (the model can see them) and other files as embedded resources. The task window shows a **live submission-size counter** (text + attachments vs your `max_result_bytes`); if it would exceed the budget the three submit buttons grey out until the human trims it. As a hard safety, the server also caps the returned result to the budget — anything that doesn't fit is referenced by path instead of inlined (and is still saved in full to the Logs), so a result is never rejected as "too large". Every submission is also archived to the **Logs** (see below).
 
 **Example Usage:**
 ```python
@@ -327,7 +327,7 @@ python management_console.py    # or, if installed: hitl-management-console
 ```
 
 Tabs:
-- **Outbox** — browse, open attachments in, and delete the archived task submissions (see below).
+- **Logs** — browse, open attachments in, and delete the recorded interactions: every input/choice/confirmation/info call and every delegated task (see below).
 - **User Profile** — your name, role, responsibilities, and how you'd like the AI to communicate with you. The server surfaces this through channels the model actually reads: the MCP **`initialize` instructions** and the description of a dedicated **`get_operator_profile`** tool (tool descriptions are always in the model's context), plus a callable tool that returns it. (It is *not* only in the guidance prompt — MCP prompts are user-invoked and most clients never auto-load them.) Leaving role/responsibilities empty means "can be assigned any task." Because instructions/tool descriptions are read at server startup, **take the Server Offline then Online after editing your profile** to refresh what the AI sees.
 - **Server** — bring the MCP server **Online / Offline** over HTTP(S) on a chosen port/host. Tick **Enable HTTPS** to serve TLS (required by newer clients like Claude Desktop): point it at a PEM cert/key or click **Generate self-signed…** to create one via the system `openssl`. The console owns the process; closing the console takes the server Offline. (Point a URL-based MCP client at the shown `http(s)://host:port/mcp` endpoint; dialogs pop on this machine's desktop.)
 - **Task Options** — default task timeout, default max result size, and whether file/image attachments are enabled. The timeout/size defaults are **fallbacks**: used only when the AI doesn't pass its own value.
@@ -337,13 +337,13 @@ Settings persist to `~/.human_loop_config.json` (override with `HUMAN_LOOP_CONFI
 
 > **Roadmap (not yet implemented):** the config schema is versioned and structured to grow toward multi-operator, enterprise use — per-user login, an operator `secret_key` the AI must present to call in, and organization "super accounts" that control which settings each user may change.
 
-## 📤 Outbox
+## 📤 Logs
 
-Every human submission sent through `assign_task_to_human` (the AI's command + description, the human's note, and copies of all attachments) is archived to disk so nothing is lost when the window is cleared or closed.
+**Every** human-in-the-loop interaction is archived to disk — not just delegated tasks. That means each `get_user_input` / `get_user_choice` / `get_multiline_input` / `show_confirmation_dialog` / `show_info_message` call (the prompt shown and the human's answer), plus every `assign_task_to_human` submission (the AI's command + description, the human's note, and copies of all attachments). Nothing is lost when a window is cleared or closed.
 
-- **Location:** `~/.human_loop_outbox/` by default, or set the `HUMAN_LOOP_OUTBOX_DIR` environment variable.
-- **Layout:** one directory per submission, each containing an `entry.json` and an `attachments/` folder with copies of the files.
-- Browse/open/delete entries in the **Outbox** tab of the Management Console (above).
+- **Location:** `~/.human_loop_logs/` by default, or set the `HUMAN_LOOP_LOGS_DIR` environment variable. (The legacy `~/.human_loop_outbox/` / `HUMAN_LOOP_OUTBOX_DIR` are still honored, so existing archives keep working.)
+- **Layout:** one directory per interaction, each containing an `entry.json` (with `tool`, `kind`, `status`, the prompt, and the response) and an `attachments/` folder with copies of any files.
+- Browse/open/delete entries in the **Logs** tab of the Management Console (above).
 
 ## 📋 Response Format
 
@@ -501,7 +501,7 @@ HITL_DEBUG=1 uvx hitl-mcp-server
 ```
 Human-In-the-Loop-MCP-Server/
 ├── human_loop_server.py       # Main server implementation
-├── management_console.py      # Tabbed operator console (Outbox, Profile, Server, …)
+├── management_console.py      # Tabbed operator console (Logs, Profile, Server, …)
 ├── human_loop_config.py       # Shared config store (read by server + console)
 ├── notify.wav                # Default notification ringtone
 ├── pyproject.toml            # Package configuration
