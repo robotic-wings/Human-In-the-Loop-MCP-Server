@@ -202,10 +202,6 @@ def get_logs_dir() -> str:
     return DEFAULT_LOGS_DIR
 
 
-# Backwards-compatible alias (older internal callers / tests).
-get_outbox_dir = get_logs_dir
-
-
 def _sanitize_for_path(text: str, max_len: int = 40) -> str:
     """Make a string safe to embed in a directory name."""
     safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in (text or ""))
@@ -238,7 +234,6 @@ def archive_log(entry: Dict[str, Any], attachment_paths: List[str]) -> Optional[
     try:
         logs = get_logs_dir()
         os.makedirs(logs, exist_ok=True)
-        outbox = logs
 
         now = datetime.now(timezone.utc)
         ts = now.strftime("%Y%m%dT%H%M%S_%f")
@@ -246,8 +241,8 @@ def archive_log(entry: Dict[str, Any], attachment_paths: List[str]) -> Optional[
         status = entry.get("status", "unknown")
         dir_name = f"{ts}__{_sanitize_for_path(status, 16)}__{_sanitize_for_path(entry.get('task_title', ''))}"
 
-        final_dir = os.path.join(outbox, dir_name)
-        tmp_dir = os.path.join(outbox, f".tmp_{entry_id}")
+        final_dir = os.path.join(logs, dir_name)
+        tmp_dir = os.path.join(logs, f".tmp_{entry_id}")
         if os.path.exists(tmp_dir):
             shutil.rmtree(tmp_dir, ignore_errors=True)
         attach_dir = os.path.join(tmp_dir, "attachments")
@@ -1851,7 +1846,8 @@ def _log_interaction(session, result):
 
     if kind in ("input", "multiline"):
         status = "cancelled" if cancelled else "answered"
-        response = "" if cancelled else str(result.get("user_input") or "")
+        val = result.get("user_input")
+        response = "" if (cancelled or val is None) else str(val)
     elif kind == "choice":
         status = "cancelled" if cancelled else "answered"
         response = ", ".join(str(x) for x in (result.get("selected_choices") or []))
