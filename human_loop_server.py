@@ -1659,11 +1659,11 @@ class HumanTaskDialog(_LegAwareWindow):
         self.dialog.resizable(True, True)
         configure_modern_window(self.dialog)
         if IS_MACOS:
-            self.dialog.geometry("580x700")
+            self.dialog.geometry("980x700")
         elif IS_WINDOWS:
-            self.dialog.geometry("600x720")
+            self.dialog.geometry("900x720")
         else:
-            self.dialog.geometry("560x680")
+            self.dialog.geometry("960x680")
         self.dialog.minsize(460, 520)
         self._center_window()
 
