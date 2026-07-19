@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 import tkinter as tk
-from tkinter import messagebox, filedialog
+from tkinter import messagebox, filedialog, ttk
 from typing import List, Dict, Any, Optional, Literal
 from datetime import datetime, timezone
 import sys
@@ -412,6 +412,10 @@ class DialogRunner:
             if IS_MACOS:
                 self.root.call('wm', 'attributes', '.', '-topmost', '1')
                 configure_macos_app()
+                # Drop the Dock icon (Tk may re-assert a regular policy during
+                # startup, so re-apply once the loop is running).
+                _hide_dock_icon()
+                self.root.after(300, _hide_dock_icon)
             elif IS_WINDOWS:
                 self.root.attributes('-topmost', True)
         except Exception as e:
@@ -687,11 +691,46 @@ def configure_macos_app():
         try:
             # Try to bring Python to front on macOS
             subprocess.run([
-                'osascript', '-e', 
+                'osascript', '-e',
                 'tell application "System Events" to set frontmost of first process whose unix id is {} to true'.format(os.getpid())
             ], check=False, capture_output=True)
         except Exception:
             pass  # Ignore if osascript is not available
+
+
+def _hide_dock_icon():
+    """Make this process a macOS 'accessory' app — no Dock icon, no menu bar,
+    while windows still show. Gated on HUMAN_LOOP_HIDE_DOCK (set by the LaunchAgent)
+    so a manual `python human_loop_server.py` run keeps its Dock icon for debugging.
+
+    Done via the Objective-C runtime with ctypes. objc_msgSend must be given the
+    exact argtypes/restype for each selector before it's called (a mis-typed call
+    segfaults on arm64), so we set them per call on the shared function pointer.
+    """
+    if not IS_MACOS:
+        return
+    if os.environ.get("HUMAN_LOOP_HIDE_DOCK", "").strip().lower() not in ("1", "true", "yes", "on"):
+        return
+    try:
+        import ctypes
+        import ctypes.util
+        ctypes.cdll.LoadLibrary(ctypes.util.find_library("AppKit"))
+        objc = ctypes.cdll.LoadLibrary(ctypes.util.find_library("objc"))
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        send = objc.objc_msgSend
+        NSApplication = objc.objc_getClass(b"NSApplication")
+        send.restype = ctypes.c_void_p
+        send.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        app = send(NSApplication, objc.sel_registerName(b"sharedApplication"))
+        # -[NSApplication setActivationPolicy:] — NSApplicationActivationPolicyAccessory == 1.
+        send.restype = ctypes.c_bool
+        send.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long]
+        send(app, objc.sel_registerName(b"setActivationPolicy:"), 1)
+    except Exception as e:
+        _out(f"Note: could not hide Dock icon: {e}")
 
 def ensure_gui_initialized():
     """Report whether the shared GUI main loop is up.
@@ -877,6 +916,99 @@ class _LegAwareWindow:
         w.geometry(f"{width}x{height}+{x}+{y}")
 
 
+# --------------------------------------------------------------------------- #
+# "Give feedback to AI" — a button on every interaction dialog. It does NOT
+# collect the feedback itself: it resolves the current call (submit-or-cancel),
+# then tags the result so the AI is told to call get_feedback_from_user next
+# turn (that tool opens the dropdown + text dialog below).
+# --------------------------------------------------------------------------- #
+FEEDBACK_TYPES = [
+    ("more_info", "I need to give the AI more information"),
+    ("ask_question", "I have a question for the AI"),
+    ("task_too_big", "The task the AI designed is too large - break it into smaller steps"),
+    ("adjust_timeout", "Adjust the MCP tool-call timeout"),
+    ("adjust_attachment_limit", "Adjust the attachment file-size limit"),
+    ("ai_could_do_itself", "The AI assigned me a task it could do itself"),
+    ("language_barrier", "I have trouble understanding the language the AI uses"),
+    ("out_of_scope", "The task is outside my responsibilities"),
+    ("make_request", "I want to make a request to the AI"),
+    ("terminate_session", "I want to end the current session"),
+    ("other", "Other"),
+]
+_FEEDBACK_LABELS = [lbl for _id, lbl in FEEDBACK_TYPES]
+_FEEDBACK_LABEL_TO_ID = {lbl: _id for _id, lbl in FEEDBACK_TYPES}
+
+_FEEDBACK_NOTICE = (
+    "The human clicked 'Give feedback to AI'. On your VERY NEXT turn, before "
+    "replying to the user or doing anything else, call the `get_feedback_from_user` "
+    "tool to collect their feedback, then act on it.")
+
+
+def _ask_task_disposition(parent, theme_colors):
+    """Modal chooser shown when the human clicks 'Give feedback' on a task window:
+    how to report the task before the feedback step. Returns
+    'completed' | 'failed' | 'in_progress' | 'cancel', or None if they backed out."""
+    c = theme_colors
+    result = {"choice": None}
+    win = tk.Toplevel(parent)
+    win.title("Report the task first?")
+    win.configure(bg=c["bg_primary"])
+    win.transient(parent)
+    frm = tk.Frame(win, bg=c["bg_primary"])
+    frm.pack(fill="both", expand=True, padx=20, pady=16)
+    tk.Label(frm, text="Report this task's current state before giving feedback:",
+             bg=c["bg_primary"], fg=c["fg_primary"], font=get_system_font(),
+             wraplength=360, justify="left", anchor="w").pack(fill="x", pady=(0, 12))
+
+    def pick(v):
+        result["choice"] = v
+        win.destroy()
+
+    row1 = tk.Frame(frm, bg=c["bg_primary"])
+    row1.pack(fill="x")
+    create_modern_button(row1, "Completed", lambda: pick("completed"), "primary", c).pack(side="left")
+    create_modern_button(row1, "Failed", lambda: pick("failed"), "secondary", c).pack(side="left", padx=(8, 0))
+    create_modern_button(row1, "Still progressing", lambda: pick("in_progress"), "secondary", c).pack(side="left", padx=(8, 0))
+    row2 = tk.Frame(frm, bg=c["bg_primary"])
+    row2.pack(fill="x", pady=(10, 0))
+    create_modern_button(row2, "Cancel the task", lambda: pick("cancel"), "secondary", c).pack(side="left")
+
+    win.protocol("WM_DELETE_WINDOW", win.destroy)   # closing == back out (None)
+    win.update_idletasks()
+    try:
+        win.grab_set()
+    except Exception:
+        pass
+    parent.wait_window(win)
+    return result["choice"]
+
+
+def _on_feedback_click(dialog):
+    """Shared handler for the 'Give feedback to AI' button. Resolves the current
+    call (submit if submittable & confirmed, else cancel), tags the payload so the
+    tool result asks the AI to call get_feedback_from_user, then closes the dialog."""
+    payload = dialog._resolve_for_feedback()
+    if payload is None:
+        return  # the human backed out; leave the dialog open
+    payload["feedback_requested"] = True
+    dialog.session.submit_from_ui(payload)
+    dialog.close()
+
+
+def _with_feedback_notice(result):
+    """Attach the 'call get_feedback_from_user next' notice to a tool result
+    (a dict for simple tools, or a content-block list for assign_task_to_human)."""
+    if isinstance(result, list):
+        return [*result, _FEEDBACK_NOTICE]
+    if isinstance(result, dict):
+        out = dict(result)
+        out["feedback_requested"] = True
+        out["feedback_notice"] = _FEEDBACK_NOTICE
+        out["message"] = (_FEEDBACK_NOTICE + " " + (out.get("message") or "")).strip()
+        return out
+    return result
+
+
 class InteractionDialog(_LegAwareWindow):
     """Non-modal dialog skeleton shared by the simple input/choice/confirm/etc.
     dialogs. Replaces the old modal ``wait_window()`` classes: results flow to the
@@ -887,7 +1019,8 @@ class InteractionDialog(_LegAwareWindow):
     Subclasses override ``_build_body``/``_build_buttons`` and call ``self._submit``.
     """
 
-    HAS_BODY = True   # False for message-only dialogs (confirm/info)
+    HAS_BODY = True        # False for message-only dialogs (confirm/info)
+    SHOW_FEEDBACK = True    # the get_feedback_from_user dialog turns this off
 
     def __init__(self, parent, session):
         self.parent = parent
@@ -915,6 +1048,10 @@ class InteractionDialog(_LegAwareWindow):
         # Buttons pinned to the bottom so a long prompt can never push them off.
         self._button_bar = tk.Frame(main, bg=c["bg_primary"])
         self._button_bar.pack(side="bottom", fill="x", pady=(12, 0))
+        # "Give feedback to AI" sits on the left of the bar; subclass OK/Cancel go right.
+        if self.SHOW_FEEDBACK:
+            create_modern_button(self._button_bar, "Give feedback to AI",
+                                 lambda: _on_feedback_click(self), "secondary", c).pack(side="left")
 
         # Hidden-by-default countdown/disconnect status line.
         self.status_label = tk.Label(main, text="", bg=c["bg_primary"], fg=c["fg_secondary"],
@@ -983,6 +1120,30 @@ class InteractionDialog(_LegAwareWindow):
             return
         self.session.submit_from_ui({"cancelled": True})
         self.close()
+
+    # ---- feedback resolution (overridden by bodies that hold content) ---- #
+    def _is_submittable(self):
+        """True if there is a valid answer worth offering to submit before feedback.
+        Message-only dialogs (confirm/info) have nothing pending -> False."""
+        return False
+
+    def _submit_payload(self):
+        return {"cancelled": True}
+
+    def _resolve_for_feedback(self):
+        """Return the payload to deliver when 'Give feedback' is clicked, or None to
+        abort. If submittable, ask whether to submit the current answer first."""
+        if self._is_submittable():
+            ans = messagebox.askyesnocancel(
+                "Give feedback to AI",
+                "Submit your current answer before giving feedback?\n\n"
+                "Yes - submit it, then give feedback.\n"
+                "No - discard it, then give feedback.",
+                parent=self._top)
+            if ans is None:
+                return None
+            return self._submit_payload() if ans else {"cancelled": True}
+        return {"cancelled": True}
 
 
 class InputDialog(InteractionDialog):
@@ -1066,6 +1227,13 @@ class InputDialog(InteractionDialog):
     def _cancel(self):
         self._submit({"cancelled": True})
 
+    def _is_submittable(self):
+        valid, val = self._parse_current()
+        return valid and val is not None
+
+    def _submit_payload(self):
+        return {"value": self._parse_current()[1]}
+
 
 class ChoiceBody(InteractionDialog):
     """Pick one/many from a list (was ChoiceDialog)."""
@@ -1118,6 +1286,13 @@ class ChoiceBody(InteractionDialog):
     def _cancel(self):
         self._submit({"cancelled": True})
 
+    def _is_submittable(self):
+        return bool(self.listbox.curselection())
+
+    def _submit_payload(self):
+        items = [self.listbox.get(i) for i in self.listbox.curselection()]
+        return {"value": items if len(items) > 1 else items[0]}
+
 
 class MultilineBody(InteractionDialog):
     """Long-form text input (was MultilineInputDialog)."""
@@ -1160,6 +1335,12 @@ class MultilineBody(InteractionDialog):
 
     def _cancel(self):
         self._submit({"cancelled": True})
+
+    def _is_submittable(self):
+        return bool(self.text_widget.get("1.0", tk.END).strip())
+
+    def _submit_payload(self):
+        return {"value": self.text_widget.get("1.0", tk.END).strip()}
 
 
 class ConfirmBody(InteractionDialog):
@@ -1215,6 +1396,57 @@ class InfoBody(InteractionDialog):
             return
         self.session.submit_from_ui({"value": True})
         self.close()
+
+
+class FeedbackBody(InteractionDialog):
+    """Dropdown (feedback type) + free-text message. Opened by the
+    get_feedback_from_user tool. Has no 'Give feedback' button itself."""
+
+    SHOW_FEEDBACK = False
+
+    def _minsize(self):
+        return (460, 380)
+
+    def _geometry(self):
+        if IS_MACOS:
+            return (560, 470)
+        if IS_WINDOWS:
+            return (580, 490)
+        return (540, 450)
+
+    def _build_body(self, parent):
+        c = self.theme_colors
+        parent.columnconfigure(0, weight=1)
+        tk.Label(parent, text="Feedback type:", bg=c["bg_primary"], fg=c["fg_primary"],
+                 font=get_system_font(), anchor="w").grid(row=0, column=0, sticky="w")
+        self.type_var = tk.StringVar(value=_FEEDBACK_LABELS[0])
+        self.combo = ttk.Combobox(parent, textvariable=self.type_var,
+                                  values=_FEEDBACK_LABELS, state="readonly")
+        self.combo.grid(row=1, column=0, sticky="ew", pady=(2, 12))
+        tk.Label(parent, text="Your message:", bg=c["bg_primary"], fg=c["fg_primary"],
+                 font=get_system_font(), anchor="w").grid(row=2, column=0, sticky="w")
+        parent.rowconfigure(3, weight=1)
+        self.text_widget = tk.Text(parent, height=8)
+        apply_modern_style(self.text_widget, "text", self.theme_colors)
+        self.text_widget.grid(row=3, column=0, sticky="nsew", pady=(2, 0))
+        self.text_widget.focus_set()
+
+    def _build_buttons(self, parent):
+        c = self.theme_colors
+        create_modern_button(parent, "Send", self._ok, "primary", c).pack(side=tk.RIGHT, padx=(8, 0))
+        create_modern_button(parent, "Cancel", self._cancel, "secondary", c).pack(side=tk.RIGHT)
+        self._top.bind('<Escape>', lambda e: self._cancel())
+
+    def _ok(self):
+        label = self.type_var.get()
+        self._submit({"value": {
+            "id": _FEEDBACK_LABEL_TO_ID.get(label, "other"),
+            "label": label,
+            "text": self.text_widget.get("1.0", tk.END).strip(),
+        }})
+
+    def _cancel(self):
+        self._submit({"cancelled": True})
 
 
 # --------------------------------------------------------------------------- #
@@ -1523,6 +1755,9 @@ class HumanTaskDialog(_LegAwareWindow):
             button_frame, "Still progressing", lambda: self._submit("in_progress", terminal=False),
             "secondary", self.theme_colors)
         self.btn_in_progress.pack(side=tk.RIGHT)
+        create_modern_button(
+            button_frame, "Give feedback to AI", lambda: _on_feedback_click(self),
+            "secondary", self.theme_colors).pack(side=tk.LEFT, padx=(8, 0))
         self._submit_buttons = (self.btn_completed, self.btn_failed, self.btn_in_progress)
 
         self.dialog.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -1659,6 +1894,20 @@ class HumanTaskDialog(_LegAwareWindow):
         self.close()
 
     # ---------------- submit / close ---------------- #
+    def _resolve_for_feedback(self):
+        """'Give feedback' on a task window: ask how to report the task first
+        (Completed/Failed/Still-progressing/Cancel). Returns the submit payload, or
+        None if the human backed out."""
+        choice = _ask_task_disposition(self._top, self.theme_colors)
+        if choice is None:
+            return None
+        body = self.body_text.get("1.0", tk.END).strip()
+        paths = list(self.attachments)
+        status = "cancelled" if choice == "cancel" else choice
+        return {"status": status, "human_action": True, "body": body,
+                "attachment_paths": paths,
+                "terminal": choice in ("completed", "failed", "cancel")}
+
     def _submit(self, status, terminal):
         """Any submit action (Completed/Failed/Still-progressing) is one complete
         'email'. It always CLOSES the window - the window's lifecycle is exactly
@@ -1830,6 +2079,7 @@ _KIND_TO_TOOL = {
     "multiline": "get_multiline_input",
     "confirm": "show_confirmation_dialog",
     "info": "show_info_message",
+    "feedback": "get_feedback_from_user",
     "task": "assign_task_to_human",
 }
 
@@ -1860,6 +2110,14 @@ def _log_interaction(session, result):
     elif kind == "info":
         acked = bool(result.get("acknowledged"))
         status, response = ("acknowledged", "(acknowledged)") if acked else ("dismissed", "(dismissed)")
+    elif kind == "feedback":
+        if cancelled:
+            status, response = "cancelled", ""
+        else:
+            status = result.get("feedback_type") or "feedback"
+            label = result.get("feedback_type_label", "")
+            text = result.get("feedback_text") or ""
+            response = (label + ("\n\n" + text if text else "")).strip()
     else:
         status, response = ("done", "")
 
@@ -2042,8 +2300,14 @@ async def _run_interaction(*, kind, params, client_timeout_seconds, session_id, 
             f"The human opened the dialog. Keep waiting - call {tool_name} again with the same id and do "
             "NOT respond to the user in the meantime.")
     if kind_ev == "decline":
-        return on_decline(session, payload)
-    return on_submit(session, payload)
+        result = on_decline(session, payload)
+    else:
+        result = on_submit(session, payload)
+    # The human clicked 'Give feedback to AI' on the dialog: the call was resolved
+    # (submitted or cancelled) above; tell the AI to collect the feedback next turn.
+    if payload.get("feedback_requested"):
+        result = _with_feedback_notice(result)
+    return result
 
 
 @mcp.tool()
@@ -2436,6 +2700,73 @@ async def show_info_message(
         return {"success": False, "error": str(e),
                 "needs_continuation": False, "platform": CURRENT_PLATFORM}
 
+
+@mcp.tool()
+async def get_feedback_from_user(
+    client_timeout_seconds: _HEARTBEAT_TIMEOUT_FIELD = None,
+    interaction_id: _INTERACTION_ID_FIELD = None,
+    ctx: Context = None,
+) -> Dict[str, Any]:
+    """
+    Collect free-form feedback from the human: opens a dialog with a dropdown of
+    feedback types and a text box, and returns what they chose and wrote.
+
+    WHEN TO CALL: any previous interactive tool result may come back with
+    `feedback_requested: true` (and a `feedback_notice`) because the human clicked
+    "Give feedback to AI" on that dialog. When you see that, call THIS tool on your
+    very next turn — before replying to the user or doing anything else — to hear
+    them out, then act on what they say. (You may also call it proactively if you
+    want to invite feedback.)
+
+    The result carries `feedback_type` (a stable id such as `task_too_big`,
+    `adjust_timeout`, `adjust_attachment_limit`, `out_of_scope`, `ai_could_do_itself`,
+    `terminate_session`, `other`, …), `feedback_type_label` (the human-readable
+    label they picked), and `feedback_text` (their message). Interpret both the type
+    and the text: e.g. `task_too_big` → split the task into smaller steps;
+    `adjust_timeout` / `adjust_attachment_limit` → use a larger `client_timeout_seconds`
+    / `max_result_bytes` on subsequent calls; `terminate_session` → stop; `out_of_scope`
+    / `ai_could_do_itself` → don't re-delegate that work. Same notification + heartbeat
+    protocol as the other tools (pass `client_timeout_seconds`; re-call with the
+    returned `interaction_id` on `heartbeat`/`opened`). Every feedback is recorded to
+    the logs.
+    """
+    try:
+        if ctx:
+            await ctx.info("get_feedback_from_user")
+        client_timeout_seconds = _simple_timeout_default(client_timeout_seconds)
+        params = {
+            "title": "Give feedback to the AI",
+            "prompt": "Choose the type of feedback, then describe it in your own words.",
+            "notify_heading": "Share your feedback",
+            "notify_preview": "The assistant is ready to hear your feedback.",
+        }
+
+        def rb(session, payload):
+            if payload.get("cancelled") or payload.get("kind") == "decline" or payload.get("value") is None:
+                return {"success": False, "cancelled": True, "feedback_type": None,
+                        "feedback_type_label": None, "feedback_text": None,
+                        "interaction_id": session.id, "needs_continuation": False,
+                        "platform": CURRENT_PLATFORM}
+            v = payload.get("value") or {}
+            return {"success": True, "cancelled": False,
+                    "feedback_type": v.get("id"), "feedback_type_label": v.get("label"),
+                    "feedback_text": v.get("text", ""), "interaction_id": session.id,
+                    "needs_continuation": False, "platform": CURRENT_PLATFORM}
+
+        return await _run_interaction(
+            kind="feedback", params=params, client_timeout_seconds=client_timeout_seconds,
+            session_id=interaction_id, ctx=ctx,
+            make_body=lambda root, s: FeedbackBody(root, s),
+            on_submit=lambda s, p: _simple_terminal(s, p, rb),
+            on_decline=lambda s, p: _simple_terminal(s, p, rb),
+            tool_name="get_feedback_from_user")
+    except Exception as e:
+        if ctx:
+            await ctx.error(f"Error in get_feedback_from_user: {str(e)}")
+        return {"success": False, "error": str(e), "cancelled": False,
+                "needs_continuation": False, "platform": CURRENT_PLATFORM}
+
+
 @mcp.tool(description=(
     "Returns the human operator's profile (name, role, responsibilities, and how they "
     "want you to communicate) so you know WHO you are assisting. "
@@ -2485,7 +2816,10 @@ You have access to Human-in-the-Loop tools that allow you to interact directly w
 - `get_multiline_input` - Long-form text for ONE open-ended answer (a description, code, a document) — not a multi-question form
 - `show_confirmation_dialog` - Yes/No decisions (confirmations, approvals)
 - `show_info_message` - Status updates and notifications
+- `get_feedback_from_user` - Collect open-ended feedback (a dropdown of feedback types + a text box). CALL THIS whenever a previous tool result comes back with `feedback_requested: true` — the human clicked "Give feedback to AI" and wants to tell you something (task too big, out of scope, adjust timeout/attachment limit, a question, a request, end the session, …). Do it before anything else on that turn, then act on `feedback_type` + `feedback_text`.
 - `get_operator_profile` - Read WHO you are assisting (the human operator's name, role, and communication preferences)
+
+Note: on EVERY interaction dialog the human has a "Give feedback to AI" button. If they use it, the current call is resolved (submitted or cancelled) and its result carries `feedback_requested: true` — your cue to call `get_feedback_from_user` next.
 
 **ALL INTERACTIVE TOOLS SHARE ONE HEARTBEAT PROTOCOL:** Every tool above (and `assign_task_to_human`) first rings a small, always-on-top notification toast in the corner (View / Cancel), then waits with a heartbeat so a slow human never trips your tool-call timeout. Always pass your own `client_timeout_seconds`. When a call returns `status: "heartbeat"` or `status: "opened"`, do NOT respond to the user or reason about content — immediately re-call the SAME tool with the returned `interaction_id` (for `assign_task_to_human`, `task_id`) to keep the same dialog alive. The human's final answer comes back with `needs_continuation: false` and the tool's usual fields (`user_input` / `selected_choice` / `confirmed` / `acknowledged`). Cancel on the notification returns the tool's cancelled/declined result.
 
@@ -2612,6 +2946,7 @@ async def health_check() -> Dict[str, Any]:
                 "get_multiline_input",
                 "show_confirmation_dialog",
                 "show_info_message",
+                "get_feedback_from_user",
                 "assign_task_to_human",
                 "get_operator_profile",
                 "get_human_loop_prompt"
@@ -2662,11 +2997,29 @@ def main():
     # can connect by URL. The GUI is still local to THIS machine's desktop.
     # Set HUMAN_LOOP_HTTPS=1 (with HUMAN_LOOP_HTTPS_CERT / _KEY) to serve TLS,
     # which newer MCP clients (e.g. Claude Desktop) now require for URL connectors.
+    #
+    # `--service` (used by the OS background service the Management Console
+    # installs) makes the server read host/port/HTTPS from the shared config file
+    # instead of env vars, so the per-OS service definition can stay trivial and
+    # identical (just `python human_loop_server.py --service`). stdio remains the
+    # default, so a client launching us without the flag is unaffected.
+    service_mode = "--service" in sys.argv
     http_port = os.environ.get("HUMAN_LOOP_HTTP_PORT")
     http_host = os.environ.get("HUMAN_LOOP_HTTP_HOST", "127.0.0.1")
     https_enabled = os.environ.get("HUMAN_LOOP_HTTPS", "").strip().lower() in ("1", "true", "yes", "on")
     https_cert = os.environ.get("HUMAN_LOOP_HTTPS_CERT", "").strip()
     https_key = os.environ.get("HUMAN_LOOP_HTTPS_KEY", "").strip()
+    if service_mode and not http_port:
+        s = human_loop_config.get_server_settings()
+        http_port = str(s.get("http_port", 8000))
+        http_host = s.get("http_host", "0.0.0.0")
+        https_enabled = bool(s.get("https_enabled", False))
+        https_cert = (s.get("https_certfile") or "").strip()
+        https_key = (s.get("https_keyfile") or "").strip()
+        # Background service => no Dock icon (macOS) / no console (via pythonw on
+        # Windows, handled by the launcher). Trigger the macOS dock-hide path.
+        if IS_MACOS:
+            os.environ["HUMAN_LOOP_HIDE_DOCK"] = "1"
     uvicorn_config = None
     scheme = "http"
     if http_port and https_enabled:

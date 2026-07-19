@@ -137,11 +137,15 @@ Some clients — including recent **Claude Desktop** — only accept **HTTPS** U
 **Recommended setup:**
 
 1. Install mkcert once: `brew install mkcert` (macOS; see the mkcert README for Linux/Windows).
-2. In the **Management Console → Server tab**: tick **Enable HTTPS**, click **Generate certificate…**. This runs `mkcert -install` (adds mkcert's local CA to your trust store — it may prompt for your password) and issues a cert into `~/.human_loop_certs/` with SANs for `localhost`/`127.0.0.1` and your bind host.
+2. In the **Management Console → Server tab**: tick **Enable HTTPS**, click **Generate certificate…**. This runs `mkcert -install` (adds mkcert's local CA to your trust store — it may prompt for your password) and issues a cert into `~/.human_loop_certs/`.
 3. **Go Online.** The endpoint becomes `https://host:port/mcp`.
 4. If Claude Desktop is already running, **restart it once** so it reloads the trust store.
 
-If mkcert isn't installed, **Generate** falls back to an `openssl` self-signed cert — usable for tools that let you bypass verification (e.g. `curl -k`), but **not** trusted by Claude Desktop until you trust it manually.
+**Serving on multiple IPs (loopback + LAN + public).** Set **Bind host** to `0.0.0.0` to serve on every interface at once (this is the default). A single certificate is issued whose **SAN list covers every address a client connects to**, so it's valid on each — no per-IP listener needed. The **Certificate names (IPs / hosts)** field is prefilled with this machine's detected LAN IP; add any others there (e.g. `192.168.0.102`, or a future public domain like `mcp.example.com`) before clicking Generate. `localhost` / `127.0.0.1` / `::1` are always included. When bound to `0.0.0.0`, the Server tab lists a `https://…/mcp` endpoint for each reachable address.
+
+> **Public addresses:** mkcert certs are only trusted on machines that have your local CA installed. To serve a **public** domain to *other people's* machines you need a certificate from a real CA (e.g. Let's Encrypt) — point the **Certificate** / **Private key** fields at it. The SAN/bind mechanics are identical.
+
+If mkcert isn't installed, **Generate** falls back to an `openssl` self-signed cert (still multi-SAN) — usable for tools that let you bypass verification (e.g. `curl -k`), but **not** trusted by Claude Desktop until you trust it manually.
 
 To run the server directly instead of via the console, set the TLS env vars alongside the port:
 
@@ -155,6 +159,20 @@ python human_loop_server.py
 ```
 
 If `HUMAN_LOOP_HTTPS=1` but the cert/key file is missing, the server refuses to start with a clear message (exit code 2) rather than serving plaintext.
+
+### Running as a background service (cross-platform)
+
+The **Management Console → Server tab → Install / Update** registers the server as a per-user background service that **auto-starts at every login** with no terminal window. Because the server pops GUI dialogs, it must run in your **graphical login session** on every OS (never a headless Windows Service / macOS LaunchDaemon), so each platform uses its user-session autostart mechanism:
+
+| OS | Mechanism | Location | No-window trick |
+|----|-----------|----------|-----------------|
+| **macOS** | LaunchAgent (launchd) | `~/Library/LaunchAgents/com.human-loop.hitl.plist` | accessory activation policy → no Dock icon |
+| **Linux** | systemd `--user` service | `~/.config/systemd/user/human-loop-hitl.service` | runs detached; no terminal |
+| **Windows** | Startup-folder launcher | `…\Start Menu\Programs\Startup\human-loop-hitl.vbs` | launched via `pythonw.exe` → no console |
+
+All three just run `python human_loop_server.py --service`; in `--service` mode the server reads host/port/HTTPS from `~/.human_loop_config.json` (so the service definition stays trivial and settings live in one place). Changing a setting in the console and clicking **Install / Update** rewrites the definition and restarts the service. Default MCP behavior is unchanged: launched **without** `--service` (e.g. by Claude Desktop over stdio), the server still runs stdio as before.
+
+The service logic lives in `service_manager.py` (stdlib-only). macOS is fully exercised; the Linux/Windows backends follow each platform's standard pattern.
 
 ## 🛠️ Available Tools
 
@@ -329,7 +347,7 @@ python management_console.py    # or, if installed: hitl-management-console
 Tabs:
 - **Logs** — browse, open attachments in, and delete the recorded interactions: every input/choice/confirmation/info call and every delegated task (see below).
 - **User Profile** — your name, role, responsibilities, and how you'd like the AI to communicate with you. The server surfaces this through channels the model actually reads: the MCP **`initialize` instructions** and the description of a dedicated **`get_operator_profile`** tool (tool descriptions are always in the model's context), plus a callable tool that returns it. (It is *not* only in the guidance prompt — MCP prompts are user-invoked and most clients never auto-load them.) Leaving role/responsibilities empty means "can be assigned any task." Because instructions/tool descriptions are read at server startup, **take the Server Offline then Online after editing your profile** to refresh what the AI sees.
-- **Server** — bring the MCP server **Online / Offline** over HTTP(S) on a chosen port/host. Tick **Enable HTTPS** to serve TLS (required by newer clients like Claude Desktop): point it at a PEM cert/key or click **Generate self-signed…** to create one via the system `openssl`. The console owns the process; closing the console takes the server Offline. (Point a URL-based MCP client at the shown `http(s)://host:port/mcp` endpoint; dialogs pop on this machine's desktop.)
+- **Server** — configure the HTTP(S) endpoint (port, bind host, TLS cert) and **Install / Update** the server as a **background OS service** that auto-starts at every login with no terminal window. Tick **Enable HTTPS** to serve TLS (required by newer clients like Claude Desktop) and **Generate certificate…** (mkcert-trusted if installed). The service runs independently of the console — closing the console does **not** stop it; use **Uninstall** to remove it, or **View log** to debug. (Point a URL-based MCP client at the shown `http(s)://host:port/mcp` endpoint; dialogs pop on this machine's desktop.) See [Running as a background service](#running-as-a-background-service-cross-platform) for how it's registered on each OS.
 - **Task Options** — default task timeout, default max result size, and whether file/image attachments are enabled. The timeout/size defaults are **fallbacks**: used only when the AI doesn't pass its own value.
 - **Notification** — pick the incoming-task ringtone (a `.wav`, or the bundled `notify.wav`), preview it, or mute.
 
@@ -503,6 +521,7 @@ Human-In-the-Loop-MCP-Server/
 ├── human_loop_server.py       # Main server implementation
 ├── management_console.py      # Tabbed operator console (Logs, Profile, Server, …)
 ├── human_loop_config.py       # Shared config store (read by server + console)
+├── service_manager.py         # Cross-platform background-service install (launchd/systemd/Startup)
 ├── notify.wav                # Default notification ringtone
 ├── pyproject.toml            # Package configuration
 ├── README.md                 # Documentation

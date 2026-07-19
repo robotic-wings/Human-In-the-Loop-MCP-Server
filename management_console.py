@@ -23,7 +23,7 @@ $HUMAN_LOOP_OUTBOX_DIR), else ~/.human_loop_logs (or legacy ~/.human_loop_outbox
 import json
 import os
 import shutil
-import signal
+import socket
 import subprocess
 import sys
 import tkinter as tk
@@ -31,6 +31,7 @@ from tkinter import messagebox, filedialog, ttk
 from datetime import datetime
 
 import human_loop_config
+import service_manager
 
 # --- Must match human_loop_server.py (kept duplicated to stay dependency-free) ---
 LOGS_ENV_VAR = "HUMAN_LOOP_LOGS_DIR"
@@ -39,10 +40,9 @@ DEFAULT_LOGS_DIR = os.path.join(os.path.expanduser("~"), ".human_loop_logs")
 OUTBOX_ENV_VAR = "HUMAN_LOOP_OUTBOX_DIR"
 DEFAULT_OUTBOX_DIR = os.path.join(os.path.expanduser("~"), ".human_loop_outbox")
 
-# The server script this console launches for HTTP mode, plus its PID / log files.
+# The server script the console registers as a background service, plus its log.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 SERVER_SCRIPT = os.path.join(_HERE, "human_loop_server.py")
-PID_FILE = os.path.join(os.path.expanduser("~"), ".human_loop_server.pid")
 SERVER_LOG = os.path.join(os.path.expanduser("~"), ".human_loop_server.log")
 BUNDLED_RINGTONE = os.path.join(_HERE, "notify.wav")
 
@@ -54,27 +54,74 @@ DEFAULT_KEYFILE = os.path.join(CERT_DIR, "server.key")
 _server_python_cache = None
 
 
-def _cert_san_names(host):
-    """Loopback names plus the bind host, de-duplicated, order-stable."""
-    return list(dict.fromkeys([(host or "127.0.0.1").strip() or "127.0.0.1",
-                               "localhost", "127.0.0.1", "::1"]))
+def detect_local_ips():
+    """Best-effort list of this machine's own IPv4 addresses (the LAN address in
+    particular), so a cert can cover the IPs clients will actually connect to.
+    Loopback and link-local are excluded (loopback is added separately)."""
+    ips = set()
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            # No packets are sent; this just picks the interface/IP the OS would
+            # use to reach the internet — i.e. the primary LAN address.
+            s.connect(("8.8.8.8", 80))
+            ips.add(s.getsockname()[0])
+        finally:
+            s.close()
+    except Exception:
+        pass
+    try:
+        for _fam, _t, _p, _c, sockaddr in socket.getaddrinfo(socket.gethostname(), None,
+                                                             socket.AF_INET):
+            ips.add(sockaddr[0])
+    except Exception:
+        pass
+    return sorted(ip for ip in ips
+                  if ip and not ip.startswith("127.") and not ip.startswith("169.254."))
 
 
-def generate_trusted_cert(host, certfile=DEFAULT_CERTFILE, keyfile=DEFAULT_KEYFILE):
-    """Create a cert/key PEM pair for `host` (+ loopback names).
+def _is_ip_literal(s):
+    return (":" in s) or (s.replace(".", "").isdigit() and s.count(".") == 3)
+
+
+def _cert_san_names(host, extra_names=None):
+    """The SAN list for a generated cert: loopback names, the machine's own LAN
+    IP(s), the bind host (unless it's a wildcard like 0.0.0.0 that clients never
+    connect to), plus any operator-supplied names. De-duplicated, order-stable."""
+    names = ["localhost", "127.0.0.1", "::1"]
+    h = (host or "").strip()
+    if h and h not in ("0.0.0.0", "::"):
+        names.append(h)
+    names += detect_local_ips()
+    for n in (extra_names or []):
+        n = (n or "").strip()
+        if n and n not in ("0.0.0.0", "::"):
+            names.append(n)
+    return list(dict.fromkeys(names))
+
+
+def generate_trusted_cert(host, extra_names=None, certfile=DEFAULT_CERTFILE,
+                          keyfile=DEFAULT_KEYFILE):
+    """Create ONE cert/key PEM pair whose SAN list covers every address a client
+    may connect to: loopback, this machine's LAN IP(s), the bind host, and any
+    `extra_names` (e.g. a future public IP/domain). A single multi-SAN cert is
+    valid for each of those, so binding to 0.0.0.0 works over every interface.
 
     Prefers **mkcert**, which installs a locally-trusted CA into the OS/browser
     trust stores so Electron/Chromium clients (Claude Desktop) accept the cert
     without a security warning. Falls back to a bare **openssl** self-signed cert,
-    which the client must be told to trust manually.
+    which the client must be told to trust manually. (Note: for a *public* domain
+    served to other people's machines you need a real CA such as Let's Encrypt;
+    mkcert only covers machines that trust your local CA.)
 
-    Returns ``(certfile, keyfile, trusted)`` where ``trusted`` is True only for the
-    mkcert path. Raises RuntimeError (with a readable message) if neither tool is
-    available or generation fails.
+    Returns ``(certfile, keyfile, trusted, names)`` where ``trusted`` is True only
+    for the mkcert path and ``names`` is the SAN list actually used. Raises
+    RuntimeError (with a readable message) if neither tool is available or fails.
     """
     os.makedirs(CERT_DIR, exist_ok=True)
-    host = (host or "127.0.0.1").strip() or "127.0.0.1"
-    names = _cert_san_names(host)
+    names = _cert_san_names(host, extra_names)
+    # A sensible CN: the first non-loopback name, else localhost.
+    cn = next((n for n in names if n not in ("localhost", "127.0.0.1", "::1")), "localhost")
 
     mkcert = shutil.which("mkcert")
     if mkcert:
@@ -88,7 +135,7 @@ def generate_trusted_cert(host, certfile=DEFAULT_CERTFILE, keyfile=DEFAULT_KEYFI
                 os.chmod(keyfile, 0o600)
             except OSError:
                 pass
-            return certfile, keyfile, True
+            return certfile, keyfile, True, names
         # mkcert present but failed — fall through to self-signed.
 
     openssl = shutil.which("openssl")
@@ -99,13 +146,11 @@ def generate_trusted_cert(host, certfile=DEFAULT_CERTFILE, keyfile=DEFAULT_KEYFI
             "    brew install mkcert\n\n"
             "…or install openssl, or point the certificate/key fields at an existing "
             "PEM pair.")
-    san_str = ",".join(
-        (("IP:" + s) if s.replace(".", "").replace(":", "").isdigit() or ":" in s else ("DNS:" + s))
-        for s in names)
+    san_str = ",".join((("IP:" + s) if _is_ip_literal(s) else ("DNS:" + s)) for s in names)
     cmd = [
         openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
         "-keyout", keyfile, "-out", certfile,
-        "-days", "825", "-subj", f"/CN={host}",
+        "-days", "825", "-subj", f"/CN={cn}",
         "-addext", f"subjectAltName={san_str}",
     ]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
@@ -115,7 +160,7 @@ def generate_trusted_cert(host, certfile=DEFAULT_CERTFILE, keyfile=DEFAULT_KEYFI
         os.chmod(keyfile, 0o600)
     except OSError:
         pass
-    return certfile, keyfile, False
+    return certfile, keyfile, False, names
 
 
 def resolve_server_python():
@@ -144,13 +189,6 @@ def resolve_server_python():
                 continue
     return None
 
-
-def _read_tail(path, n=2500):
-    try:
-        with open(path, "r", errors="replace") as f:
-            return f.read()[-n:]
-    except OSError:
-        return ""
 
 SILVER = "#C0C0C0"
 WHITE = "#FFFFFF"
@@ -379,10 +417,13 @@ class LogsTab:
         if not entry:
             return
         r = entry["record"]
-        is_task = r.get("kind", "task") == "task"
-        req_label = ("Task description (from the assistant):" if is_task
-                     else "Prompt / question shown to you:")
-        resp_label = "Human's report:" if is_task else "Your response:"
+        kind = r.get("kind", "task")
+        if kind == "task":
+            req_label, resp_label = "Task description (from the assistant):", "Human's report:"
+        elif kind == "feedback":
+            req_label, resp_label = "Feedback prompt:", "Feedback (type + message):"
+        else:
+            req_label, resp_label = "Prompt / question shown to you:", "Your response:"
         lines = [
             f'Tool:         {r.get("tool", "assign_task_to_human")}',
             f'Title:        {r.get("task_title", "")}',
@@ -677,36 +718,6 @@ class NotificationTab(SettingsTab):
         }
 
 
-# --- PID-file helpers ---------------------------------------------------- #
-def _write_pid_file(pid):
-    try:
-        with open(PID_FILE, "w") as f:
-            f.write(str(pid))
-    except OSError:
-        pass
-
-
-def _read_pid_file():
-    try:
-        with open(PID_FILE) as f:
-            return int(f.read().strip())
-    except (OSError, ValueError):
-        return None
-
-
-def _remove_pid_file():
-    try:
-        os.remove(PID_FILE)
-    except OSError:
-        pass
-
-
-def _pid_alive(pid):
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
 
 
 # ---- Server (Online / Offline) ----------------------------------------- #
@@ -716,9 +727,6 @@ class ServerTab:
     def __init__(self, parent, app):
         self.app = app
         self.frame = tk.Frame(parent, bg=SILVER)
-        self.proc = None       # Popen we started this session
-        self.pid = None        # adopted PID (from a prior session), if any
-        self._logf = None      # server's stdout+stderr log file handle
         body = tk.Frame(self.frame, bg=SILVER)
         body.pack(side="top", fill="both", expand=True, padx=16, pady=14)
         body.columnconfigure(1, weight=1)
@@ -756,35 +764,57 @@ class ServerTab:
         self.key_browse = classic_button(key_row, "Browse…", self._browse_key, width=9)
         self.key_browse.pack(side="left", padx=(6, 0))
 
+        # Names/IPs the certificate must be valid for (SAN). Bind to 0.0.0.0 to
+        # serve on every interface, and list here each IP/host clients connect to
+        # (127.0.0.1, the LAN IP, a future public domain). Loopback + this box's
+        # LAN IP are always included automatically.
+        self.san_lbl = classic_label(body, "Certificate names\n(IPs / hosts):")
+        self.san_lbl.grid(row=5, column=0, sticky="nw", pady=4)
+        self.sannames = classic_entry(body, width=30)
+        self.sannames.grid(row=5, column=1, sticky="ew", pady=4)
+        self.san_hint = classic_label(
+            body, "Separate multiple with commas, e.g.:  127.0.0.1, 192.168.0.102, mcp.example.com",
+            fg=GRAY)
+        self.san_hint.grid(row=6, column=1, sticky="w")
+
         self.gen_btn = classic_button(body, "Generate certificate…", self._generate_cert, width=22)
-        self.gen_btn.grid(row=5, column=1, sticky="w", pady=(0, 2))
+        self.gen_btn.grid(row=7, column=1, sticky="w", pady=(0, 2))
         self.https_hint = classic_label(
             body, "Claude Desktop only trusts CA-signed certs. Install mkcert "
                   "(brew install mkcert) and click Generate for a\ncertificate it accepts; "
                   "otherwise Generate makes a self-signed one you must trust manually.", fg=GRAY)
-        self.https_hint.grid(row=6, column=0, columnspan=2, sticky="w")
+        self.https_hint.grid(row=8, column=0, columnspan=2, sticky="w")
 
-        self.status_var = tk.StringVar(value="● Offline")
+        self.status_var = tk.StringVar(value="● Not installed")
         self.status_lbl = tk.Label(body, textvariable=self.status_var, bg=SILVER, fg=GRAY,
                                    font=CLASSIC_FONT_BOLD, anchor="w")
-        self.status_lbl.grid(row=7, column=0, columnspan=2, sticky="w", pady=(16, 4))
+        self.status_lbl.grid(row=9, column=0, columnspan=2, sticky="w", pady=(16, 4))
         self.endpoint_var = tk.StringVar(value="")
         self.endpoint_lbl = tk.Label(body, textvariable=self.endpoint_var, bg=SILVER, fg=BLACK,
-                                     font=CLASSIC_FONT, anchor="w")
-        self.endpoint_lbl.grid(row=8, column=0, columnspan=2, sticky="w")
-        classic_label(body, "Going Online launches the MCP server. Point a URL-based MCP client at\n"
-                            "the endpoint above. Dialogs pop on THIS machine's desktop.\n"
-                            "Closing this console takes the server Offline.", fg=GRAY).grid(
-            row=9, column=0, columnspan=2, sticky="w", pady=(12, 0))
+                                     font=CLASSIC_FONT, anchor="w", justify="left")
+        self.endpoint_lbl.grid(row=10, column=0, columnspan=2, sticky="w")
+        classic_label(body, "Installs a background service (macOS LaunchAgent / systemd --user /\n"
+                            "Windows Startup) that runs the server and auto-starts at every login —\n"
+                            "no terminal window. Bind host 0.0.0.0 = serve on ALL interfaces. Changing\n"
+                            "any setting above and clicking Install / Update re-applies and restarts it.", fg=GRAY).grid(
+            row=11, column=0, columnspan=2, sticky="w", pady=(12, 0))
 
         bar = tk.Frame(self.frame, bg=SILVER, bd=1, relief="raised")
         bar.pack(side="bottom", fill="x")
-        self.toggle_btn = classic_button(bar, "Go Online", self.toggle, width=14)
-        self.toggle_btn.pack(side="right", padx=8, pady=6)
+        self.uninstall_btn = classic_button(bar, "Uninstall", self.uninstall, width=12)
+        self.uninstall_btn.pack(side="right", padx=(4, 8), pady=6)
+        self.install_btn = classic_button(bar, "Install / Update", self.install, width=16)
+        self.install_btn.pack(side="right", padx=4, pady=6)
+        classic_button(bar, "View log", self._view_log, width=10).pack(side="left", padx=8, pady=6)
 
         self._load()
-        self._adopt_existing()
         self._poll()
+
+    def _view_log(self):
+        if os.path.isfile(SERVER_LOG):
+            open_with_os_default(SERVER_LOG)
+        else:
+            messagebox.showinfo("Server log", "No log yet — the service hasn't run.")
 
     def _load(self):
         s = human_loop_config.load_config().get("server", {})
@@ -793,13 +823,23 @@ class ServerTab:
         self.https_var.set(bool(s.get("https_enabled", False)))
         self.certfile.delete(0, tk.END); self.certfile.insert(0, str(s.get("https_certfile", "")))
         self.keyfile.delete(0, tk.END); self.keyfile.insert(0, str(s.get("https_keyfile", "")))
+        # SAN names: use the saved list, else auto-suggest this machine's LAN IP(s).
+        saved = s.get("https_san_names") or []
+        san = ", ".join(saved) if saved else ", ".join(detect_local_ips())
+        self.sannames.delete(0, tk.END); self.sannames.insert(0, san)
         self._toggle_https_fields()
 
+    def _san_names(self):
+        """The operator-listed cert names, split on comma/space/newline."""
+        raw = self.sannames.get().replace(",", " ")
+        return [n for n in raw.split() if n.strip()]
+
     def _toggle_https_fields(self):
-        """Enable the TLS inputs only when HTTPS is checked (and we're offline)."""
-        on = self.https_var.get() and not self.is_online()
-        state = "normal" if on else "disabled"
-        for w in (self.certfile, self.keyfile, self.cert_browse, self.key_browse, self.gen_btn):
+        """Enable the TLS inputs only when HTTPS is checked. Settings stay editable
+        even while the service is installed — Install / Update re-applies them."""
+        state = "normal" if self.https_var.get() else "disabled"
+        for w in (self.certfile, self.keyfile, self.cert_browse, self.key_browse,
+                  self.gen_btn, self.sannames):
             try:
                 w.config(state=state)
             except Exception:
@@ -822,17 +862,20 @@ class ServerTab:
     def _generate_cert(self):
         host = self.host.get().strip() or "127.0.0.1"
         try:
-            cert, key, trusted = generate_trusted_cert(host)
+            cert, key, trusted, names = generate_trusted_cert(host, self._san_names())
         except Exception as e:
             messagebox.showerror("Generate certificate", str(e))
             return
         self.certfile.delete(0, tk.END); self.certfile.insert(0, cert)
         self.keyfile.delete(0, tk.END); self.keyfile.insert(0, key)
+        # Reflect back the full SAN list the cert actually covers.
+        self.sannames.delete(0, tk.END); self.sannames.insert(0, ", ".join(names))
+        names_str = ", ".join(names)
         if trusted:
             messagebox.showinfo(
                 "Generate certificate",
-                f"Created a locally-trusted certificate (via mkcert) for '{host}':\n\n"
-                f"{cert}\n{key}\n\n"
+                f"Created a locally-trusted certificate (via mkcert) valid for:\n\n"
+                f"{names_str}\n\n{cert}\n{key}\n\n"
                 "mkcert also installed its local CA into your system trust store, so "
                 "Claude Desktop and browsers will accept it.\n\n"
                 "If the client is already running, restart it once so it reloads the "
@@ -840,7 +883,7 @@ class ServerTab:
         else:
             messagebox.showwarning(
                 "Generate certificate",
-                f"Created a SELF-SIGNED certificate for '{host}':\n\n"
+                f"Created a SELF-SIGNED certificate valid for:\n\n{names_str}\n\n"
                 f"{cert}\n{key}\n\n"
                 "WARNING: self-signed certs are NOT trusted by Claude Desktop "
                 "(you'll see 'connection is not private' / ERR_CERT_AUTHORITY_INVALID).\n\n"
@@ -848,38 +891,65 @@ class ServerTab:
                 "    brew install mkcert\n\n"
                 "Otherwise you must manually trust this certificate in your OS keychain.")
 
-    def is_online(self):
-        if self.proc is not None and self.proc.poll() is None:
-            return True
-        if self.pid is not None and _pid_alive(self.pid):
-            return True
-        return False
-
-    def _adopt_existing(self):
-        """If a prior console left a server running, adopt it so we can stop it."""
-        pid = _read_pid_file()
-        if pid and _pid_alive(pid):
-            self.pid = pid
-        else:
-            _remove_pid_file()
-        self._render()
-
     def _endpoint(self):
         scheme = "https" if self.https_var.get() else "http"
-        return f"{scheme}://{self.host.get().strip() or '127.0.0.1'}:{self.port.get().strip()}/mcp"
-
-    def toggle(self):
-        if self.is_online():
-            self.stop()
-        else:
-            self.start()
-
-    def start(self):
         port = self.port.get().strip()
         host = self.host.get().strip() or "127.0.0.1"
+        # 0.0.0.0/:: is a bind wildcard, not a connectable address — show the
+        # actual reachable endpoints (loopback + this machine's LAN IPs) instead.
+        if host in ("0.0.0.0", "::"):
+            hosts = ["127.0.0.1"] + detect_local_ips()
+        else:
+            hosts = [host]
+        return "\n".join(f"{scheme}://{h}:{port}/mcp" for h in hosts)
+
+    def _collect_and_save(self):
+        """Validate the fields and persist them to the shared config. Returns the
+        saved config dict, or None if validation failed (a dialog was shown)."""
+        port = self.port.get().strip()
+        host = self.host.get().strip() or "0.0.0.0"
         if not port.isdigit():
             messagebox.showwarning("Server", "Port must be a number.")
-            return
+            return None
+        https_on = self.https_var.get()
+        cert = self.certfile.get().strip()
+        key = self.keyfile.get().strip()
+        if https_on:
+            if not cert and not key:
+                if messagebox.askyesno(
+                        "HTTPS",
+                        "HTTPS is enabled but no certificate is set.\n\n"
+                        "Generate one now? (mkcert is used for a trusted certificate "
+                        "if installed; otherwise a self-signed one you must trust.)"):
+                    try:
+                        cert, key, _trusted, _names = generate_trusted_cert(host, self._san_names())
+                        self.certfile.delete(0, tk.END); self.certfile.insert(0, cert)
+                        self.keyfile.delete(0, tk.END); self.keyfile.insert(0, key)
+                    except Exception as e:
+                        messagebox.showerror("Server", f"Could not generate a certificate:\n{e}")
+                        return None
+                else:
+                    return None
+            missing = [name for name, p in (("certificate", cert), ("private key", key))
+                       if not p or not os.path.isfile(p)]
+            if missing:
+                messagebox.showwarning(
+                    "Server", f"The TLS {' and '.join(missing)} file is missing.\n\n"
+                              "Pick an existing PEM file or generate a self-signed pair.")
+                return None
+        cfg = human_loop_config.load_config()
+        cfg["server"] = {
+            "http_port": int(port), "http_host": host,
+            "https_enabled": https_on, "https_certfile": cert, "https_keyfile": key,
+            "https_san_names": self._san_names(),
+        }
+        try:
+            human_loop_config.save_config(cfg)
+        except Exception:
+            pass
+        return cfg
+
+    def install(self):
         py = resolve_server_python()
         if py is None:
             messagebox.showerror(
@@ -890,132 +960,70 @@ class ServerTab:
                 "    uv run python management_console.py\n"
                 "(or create a .venv next to these files with fastmcp installed).")
             return
-        https_on = self.https_var.get()
-        cert = self.certfile.get().strip()
-        key = self.keyfile.get().strip()
-        if https_on:
-            # Offer to generate a self-signed pair if none is configured yet.
-            if not cert and not key:
-                if messagebox.askyesno(
-                        "HTTPS",
-                        "HTTPS is enabled but no certificate is set.\n\n"
-                        "Generate one now? (mkcert is used for a trusted certificate "
-                        "if installed; otherwise a self-signed one you must trust.)"):
-                    try:
-                        cert, key, _trusted = generate_trusted_cert(host)
-                        self.certfile.delete(0, tk.END); self.certfile.insert(0, cert)
-                        self.keyfile.delete(0, tk.END); self.keyfile.insert(0, key)
-                    except Exception as e:
-                        messagebox.showerror("Server", f"Could not generate a certificate:\n{e}")
-                        return
-                else:
-                    return
-            missing = [name for name, p in (("certificate", cert), ("private key", key))
-                       if not p or not os.path.isfile(p)]
-            if missing:
-                messagebox.showwarning(
-                    "Server", f"The TLS {' and '.join(missing)} file is missing.\n\n"
-                              "Pick an existing PEM file or generate a self-signed pair.")
-                return
-        cfg = human_loop_config.load_config()
-        cfg["server"] = {
-            "http_port": int(port), "http_host": host,
-            "https_enabled": https_on, "https_certfile": cert, "https_keyfile": key,
-        }
-        try:
-            human_loop_config.save_config(cfg)
-        except Exception:
-            pass
-        env = dict(os.environ, HUMAN_LOOP_HTTP_PORT=port, HUMAN_LOOP_HTTP_HOST=host)
-        if https_on:
-            env.update(HUMAN_LOOP_HTTPS="1", HUMAN_LOOP_HTTPS_CERT=cert, HUMAN_LOOP_HTTPS_KEY=key)
-        try:
-            self._logf = open(SERVER_LOG, "w")
-            self.proc = subprocess.Popen([py, SERVER_SCRIPT], env=env,
-                                         stdout=self._logf, stderr=subprocess.STDOUT)
-        except Exception as e:
-            self._close_log()
-            messagebox.showerror("Server", f"Could not start server:\n{e}")
-            self.proc = None
+        if not service_manager.supported():
+            messagebox.showerror(
+                "Server", "Installing a background service isn't supported on this "
+                          f"platform ({sys.platform}).")
             return
-        self.pid = None
-        _write_pid_file(self.proc.pid)
+        cfg = self._collect_and_save()
+        if cfg is None:
+            return
+        try:
+            service_manager.install(py, SERVER_SCRIPT, _HERE)
+        except Exception as e:
+            messagebox.showerror("Server", f"Could not install the service:\n\n{e}")
+            return
         self._render()
+        # "No icon" means different things per OS: no Dock icon (macOS), no console
+        # window (Windows, via pythonw), no terminal (Linux).
+        no_icon = ("no Dock icon" if service_manager.IS_MACOS
+                   else "no console window" if service_manager.IS_WINDOWS
+                   else "no terminal")
+        messagebox.showinfo(
+            "Service installed",
+            "The Human-in-the-Loop server is now running as a background service and "
+            "will start automatically every time you log in.\n\n"
+            f"Registered as: {service_manager.platform_label()}\n"
+            f"It has {no_icon}. Use Uninstall to remove it.\n\n"
+            f"Endpoint(s):\n{self._endpoint()}")
 
-    def _close_log(self):
-        if self._logf is not None:
-            try:
-                self._logf.close()
-            except Exception:
-                pass
-            self._logf = None
-
-    def stop(self):
-        if self.proc is not None:
-            try:
-                self.proc.terminate()
-            except Exception:
-                pass
-        elif self.pid is not None:
-            try:
-                os.kill(self.pid, signal.SIGTERM)
-            except Exception:
-                pass
-        self._close_log()
-        self.proc = None
-        self.pid = None
-        _remove_pid_file()
+    def uninstall(self):
+        if not service_manager.is_installed():
+            messagebox.showinfo("Server", "The service is not installed.")
+            return
+        if not messagebox.askyesno(
+                "Uninstall service",
+                "Stop the background server and remove it from login startup?"):
+            return
+        try:
+            service_manager.uninstall()
+        except Exception as e:
+            messagebox.showerror("Server", f"Could not uninstall the service:\n\n{e}")
+            return
         self._render()
-
-    def _handle_crash(self):
-        """The server we launched exited on its own — surface why."""
-        self._close_log()
-        log = _read_tail(SERVER_LOG)
-        self.proc = None
-        _remove_pid_file()
-        self._render()
-        messagebox.showerror(
-            "Server stopped",
-            "The MCP server process exited unexpectedly.\n\n" + (log or "(no output captured)"))
 
     def _poll(self):
-        # Detect a server that died on its own; keep the button label correct.
-        if self.proc is not None and self.proc.poll() is not None:
-            self._handle_crash()
-        elif self.proc is None and self.pid is not None and not _pid_alive(self.pid):
-            self.pid = None
-            _remove_pid_file()
-            self._render()
-        self.frame.after(1000, self._poll)
+        self._render()
+        self.frame.after(2000, self._poll)
 
     def _render(self):
-        if self.is_online():
-            self.status_var.set("● Online")
+        installed = service_manager.is_installed()
+        pid = service_manager.running_pid() if installed else None
+        if installed and pid:
+            self.status_var.set(f"● Running as a login service (pid {pid})")
             self.status_lbl.config(fg=GREEN)
             self.endpoint_var.set(self._endpoint())
-            self.toggle_btn.config(text="Go Offline")
-            self.port.config(state="disabled")
-            self.host.config(state="disabled")
-            self.https_chk.config(state="disabled")
+        elif installed:
+            # Installed; PID unknown (stopped, still starting, or — on Windows/Linux
+            # — not detectable). Use View log to check if it actually crashed.
+            self.status_var.set("● Installed — starts at login (View log for details)")
+            self.status_lbl.config(fg=NAVY)
+            self.endpoint_var.set(self._endpoint())
         else:
-            self.status_var.set("● Offline")
+            self.status_var.set("● Not installed")
             self.status_lbl.config(fg=GRAY)
             self.endpoint_var.set("")
-            self.toggle_btn.config(text="Go Online")
-            self.port.config(state="normal")
-            self.host.config(state="normal")
-            self.https_chk.config(state="normal")
-        self._toggle_https_fields()
-
-    def shutdown(self):
-        """Called when the console is closing: stop a server we own."""
-        if self.proc is not None and self.proc.poll() is None:
-            try:
-                self.proc.terminate()
-            except Exception:
-                pass
-            _remove_pid_file()
-        self._close_log()
+        self.uninstall_btn.config(state="normal" if installed else "disabled")
 
 
 # ========================================================================= #
@@ -1098,7 +1106,8 @@ class ManagementConsole:
             f"Logs: {get_logs_dir()}")
 
     def _on_close(self):
-        self.server_tab.shutdown()
+        # The server runs as an independent background service now, so closing
+        # the console does NOT stop it — just close the window.
         self.root.destroy()
 
 

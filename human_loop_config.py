@@ -45,6 +45,7 @@ DEFAULT_CONFIG = {
         "https_enabled": False,   # serve over HTTPS (required by newer clients)
         "https_certfile": "",     # PEM cert path (empty = auto-managed self-signed)
         "https_keyfile": "",      # PEM private-key path (empty = auto-managed self-signed)
+        "https_san_names": [],    # extra IPs/hosts the cert must cover (SAN)
     },
     "task_defaults": {
         "timeout_seconds": 240,
