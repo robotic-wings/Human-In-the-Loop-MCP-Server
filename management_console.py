@@ -46,11 +46,6 @@ SERVER_SCRIPT = os.path.join(_HERE, "human_loop_server.py")
 SERVER_LOG = os.path.join(os.path.expanduser("~"), ".human_loop_server.log")
 BUNDLED_RINGTONE = os.path.join(_HERE, "notify.wav")
 
-# Where auto-generated TLS material lives.
-CERT_DIR = os.path.join(os.path.expanduser("~"), ".human_loop_certs")
-DEFAULT_CERTFILE = os.path.join(CERT_DIR, "server.crt")
-DEFAULT_KEYFILE = os.path.join(CERT_DIR, "server.key")
-
 _server_python_cache = None
 
 
@@ -78,89 +73,6 @@ def detect_local_ips():
         pass
     return sorted(ip for ip in ips
                   if ip and not ip.startswith("127.") and not ip.startswith("169.254."))
-
-
-def _is_ip_literal(s):
-    return (":" in s) or (s.replace(".", "").isdigit() and s.count(".") == 3)
-
-
-def _cert_san_names(host, extra_names=None):
-    """The SAN list for a generated cert: loopback names, the machine's own LAN
-    IP(s), the bind host (unless it's a wildcard like 0.0.0.0 that clients never
-    connect to), plus any operator-supplied names. De-duplicated, order-stable."""
-    names = ["localhost", "127.0.0.1", "::1"]
-    h = (host or "").strip()
-    if h and h not in ("0.0.0.0", "::"):
-        names.append(h)
-    names += detect_local_ips()
-    for n in (extra_names or []):
-        n = (n or "").strip()
-        if n and n not in ("0.0.0.0", "::"):
-            names.append(n)
-    return list(dict.fromkeys(names))
-
-
-def generate_trusted_cert(host, extra_names=None, certfile=DEFAULT_CERTFILE,
-                          keyfile=DEFAULT_KEYFILE):
-    """Create ONE cert/key PEM pair whose SAN list covers every address a client
-    may connect to: loopback, this machine's LAN IP(s), the bind host, and any
-    `extra_names` (e.g. a future public IP/domain). A single multi-SAN cert is
-    valid for each of those, so binding to 0.0.0.0 works over every interface.
-
-    Prefers **mkcert**, which installs a locally-trusted CA into the OS/browser
-    trust stores so Electron/Chromium clients (Claude Desktop) accept the cert
-    without a security warning. Falls back to a bare **openssl** self-signed cert,
-    which the client must be told to trust manually. (Note: for a *public* domain
-    served to other people's machines you need a real CA such as Let's Encrypt;
-    mkcert only covers machines that trust your local CA.)
-
-    Returns ``(certfile, keyfile, trusted, names)`` where ``trusted`` is True only
-    for the mkcert path and ``names`` is the SAN list actually used. Raises
-    RuntimeError (with a readable message) if neither tool is available or fails.
-    """
-    os.makedirs(CERT_DIR, exist_ok=True)
-    names = _cert_san_names(host, extra_names)
-    # A sensible CN: the first non-loopback name, else localhost.
-    cn = next((n for n in names if n not in ("localhost", "127.0.0.1", "::1")), "localhost")
-
-    mkcert = shutil.which("mkcert")
-    if mkcert:
-        # Install the local CA into the system + browser trust stores (idempotent;
-        # may prompt for your password the first time).
-        subprocess.run([mkcert, "-install"], capture_output=True, text=True, timeout=180)
-        r = subprocess.run([mkcert, "-cert-file", certfile, "-key-file", keyfile] + names,
-                           capture_output=True, text=True, timeout=180)
-        if r.returncode == 0:
-            try:
-                os.chmod(keyfile, 0o600)
-            except OSError:
-                pass
-            return certfile, keyfile, True, names
-        # mkcert present but failed — fall through to self-signed.
-
-    openssl = shutil.which("openssl")
-    if not openssl:
-        raise RuntimeError(
-            "Neither mkcert nor openssl was found on PATH.\n\n"
-            "Install mkcert for a trusted certificate (recommended):\n"
-            "    brew install mkcert\n\n"
-            "…or install openssl, or point the certificate/key fields at an existing "
-            "PEM pair.")
-    san_str = ",".join((("IP:" + s) if _is_ip_literal(s) else ("DNS:" + s)) for s in names)
-    cmd = [
-        openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-        "-keyout", keyfile, "-out", certfile,
-        "-days", "825", "-subj", f"/CN={cn}",
-        "-addext", f"subjectAltName={san_str}",
-    ]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    if r.returncode != 0:
-        raise RuntimeError((r.stderr or r.stdout or "openssl failed").strip())
-    try:
-        os.chmod(keyfile, 0o600)
-    except OSError:
-        pass
-    return certfile, keyfile, False, names
 
 
 def resolve_server_python():
@@ -764,40 +676,25 @@ class ServerTab:
         self.key_browse = classic_button(key_row, "Browse…", self._browse_key, width=9)
         self.key_browse.pack(side="left", padx=(6, 0))
 
-        # Names/IPs the certificate must be valid for (SAN). Bind to 0.0.0.0 to
-        # serve on every interface, and list here each IP/host clients connect to
-        # (127.0.0.1, the LAN IP, a future public domain). Loopback + this box's
-        # LAN IP are always included automatically.
-        self.san_lbl = classic_label(body, "Certificate names\n(IPs / hosts):")
-        self.san_lbl.grid(row=5, column=0, sticky="nw", pady=4)
-        self.sannames = classic_entry(body, width=30)
-        self.sannames.grid(row=5, column=1, sticky="ew", pady=4)
-        self.san_hint = classic_label(
-            body, "Separate multiple with commas, e.g.:  127.0.0.1, 192.168.0.102, mcp.example.com",
-            fg=GRAY)
-        self.san_hint.grid(row=6, column=1, sticky="w")
-
-        self.gen_btn = classic_button(body, "Generate certificate…", self._generate_cert, width=22)
-        self.gen_btn.grid(row=7, column=1, sticky="w", pady=(0, 2))
         self.https_hint = classic_label(
-            body, "Claude Desktop only trusts CA-signed certs. Install mkcert "
-                  "(brew install mkcert) and click Generate for a\ncertificate it accepts; "
-                  "otherwise Generate makes a self-signed one you must trust manually.", fg=GRAY)
-        self.https_hint.grid(row=8, column=0, columnspan=2, sticky="w")
+            body, "Provide your own PEM certificate + private key. The cert's SAN must\n"
+                  "cover each address clients connect to (e.g. 127.0.0.1 and your LAN IP),\n"
+                  "and be trusted by the client (Claude Desktop rejects untrusted certs).", fg=GRAY)
+        self.https_hint.grid(row=5, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
         self.status_var = tk.StringVar(value="● Not installed")
         self.status_lbl = tk.Label(body, textvariable=self.status_var, bg=SILVER, fg=GRAY,
                                    font=CLASSIC_FONT_BOLD, anchor="w")
-        self.status_lbl.grid(row=9, column=0, columnspan=2, sticky="w", pady=(16, 4))
+        self.status_lbl.grid(row=6, column=0, columnspan=2, sticky="w", pady=(16, 4))
         self.endpoint_var = tk.StringVar(value="")
         self.endpoint_lbl = tk.Label(body, textvariable=self.endpoint_var, bg=SILVER, fg=BLACK,
                                      font=CLASSIC_FONT, anchor="w", justify="left")
-        self.endpoint_lbl.grid(row=10, column=0, columnspan=2, sticky="w")
+        self.endpoint_lbl.grid(row=7, column=0, columnspan=2, sticky="w")
         classic_label(body, "Installs a background service (macOS LaunchAgent / systemd --user /\n"
                             "Windows Startup) that runs the server and auto-starts at every login —\n"
                             "no terminal window. Bind host 0.0.0.0 = serve on ALL interfaces. Changing\n"
                             "any setting above and clicking Install / Update re-applies and restarts it.", fg=GRAY).grid(
-            row=11, column=0, columnspan=2, sticky="w", pady=(12, 0))
+            row=8, column=0, columnspan=2, sticky="w", pady=(12, 0))
 
         bar = tk.Frame(self.frame, bg=SILVER, bd=1, relief="raised")
         bar.pack(side="bottom", fill="x")
@@ -823,23 +720,13 @@ class ServerTab:
         self.https_var.set(bool(s.get("https_enabled", False)))
         self.certfile.delete(0, tk.END); self.certfile.insert(0, str(s.get("https_certfile", "")))
         self.keyfile.delete(0, tk.END); self.keyfile.insert(0, str(s.get("https_keyfile", "")))
-        # SAN names: use the saved list, else auto-suggest this machine's LAN IP(s).
-        saved = s.get("https_san_names") or []
-        san = ", ".join(saved) if saved else ", ".join(detect_local_ips())
-        self.sannames.delete(0, tk.END); self.sannames.insert(0, san)
         self._toggle_https_fields()
 
-    def _san_names(self):
-        """The operator-listed cert names, split on comma/space/newline."""
-        raw = self.sannames.get().replace(",", " ")
-        return [n for n in raw.split() if n.strip()]
-
     def _toggle_https_fields(self):
-        """Enable the TLS inputs only when HTTPS is checked. Settings stay editable
-        even while the service is installed — Install / Update re-applies them."""
+        """Enable the cert/key inputs only when HTTPS is checked. Settings stay
+        editable even while the service is installed — Install / Update re-applies."""
         state = "normal" if self.https_var.get() else "disabled"
-        for w in (self.certfile, self.keyfile, self.cert_browse, self.key_browse,
-                  self.gen_btn, self.sannames):
+        for w in (self.certfile, self.keyfile, self.cert_browse, self.key_browse):
             try:
                 w.config(state=state)
             except Exception:
@@ -858,38 +745,6 @@ class ServerTab:
             filetypes=[("PEM key", "*.pem *.key"), ("All files", "*.*")])
         if p:
             self.keyfile.delete(0, tk.END); self.keyfile.insert(0, p)
-
-    def _generate_cert(self):
-        host = self.host.get().strip() or "127.0.0.1"
-        try:
-            cert, key, trusted, names = generate_trusted_cert(host, self._san_names())
-        except Exception as e:
-            messagebox.showerror("Generate certificate", str(e))
-            return
-        self.certfile.delete(0, tk.END); self.certfile.insert(0, cert)
-        self.keyfile.delete(0, tk.END); self.keyfile.insert(0, key)
-        # Reflect back the full SAN list the cert actually covers.
-        self.sannames.delete(0, tk.END); self.sannames.insert(0, ", ".join(names))
-        names_str = ", ".join(names)
-        if trusted:
-            messagebox.showinfo(
-                "Generate certificate",
-                f"Created a locally-trusted certificate (via mkcert) valid for:\n\n"
-                f"{names_str}\n\n{cert}\n{key}\n\n"
-                "mkcert also installed its local CA into your system trust store, so "
-                "Claude Desktop and browsers will accept it.\n\n"
-                "If the client is already running, restart it once so it reloads the "
-                "trust store.")
-        else:
-            messagebox.showwarning(
-                "Generate certificate",
-                f"Created a SELF-SIGNED certificate valid for:\n\n{names_str}\n\n"
-                f"{cert}\n{key}\n\n"
-                "WARNING: self-signed certs are NOT trusted by Claude Desktop "
-                "(you'll see 'connection is not private' / ERR_CERT_AUTHORITY_INVALID).\n\n"
-                "For a certificate that just works, install mkcert and generate again:\n"
-                "    brew install mkcert\n\n"
-                "Otherwise you must manually trust this certificate in your OS keychain.")
 
     def _endpoint(self):
         scheme = "https" if self.https_var.get() else "http"
@@ -915,33 +770,18 @@ class ServerTab:
         cert = self.certfile.get().strip()
         key = self.keyfile.get().strip()
         if https_on:
-            if not cert and not key:
-                if messagebox.askyesno(
-                        "HTTPS",
-                        "HTTPS is enabled but no certificate is set.\n\n"
-                        "Generate one now? (mkcert is used for a trusted certificate "
-                        "if installed; otherwise a self-signed one you must trust.)"):
-                    try:
-                        cert, key, _trusted, _names = generate_trusted_cert(host, self._san_names())
-                        self.certfile.delete(0, tk.END); self.certfile.insert(0, cert)
-                        self.keyfile.delete(0, tk.END); self.keyfile.insert(0, key)
-                    except Exception as e:
-                        messagebox.showerror("Server", f"Could not generate a certificate:\n{e}")
-                        return None
-                else:
-                    return None
             missing = [name for name, p in (("certificate", cert), ("private key", key))
                        if not p or not os.path.isfile(p)]
             if missing:
                 messagebox.showwarning(
-                    "Server", f"The TLS {' and '.join(missing)} file is missing.\n\n"
-                              "Pick an existing PEM file or generate a self-signed pair.")
+                    "Server",
+                    f"HTTPS is enabled but the TLS {' and '.join(missing)} file is missing.\n\n"
+                    "Point the Certificate and Private key fields at your existing PEM files.")
                 return None
         cfg = human_loop_config.load_config()
         cfg["server"] = {
             "http_port": int(port), "http_host": host,
             "https_enabled": https_on, "https_certfile": cert, "https_keyfile": key,
-            "https_san_names": self._san_names(),
         }
         try:
             human_loop_config.save_config(cfg)

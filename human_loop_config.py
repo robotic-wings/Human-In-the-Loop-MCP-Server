@@ -43,9 +43,8 @@ DEFAULT_CONFIG = {
         "http_port": 8000,
         "http_host": "127.0.0.1",
         "https_enabled": False,   # serve over HTTPS (required by newer clients)
-        "https_certfile": "",     # PEM cert path (empty = auto-managed self-signed)
-        "https_keyfile": "",      # PEM private-key path (empty = auto-managed self-signed)
-        "https_san_names": [],    # extra IPs/hosts the cert must cover (SAN)
+        "https_certfile": "",     # PEM cert path (operator-provided)
+        "https_keyfile": "",      # PEM private-key path (operator-provided)
     },
     "task_defaults": {
         "timeout_seconds": 240,

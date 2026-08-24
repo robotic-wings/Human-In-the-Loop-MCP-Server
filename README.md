@@ -132,20 +132,15 @@ Then point a URL-based MCP client at `http://127.0.0.1:8000/mcp`. Notes:
 
 #### HTTPS / TLS (required by newer clients)
 
-Some clients — including recent **Claude Desktop** — only accept **HTTPS** URL connectors, and (being Electron/Chromium) they validate the certificate against your **system trust store**. A bare self-signed cert is therefore rejected with *"This Connection Is Not Private" / `ERR_CERT_AUTHORITY_INVALID`*. You need a cert issued by a CA that's installed in the trust store — which is exactly what [**mkcert**](https://github.com/FiloSottile/mkcert) sets up.
+Some clients — including recent **Claude Desktop** — only accept **HTTPS** URL connectors, and (being Electron/Chromium) they validate the certificate against your **system trust store**. A bare self-signed cert is rejected with *"This Connection Is Not Private" / `ERR_CERT_AUTHORITY_INVALID`*. You must **provide your own** PEM certificate + private key that the client trusts.
 
-**Recommended setup:**
+**Setup:** in the **Management Console → Server tab**, tick **Enable HTTPS** and point the **Certificate** and **Private key** fields at your PEM files (the **Browse…** buttons help), then **Install / Update**. The endpoint becomes `https://host:port/mcp`.
 
-1. Install mkcert once: `brew install mkcert` (macOS; see the mkcert README for Linux/Windows).
-2. In the **Management Console → Server tab**: tick **Enable HTTPS**, click **Generate certificate…**. This runs `mkcert -install` (adds mkcert's local CA to your trust store — it may prompt for your password) and issues a cert into `~/.human_loop_certs/`.
-3. **Go Online.** The endpoint becomes `https://host:port/mcp`.
-4. If Claude Desktop is already running, **restart it once** so it reloads the trust store.
+**Getting a trusted cert** (the console does *not* generate one for you):
+- **Local/LAN:** [`mkcert`](https://github.com/FiloSottile/mkcert) is the easiest — `mkcert -install` once, then e.g. `mkcert 127.0.0.1 192.168.0.102 localhost` produces a `.pem` pair trusted on this machine. Point the fields at those files.
+- **Public domain:** use a real CA (e.g. Let's Encrypt).
 
-**Serving on multiple IPs (loopback + LAN + public).** Set **Bind host** to `0.0.0.0` to serve on every interface at once (this is the default). A single certificate is issued whose **SAN list covers every address a client connects to**, so it's valid on each — no per-IP listener needed. The **Certificate names (IPs / hosts)** field is prefilled with this machine's detected LAN IP; add any others there (e.g. `192.168.0.102`, or a future public domain like `mcp.example.com`) before clicking Generate. `localhost` / `127.0.0.1` / `::1` are always included. When bound to `0.0.0.0`, the Server tab lists a `https://…/mcp` endpoint for each reachable address.
-
-> **Public addresses:** mkcert certs are only trusted on machines that have your local CA installed. To serve a **public** domain to *other people's* machines you need a certificate from a real CA (e.g. Let's Encrypt) — point the **Certificate** / **Private key** fields at it. The SAN/bind mechanics are identical.
-
-If mkcert isn't installed, **Generate** falls back to an `openssl` self-signed cert (still multi-SAN) — usable for tools that let you bypass verification (e.g. `curl -k`), but **not** trusted by Claude Desktop until you trust it manually.
+**Serving on multiple IPs.** Set **Bind host** to `0.0.0.0` (the default) to serve on every interface at once. Your certificate's **SAN list must cover each address clients connect to** (e.g. `127.0.0.1` and your LAN IP) — a single multi-SAN cert is valid on all of them, no per-IP listener needed. When bound to `0.0.0.0`, the Server tab lists a `https://…/mcp` endpoint for each reachable address.
 
 To run the server directly instead of via the console, set the TLS env vars alongside the port:
 
@@ -347,7 +342,7 @@ python management_console.py    # or, if installed: hitl-management-console
 Tabs:
 - **Logs** — browse, open attachments in, and delete the recorded interactions: every input/choice/confirmation/info call and every delegated task (see below).
 - **User Profile** — your name, role, responsibilities, and how you'd like the AI to communicate with you. The server surfaces this through channels the model actually reads: the MCP **`initialize` instructions** and the description of a dedicated **`get_operator_profile`** tool (tool descriptions are always in the model's context), plus a callable tool that returns it. (It is *not* only in the guidance prompt — MCP prompts are user-invoked and most clients never auto-load them.) Leaving role/responsibilities empty means "can be assigned any task." Because instructions/tool descriptions are read at server startup, **take the Server Offline then Online after editing your profile** to refresh what the AI sees.
-- **Server** — configure the HTTP(S) endpoint (port, bind host, TLS cert) and **Install / Update** the server as a **background OS service** that auto-starts at every login with no terminal window. Tick **Enable HTTPS** to serve TLS (required by newer clients like Claude Desktop) and **Generate certificate…** (mkcert-trusted if installed). The service runs independently of the console — closing the console does **not** stop it; use **Uninstall** to remove it, or **View log** to debug. (Point a URL-based MCP client at the shown `http(s)://host:port/mcp` endpoint; dialogs pop on this machine's desktop.) See [Running as a background service](#running-as-a-background-service-cross-platform) for how it's registered on each OS.
+- **Server** — configure the HTTP(S) endpoint (port, bind host, TLS cert) and **Install / Update** the server as a **background OS service** that auto-starts at every login with no terminal window. Tick **Enable HTTPS** to serve TLS (required by newer clients like Claude Desktop) and point the **Certificate** / **Private key** fields at your own PEM files. The service runs independently of the console — closing the console does **not** stop it; use **Uninstall** to remove it, or **View log** to debug. (Point a URL-based MCP client at the shown `http(s)://host:port/mcp` endpoint; dialogs pop on this machine's desktop.) See [Running as a background service](#running-as-a-background-service-cross-platform) for how it's registered on each OS.
 - **Task Options** — default task timeout, default max result size, and whether file/image attachments are enabled. The timeout/size defaults are **fallbacks**: used only when the AI doesn't pass its own value.
 - **Notification** — pick the incoming-task ringtone (a `.wav`, or the bundled `notify.wav`), preview it, or mute.
 
