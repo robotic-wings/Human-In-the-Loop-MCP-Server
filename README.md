@@ -6,8 +6,6 @@
 
 A powerful **Model Context Protocol (MCP) Server** that enables AI assistants like Claude to interact with humans through intuitive GUI dialogs. This server bridges the gap between automated AI processes and human decision-making by providing real-time user input tools, choices, confirmations, and feedback mechanisms.
 
-![demo](demo.gif)
-
 ## 🚀 Features
 
 ### 💬 Interactive Dialog Tools
@@ -522,7 +520,6 @@ Human-In-the-Loop-MCP-Server/
 ├── README.md                 # Documentation
 ├── LICENSE                   # MIT License
 ├── .gitignore               # Git ignore rules
-└── demo.gif                 # Demo animation
 ```
 
 ### Contributing
