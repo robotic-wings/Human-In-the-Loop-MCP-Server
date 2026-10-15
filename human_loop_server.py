@@ -2358,9 +2358,9 @@ async def _run_interaction(*, kind, params, client_timeout_seconds, session_id, 
 async def assign_task_to_human(
     task_title: Annotated[str, Field(description="Short imperative title of the ONE action (e.g. 'Photograph the north wall'). Not a question.")],
     task_description: Annotated[str, Field(description="A SINGLE, atomic, actionable instruction for one action the assistant cannot do itself and must delegate to a human (a physical-world action is the common case). This is a work order, not a chat message: NOT a question, NOT a list of multiple steps, NOT background+questions+a to-do list. If the work has several steps, assign them as separate sequential tasks instead.")],
-    task_id: Annotated[Optional[str], Field(description="Leave empty to START a new task. To CONTINUE an existing task (after a 'heartbeat' response or an 'in_progress' update), pass back the task_id from the previous call - this revives the same open window without losing the human's work.")] = None,
-    client_timeout_seconds: Annotated[Optional[int], Field(description="YOUR OWN per-tool-call timeout, in seconds. The server returns a 'heartbeat' response safely before this deadline so you can immediately re-call and keep the human's dialog alive. If omitted, the server's configured default is used.")] = None,
-    max_result_bytes: Annotated[Optional[int], Field(description="YOUR CLIENT'S max tool-result size, in BYTES. The human sees a live size counter and cannot submit text+attachments whose encoded size would exceed this, so a large deliverable is never rejected/lost. If omitted, the server's configured default is used.")] = None,
+    task_id: Annotated[Optional[str], Field(description="Leave empty to START a new task. To CONTINUE an existing task (after a 'heartbeat' response or an 'in_progress' update), pass back the task_id from the previous call. A task-window watchdog result with reason 'assistant_disconnected' is also recoverable: pass its original task_id to reopen the task with its autosaved draft and attachments.")] = None,
+    client_timeout_seconds: Annotated[Optional[int], Field(description="YOUR OWN per-tool-call timeout, in seconds; values below 2 are rejected with status 'invalid_client_timeout'. For accepted values, the server returns a 'heartbeat' response before this deadline so you can immediately re-call and keep the human's dialog alive. If omitted, the server's configured default is used.")] = None,
+    max_result_bytes: Annotated[Optional[int], Field(description="YOUR CLIENT'S max tool-result size, in BYTES. The note itself must fit this limit. Attachments that exceed the remaining result budget are returned as path references instead of inline content, so attachment-only overflow can still be submitted. If omitted, the server's configured default is used.")] = None,
     context_note: Annotated[str, Field(description="Optional extra context to show the human in the dialog")] = "",
     ctx: Context = None,
 ) -> Any:
@@ -2419,12 +2419,13 @@ async def assign_task_to_human(
           on the notification (declined the task; distinct from a task-window "Failed" report,
           which is resubmittable per above).
         * `status: "cancelled"` (no reason) — the human closed the task window without reporting.
-        * `reason: "assistant_disconnected"` (status "failed" from the notification or
-          "cancelled" from the task window) — the dialog auto-closed after you went silent; any
-          draft the human had typed is auto-saved to the logs and included.
-    - Pass `max_result_bytes` = your client's max tool-result size. The human sees a live size
-      counter and cannot submit anything whose encoded size would exceed it, and the server
-      hard-caps the result to that budget — so a deliverable is never rejected as "too large".
+    - A task-window `cancelled` result with `reason: "assistant_disconnected"` is recoverable,
+      not terminal: re-call with its original `task_id` to reopen the task with its autosaved
+      draft and attachments. A notification that auto-closes before the task window opens has
+      no draft or attachments to recover.
+    - Pass `max_result_bytes` = your client's max tool-result size. The note itself must fit the
+      budget. Attachments that exceed the remaining budget are submitted as path references
+      rather than inline content, so attachment-only overflow does not block submission.
     - Every human submission (note + attachments + your command) is also archived to a
       local "logs" archive that can be browsed later in the Management Console (management_console.py).
     """
