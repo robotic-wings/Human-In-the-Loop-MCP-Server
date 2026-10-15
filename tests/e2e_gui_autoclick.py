@@ -18,6 +18,7 @@ import os
 import sys
 import threading
 import time
+import tkinter as tk
 from pathlib import Path
 from typing import Any
 
@@ -28,9 +29,25 @@ SERVER_LOG = Path("/private/tmp/hitl-unattended-e2e-server.log")
 
 def _widget_tree(widget):
     """Yield a Tk widget and all of its descendants."""
+    try:
+        children = widget.winfo_children()
+    except tk.TclError:
+        return
     yield widget
-    for child in widget.winfo_children():
+    for child in children:
         yield from _widget_tree(child)
+
+
+def run_vanished_widget_case() -> None:
+    """Ensure a widget destroyed during traversal simply ends that branch."""
+    root = tk.Tk()
+    vanished = tk.Frame(root)
+    vanished.destroy()
+    try:
+        assert list(_widget_tree(vanished)) == []
+    finally:
+        root.destroy()
+    print(json.dumps({"case": "vanished_widget_ends_traversal", "status": "passed"}))
 
 
 def _click_button(window, label: str) -> None:
@@ -1005,5 +1022,7 @@ if __name__ == "__main__":
         asyncio.run(run_one_second_timeout_case())
     elif sys.argv[1:] == ["--quick-gui-startup-race"]:
         asyncio.run(run_gui_startup_race_case())
+    elif sys.argv[1:] == ["--quick-vanished-widget"]:
+        run_vanished_widget_case()
     else:
         asyncio.run(run_tests())
