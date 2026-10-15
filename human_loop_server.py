@@ -162,8 +162,10 @@ def composite_task_advisory(task_description):
 
 # Heartbeat / continuation tuning (seconds).
 HEARTBEAT_SAFETY_MARGIN = 30       # max seconds shaved off the client's timeout
+MIN_CLIENT_TIMEOUT_SECONDS = 2     # enough room for a one-second heartbeat leg
 DISCONNECT_GRACE_SECONDS = 20      # past a leg deadline before we warn "may be disconnected"
 AUTO_CLOSE_AFTER_SECONDS = 180     # further silence before auto-saving the draft & closing
+GUI_STARTUP_WAIT_SECONDS = 0.5     # bounded wait for the main-thread Tk loop
 
 # Pre-task notification / ringtone.
 RINGTONE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notify.wav")
@@ -181,7 +183,7 @@ def compute_leg_seconds(client_timeout_seconds: int) -> int:
     dialog is orphaned. So we shave a proportional margin (capped) and never
     return a value >= the client's timeout.
     """
-    ct = max(2, int(client_timeout_seconds))
+    ct = max(MIN_CLIENT_TIMEOUT_SECONDS, int(client_timeout_seconds))
     margin = min(HEARTBEAT_SAFETY_MARGIN, max(1, ct // 4))
     return max(1, ct - margin)
 
@@ -1493,6 +1495,7 @@ class InteractionSession:
         self.last_seen = self.created_at
         self.last_human_action_at = self.created_at  # for follow-up re-notify timing
         self.advisory = None  # non-blocking hint if the description looks misused
+        self.recovery_payload = None  # watchdog-autosaved task draft, restored on reopen
         self.closed = False
 
     def attach_dialog(self, dialog):
@@ -1762,32 +1765,43 @@ class HumanTaskDialog(_LegAwareWindow):
 
         self.dialog.protocol("WM_DELETE_WINDOW", self._on_close)
         self.body_text.bind("<KeyRelease>", lambda e: self._update_size_counter())
-        self._update_size_counter()
+        recovery = session.recovery_payload
+        if recovery:
+            self.body_text.insert("1.0", recovery.get("body", ""))
+            self.attachments = list(recovery.get("attachment_paths", []))
+            session.recovery_payload = None
+            self._refresh_attachments()
+        else:
+            self._update_size_counter()
         self.body_text.focus_set()
 
     def _update_size_counter(self):
-        """Refresh the size counter and enable/disable the submit buttons based on
-        whether the estimated result fits the client's max_result_bytes budget."""
+        """Refresh the size counter and explain when attachments will be referenced."""
         if not self._alive:
             return
         limit = self.session.max_result_bytes or DEFAULT_MAX_RESULT_BYTES
         body = self.body_text.get("1.0", tk.END).strip()
         est = estimate_result_bytes(body, self.attachments)
-        over = est > limit
+        body_over = estimate_result_bytes(body, []) > limit
+        attachments_over = est > limit
         c = self.theme_colors
-        if over:
+        if body_over:
             self.size_label.config(
                 text=(f"Submission size: {_human_bytes(est)} / {_human_bytes(limit)} limit — "
-                      f"too large. Remove attachments or text to submit."),
+                      f"shorten the note to submit."),
+                fg=c.get("error_color", c["fg_secondary"]))
+        elif attachments_over:
+            self.size_label.config(
+                text=(f"Submission size: {_human_bytes(est)} / {_human_bytes(limit)} limit — "
+                      f"attachments over the budget will be returned as path references."),
                 fg=c.get("error_color", c["fg_secondary"]))
         else:
             self.size_label.config(
                 text=f"Submission size: {_human_bytes(est)} / {_human_bytes(limit)} limit",
                 fg=c["fg_secondary"])
-        state = "disabled" if over else "normal"
         for b in self._submit_buttons:
             try:
-                b.configure(state=state)
+                b.configure(state="disabled" if body_over else "normal")
             except Exception:
                 pass
 
@@ -1929,15 +1943,14 @@ class HumanTaskDialog(_LegAwareWindow):
             except Exception:
                 pass
             return
-        # Defensive: buttons are disabled when over budget, but never send an
-        # over-limit submission (the client would reject it).
+        # Attachments can fall back to path references, but text itself cannot.
         limit = self.session.max_result_bytes or DEFAULT_MAX_RESULT_BYTES
-        if estimate_result_bytes(body, paths) > limit:
+        if estimate_result_bytes(body, []) > limit:
             try:
                 messagebox.showwarning(
                     "Submission too large",
-                    f"This submission is larger than the {_human_bytes(limit)} limit.\n\n"
-                    "Remove attachments or shorten your note, then submit.",
+                    f"Your note is larger than the {_human_bytes(limit)} limit.\n\n"
+                    "Shorten the note; attachments are safely returned as path references.",
                     parent=self.dialog)
             except Exception:
                 pass
@@ -2180,6 +2193,12 @@ def _task_on_submit(session, payload):
     if payload.get("human_action", True):
         session.last_human_action_at = session.last_seen
 
+    if payload.get("reason") == "assistant_disconnected":
+        # Keep the task id and its autosaved work recoverable when the caller
+        # returns after a watchdog close.
+        session.recovery_payload = payload
+        return _build_submission_result(session, payload, needs_continuation=True, archived_dir=archived_dir)
+
     if status in ("completed", "failed"):
         # Keep the session dormant for AI review / re-submission.
         return _build_submission_result(session, payload, needs_continuation=False, archived_dir=archived_dir)
@@ -2219,9 +2238,27 @@ async def _run_interaction(*, kind, params, client_timeout_seconds, session_id, 
     toast; the human clicks View to open the actual dialog; the wait is kept alive
     across the client's timeout via heartbeats. `on_submit`/`on_decline` are the
     tool-specific terminal handlers."""
+    if client_timeout_seconds < MIN_CLIENT_TIMEOUT_SECONDS:
+        return {
+            "success": False,
+            "status": "invalid_client_timeout",
+            "error_code": "client_timeout_seconds_too_low",
+            "minimum_client_timeout_seconds": MIN_CLIENT_TIMEOUT_SECONDS,
+            "needs_continuation": False,
+            "platform": CURRENT_PLATFORM,
+        }
+
+    startup_deadline = time.monotonic() + GUI_STARTUP_WAIT_SECONDS
+    while not ensure_gui_initialized() and time.monotonic() < startup_deadline:
+        await asyncio.sleep(0.05)
     if not ensure_gui_initialized():
-        return {"success": False, "error": "GUI system not available",
-                "needs_continuation": False, "platform": CURRENT_PLATFORM}
+        return {
+            "success": False,
+            "status": "gui_starting",
+            "retryable": True,
+            "needs_continuation": False,
+            "platform": CURRENT_PLATFORM,
+        }
 
     loop = asyncio.get_running_loop()
     leg_seconds = compute_leg_seconds(client_timeout_seconds)
@@ -2239,6 +2276,13 @@ async def _run_interaction(*, kind, params, client_timeout_seconds, session_id, 
                 "message": ("No such id (it was answered/cancelled, or the session expired after "
                             "inactivity). Start again by calling without an id."),
                 "platform": CURRENT_PLATFORM}
+
+    if session and session.kind == "task" and session.dialog is None and not session.updates.empty():
+        pending = session.updates.get_nowait()
+        if pending.get("reason") == "assistant_disconnected":
+            _task_on_submit(session, pending)
+        else:
+            session.updates.put_nowait(pending)
 
     if session is None:
         # Brand-new: create the session and RING the non-focus-stealing toast.
@@ -2314,9 +2358,9 @@ async def _run_interaction(*, kind, params, client_timeout_seconds, session_id, 
 async def assign_task_to_human(
     task_title: Annotated[str, Field(description="Short imperative title of the ONE action (e.g. 'Photograph the north wall'). Not a question.")],
     task_description: Annotated[str, Field(description="A SINGLE, atomic, actionable instruction for one action the assistant cannot do itself and must delegate to a human (a physical-world action is the common case). This is a work order, not a chat message: NOT a question, NOT a list of multiple steps, NOT background+questions+a to-do list. If the work has several steps, assign them as separate sequential tasks instead.")],
-    task_id: Annotated[Optional[str], Field(description="Leave empty to START a new task. To CONTINUE an existing task (after a 'heartbeat' response or an 'in_progress' update), pass back the task_id from the previous call - this revives the same open window without losing the human's work.")] = None,
-    client_timeout_seconds: Annotated[Optional[int], Field(description="YOUR OWN per-tool-call timeout, in seconds. The server returns a 'heartbeat' response safely before this deadline so you can immediately re-call and keep the human's dialog alive. If omitted, the server's configured default is used.")] = None,
-    max_result_bytes: Annotated[Optional[int], Field(description="YOUR CLIENT'S max tool-result size, in BYTES. The human sees a live size counter and cannot submit text+attachments whose encoded size would exceed this, so a large deliverable is never rejected/lost. If omitted, the server's configured default is used.")] = None,
+    task_id: Annotated[Optional[str], Field(description="Leave empty to START a new task. To CONTINUE an existing task (after a 'heartbeat' response or an 'in_progress' update), pass back the task_id from the previous call. A task-window watchdog result with reason 'assistant_disconnected' is also recoverable: pass its original task_id to reopen the task with its autosaved draft and attachments.")] = None,
+    client_timeout_seconds: Annotated[Optional[int], Field(description="YOUR OWN per-tool-call timeout, in seconds; values below 2 are rejected with status 'invalid_client_timeout'. For accepted values, the server returns a 'heartbeat' response before this deadline so you can immediately re-call and keep the human's dialog alive. If omitted, the server's configured default is used.")] = None,
+    max_result_bytes: Annotated[Optional[int], Field(description="YOUR CLIENT'S max tool-result size, in BYTES. The note itself must fit this limit. Attachments that exceed the remaining result budget are returned as path references instead of inline content, so attachment-only overflow can still be submitted. If omitted, the server's configured default is used.")] = None,
     context_note: Annotated[str, Field(description="Optional extra context to show the human in the dialog")] = "",
     ctx: Context = None,
 ) -> Any:
@@ -2375,12 +2419,13 @@ async def assign_task_to_human(
           on the notification (declined the task; distinct from a task-window "Failed" report,
           which is resubmittable per above).
         * `status: "cancelled"` (no reason) — the human closed the task window without reporting.
-        * `reason: "assistant_disconnected"` (status "failed" from the notification or
-          "cancelled" from the task window) — the dialog auto-closed after you went silent; any
-          draft the human had typed is auto-saved to the logs and included.
-    - Pass `max_result_bytes` = your client's max tool-result size. The human sees a live size
-      counter and cannot submit anything whose encoded size would exceed it, and the server
-      hard-caps the result to that budget — so a deliverable is never rejected as "too large".
+    - A task-window `cancelled` result with `reason: "assistant_disconnected"` is recoverable,
+      not terminal: re-call with its original `task_id` to reopen the task with its autosaved
+      draft and attachments. A notification that auto-closes before the task window opens has
+      no draft or attachments to recover.
+    - Pass `max_result_bytes` = your client's max tool-result size. The note itself must fit the
+      budget. Attachments that exceed the remaining budget are submitted as path references
+      rather than inline content, so attachment-only overflow does not block submission.
     - Every human submission (note + attachments + your command) is also archived to a
       local "logs" archive that can be browsed later in the Management Console (management_console.py).
     """
@@ -2787,7 +2832,7 @@ async def get_operator_profile() -> Dict[str, Any]:
 
 # Add a prompt to get prompting guidance for LLMs
 @mcp.prompt()
-async def get_human_loop_prompt() -> Dict[str, str]:
+async def get_human_loop_prompt() -> str:
     """
     Get prompting guidance for LLMs on when and how to use human-in-the-loop tools.
     
@@ -2915,7 +2960,7 @@ OPTIMIZE FOR USER EXPERIENCE:
     guidance["operator_profile"] = profile_block
     guidance["main_prompt"] = profile_block + "\n" + guidance["main_prompt"]
 
-    return guidance
+    return "\n\n".join(guidance.values())
 
 # Add a health check tool
 @mcp.tool()
@@ -2949,8 +2994,9 @@ async def health_check() -> Dict[str, Any]:
                 "get_feedback_from_user",
                 "assign_task_to_human",
                 "get_operator_profile",
-                "get_human_loop_prompt"
+                "health_check",
             ],
+            "prompts_available": ["get_human_loop_prompt"],
             "operator": {
                 "name": (human_loop_config.get_profile().get("name") or "").strip() or None,
                 "profile_configured": bool((human_loop_config.get_profile().get("name") or "").strip()),
