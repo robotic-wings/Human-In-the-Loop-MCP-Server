@@ -46,18 +46,18 @@ class _TransportEndpoint(BaseHTTPRequestHandler):
                 self.wfile.write(b'{"code":200}')
                 return
             self.send_response(200)
-            self.send_header("Content-Length", "17")
+            self.send_header("Content-Length", "9")
             self.end_headers()
             # Every gap is below the ordinary socket inactivity timeout, but
             # the complete response exceeds the total Bark delivery budget.
-            for _ in range(17):
+            for _ in range(9):
                 try:
                     self.wfile.write(b"x")
                     self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError):
                     cls.client_closed_at = time.monotonic()
                     return
-                time.sleep(0.25)
+                time.sleep(0.5)
             # A normal HTTP reader may consume the declared body and close
             # without provoking a write error; observe that peer close too.
             self.connection.settimeout(0.05)
@@ -264,11 +264,27 @@ async def run_slow_trickle_case(kind: str = "trickle") -> None:
         attempt_started: float | None = None
         closed_at: float | None = None
         followup_ok = False
+        heartbeat_elapsed: float | None = None
 
         async def trickle_delivery(client: Any) -> None:
-            nonlocal attempt_started, closed_at, followup_ok
+            nonlocal attempt_started, closed_at, followup_ok, heartbeat_elapsed
+            opened = _result_data(await client.call_tool("get_user_input", {
+                "title": "AUTO_TIMEOUT_HEARTBEAT", "prompt": "GUI/MCP stays normal", "client_timeout_seconds": 2,
+            }))
+            if not opened or opened.get("status") != "opened":
+                failures.append(f"slow {kind} did not return opened: {opened!r}")
+                return
+            heartbeat_started = time.monotonic()
+            heartbeat = _result_data(await client.call_tool("get_user_input", {
+                "title": "AUTO_TIMEOUT_HEARTBEAT", "prompt": "GUI/MCP stays normal",
+                "interaction_id": opened["interaction_id"], "client_timeout_seconds": 2,
+            }))
+            heartbeat_elapsed = time.monotonic() - heartbeat_started
+            if not heartbeat or heartbeat.get("status") != "heartbeat" or heartbeat_elapsed >= 2:
+                failures.append(f"slow {kind} delayed heartbeat ({heartbeat_elapsed:.3f}s): {heartbeat!r}")
             result, _ = await _drive(client, "get_user_input", {
-                "title": "Bark trickle", "prompt": "GUI/MCP stays normal", "client_timeout_seconds": 4,
+                "title": "AUTO_TIMEOUT_HEARTBEAT", "prompt": "GUI/MCP stays normal",
+                "interaction_id": opened["interaction_id"], "client_timeout_seconds": 2,
             })
             value = _result_data(result)
             if not value or value.get("success") is not True or value.get("user_input") != "auto text":
@@ -313,6 +329,7 @@ async def run_slow_trickle_case(kind: str = "trickle") -> None:
             "case": f"bark_slow_{kind}_evidence",
             "attempts": len(_TransportEndpoint.attempts),
             "elapsed_to_close": elapsed,
+            "heartbeat_elapsed": heartbeat_elapsed,
             "followup_ok": followup_ok,
         }))
     assert not failures, "\n".join(failures)
