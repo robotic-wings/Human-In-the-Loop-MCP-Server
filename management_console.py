@@ -27,8 +27,8 @@ import socket
 import subprocess
 import sys
 import tkinter as tk
-from tkinter import messagebox, filedialog, ttk
 from datetime import datetime
+from tkinter import filedialog, messagebox, ttk
 
 import human_loop_config
 import service_manager
@@ -569,11 +569,22 @@ class NotificationTab(SettingsTab):
         classic_label(b, "Empty = the bundled notify.wav.", fg=GRAY).grid(
             row=2, column=1, sticky="w")
 
+        self.bark_var = tk.IntVar(value=0)
+        tk.Checkbutton(b, text="Enable Bark notifications", variable=self.bark_var,
+                       bg=SILVER, fg=BLACK, font=CLASSIC_FONT, activebackground=SILVER,
+                       selectcolor=WHITE, anchor="w").grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=(16, 0))
+        classic_label(b, "Bark URL:").grid(row=5, column=0, sticky="w", pady=4)
+        self.bark_url = classic_entry(b)
+        self.bark_url.grid(row=5, column=1, sticky="ew", pady=4)
+        classic_label(b, "Include the full http(s) URL and device key path.", fg=GRAY).grid(
+            row=6, column=1, sticky="w")
+
         self.mute_var = tk.IntVar(value=0)
         tk.Checkbutton(b, text="Mute (no sound on incoming tasks)", variable=self.mute_var,
                        bg=SILVER, fg=BLACK, font=CLASSIC_FONT, activebackground=SILVER,
                        selectcolor=WHITE, anchor="w").grid(
-            row=3, column=0, columnspan=2, sticky="w", pady=(16, 0))
+            row=7, column=0, columnspan=2, sticky="w", pady=(16, 0))
         self._test_proc = None
 
     def _browse(self):
@@ -620,13 +631,25 @@ class NotificationTab(SettingsTab):
 
     def load(self):
         n = human_loop_config.load_config().get("notification", {})
+        if not isinstance(n, dict):
+            n = {}
         self.ring.delete(0, tk.END); self.ring.insert(0, n.get("ringtone_path", ""))
         self.mute_var.set(1 if n.get("muted", False) else 0)
+        self.bark_var.set(1 if n.get("bark_enabled") is True else 0)
+        saved_url = n.get("bark_url", "")
+        self.bark_url.delete(0, tk.END)
+        self.bark_url.insert(0, saved_url if isinstance(saved_url, str) else "")
 
     def collect(self):
+        bark_url = self.bark_url.get().strip()
+        bark_enabled = bool(self.bark_var.get())
+        if bark_enabled and not human_loop_config.is_valid_bark_url(bark_url):
+            raise ValueError("Enter a valid Bark URL with an http(s) scheme, host, and device key path.")
         return {
             "ringtone_path": self.ring.get().strip(),
             "muted": bool(self.mute_var.get()),
+            "bark_enabled": bark_enabled,
+            "bark_url": bark_url,
         }
 
 

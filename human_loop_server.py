@@ -11,26 +11,30 @@ import asyncio
 import concurrent.futures
 import json
 import mimetypes
+import os
 import platform
 import queue
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
-import uuid
 import tkinter as tk
-from tkinter import messagebox, filedialog, ttk
-from typing import List, Dict, Any, Optional, Literal
+import uuid
 from datetime import datetime, timezone
-import sys
-import os
+from tkinter import filedialog, messagebox, ttk
+from typing import Annotated, Any, Dict, List, Literal, Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+import httpx
 from pydantic import Field
-from typing import Annotated
+
 # Set required environment variable for FastMCP 2.8.1+
 os.environ.setdefault('FASTMCP_LOG_LEVEL', 'INFO')
-from fastmcp import FastMCP, Context
-from fastmcp.utilities.types import Image, File
+from fastmcp import Context, FastMCP
+from fastmcp.utilities.types import File, Image
+
 import human_loop_config
 
 # Platform detection
@@ -167,6 +171,13 @@ DISCONNECT_GRACE_SECONDS = 20      # past a leg deadline before we warn "may be 
 AUTO_CLOSE_AFTER_SECONDS = 180     # further silence before auto-saving the draft & closing
 GUI_STARTUP_WAIT_SECONDS = 0.5     # bounded wait for the main-thread Tk loop
 
+# Bark is best-effort and must never hold up an MCP call. Admit only a bounded
+# number of delivery tasks so repeated calls cannot grow an unbounded queue.
+BARK_HTTP_TIMEOUT_SECONDS = 2.5
+BARK_MAX_IN_FLIGHT = 8
+_bark_slots = threading.BoundedSemaphore(BARK_MAX_IN_FLIGHT)
+_bark_tasks: set[asyncio.Task] = set()
+
 # Pre-task notification / ringtone.
 RINGTONE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notify.wav")
 FOLLOW_UP_NOTIFY_AFTER_SECONDS = 180  # re-ring on continuation only after this much idle
@@ -186,6 +197,96 @@ def compute_leg_seconds(client_timeout_seconds: int) -> int:
     ct = max(MIN_CLIENT_TIMEOUT_SECONDS, int(client_timeout_seconds))
     margin = min(HEARTBEAT_SAFETY_MARGIN, max(1, ct // 4))
     return max(1, ct - margin)
+
+
+def _build_bark_request_url(bark_url, params):
+    """Build an encoded Bark request URL from the configured endpoint and toast text."""
+    params = params if isinstance(params, dict) else {}
+    heading = params.get("notify_heading")
+    if not isinstance(heading, str) or not heading.strip():
+        heading = "The assistant needs you"
+    preview = params.get("notify_preview")
+    if not isinstance(preview, str) or not preview.strip():
+        preview = (params.get("task_title") or params.get("title") or
+                   params.get("prompt") or params.get("message") or "Open Human-in-the-Loop to respond.")
+    preview = " ".join(preview.split())[:500]
+    heading = " ".join(heading.split())[:120]
+
+    parsed = urlsplit(bark_url)
+    query = [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+             if key not in {"title", "body"}]
+    query.extend((("title", heading), ("body", preview)))
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path,
+                       urlencode(query, doseq=True), ""))
+
+
+def _schedule_bark_notification(params):
+    """Queue one bounded, best-effort Bark GET without delaying the GUI/MCP path."""
+    enabled, bark_url = human_loop_config.get_bark_settings()
+    if not enabled:
+        return
+
+    try:
+        request_url = _build_bark_request_url(bark_url, params)
+    except Exception:
+        # Malformed text must not affect the interaction or leak the endpoint.
+        _out("Bark notification skipped (invalid message)")
+        return
+
+    if not _bark_slots.acquire(blocking=False):
+        return
+
+    try:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + BARK_HTTP_TIMEOUT_SECONDS
+        delivery = _deliver_bark_notification(request_url, deadline)
+        try:
+            task = loop.create_task(delivery)
+        except Exception:
+            delivery.close()
+            raise
+        _bark_tasks.add(task)
+        task.add_done_callback(_bark_task_done)
+    except Exception:
+        _bark_slots.release()
+        _out("Bark notification could not be queued")
+
+
+def _bark_task_done(task):
+    """Retire one task and release capacity even if it was cancelled before start."""
+    _bark_tasks.discard(task)
+    try:
+        error = task.exception()
+    except asyncio.CancelledError:
+        error = None
+    if error is not None:
+        # Never include exception text: request errors can contain the Bark URL.
+        _out("Bark notification attempt failed")
+    _bark_slots.release()
+
+
+async def _deliver_bark_notification(request_url, deadline):
+    """Send one no-retry Bark GET under a total deadline, without reading its body."""
+    try:
+        async with asyncio.timeout_at(deadline):
+            async with httpx.AsyncClient(follow_redirects=False, timeout=None) as client:
+                async with client.stream(
+                    "GET",
+                    request_url,
+                    headers={"User-Agent": "Human-In-the-Loop-MCP-Server"},
+                ) as response:
+                    response.raise_for_status()
+    except TimeoutError:
+        _out("Bark notification attempt timed out")
+    except httpx.HTTPStatusError:
+        _out("Bark notification attempt failed (HTTP response)")
+    except httpx.RequestError:
+        _out("Bark notification attempt failed (network error)")
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # Notification delivery is deliberately isolated from user input.
+        _out("Bark notification attempt failed")
 
 
 def get_logs_dir() -> str:
@@ -2294,6 +2395,7 @@ async def _run_interaction(*, kind, params, client_timeout_seconds, session_id, 
         await _dialog_runner.run_dialog(
             lambda root: session.attach_dialog(NotificationWindow(root, session)), timeout=30)
         _sessions[new_id] = session
+        _schedule_bark_notification(session.params)
         if ctx:
             await ctx.info(f"Notified human ({kind}, id={new_id})")
     elif session.dialog is None and session.updates.empty():
@@ -2312,6 +2414,7 @@ async def _run_interaction(*, kind, params, client_timeout_seconds, session_id, 
         if idle > FOLLOW_UP_NOTIFY_AFTER_SECONDS:
             await _dialog_runner.run_dialog(
                 lambda root: session.attach_dialog(NotificationWindow(root, session)), timeout=30)
+            _schedule_bark_notification(session.params)
         else:
             await _dialog_runner.run_dialog(
                 lambda root: session.attach_dialog(session.make_body(root, session)), timeout=30)

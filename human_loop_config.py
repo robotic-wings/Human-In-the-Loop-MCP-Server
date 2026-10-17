@@ -25,6 +25,7 @@ breaking older files:
 import json
 import os
 import tempfile
+from urllib.parse import urlsplit
 
 CONFIG_ENV_VAR = "HUMAN_LOOP_CONFIG"
 DEFAULT_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".human_loop_config.json")
@@ -54,6 +55,8 @@ DEFAULT_CONFIG = {
     "notification": {
         "ringtone_path": "",   # empty = use the bundled notify.wav
         "muted": False,
+        "bark_enabled": False,
+        "bark_url": "",
     },
 }
 
@@ -128,7 +131,41 @@ def get_task_defaults():
 
 
 def get_notification():
-    return load_config().get("notification", _defaults()["notification"])
+    notification = load_config().get("notification", _defaults()["notification"])
+    if not isinstance(notification, dict):
+        return _defaults()["notification"]
+    return notification
+
+
+def is_valid_bark_url(value):
+    """Return whether value is an absolute Bark HTTP(S) URL with a key path."""
+    if not isinstance(value, str) or not value or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        return False
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except (ValueError, UnicodeError):
+        return False
+    return (
+        parsed.scheme.lower() in {"http", "https"}
+        and bool(parsed.hostname)
+        and bool(parsed.path.strip("/"))
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.fragment
+        and (port is None or 1 <= port <= 65535)
+        and not any(char.isspace() for char in parsed.netloc)
+    )
+
+
+def get_bark_settings():
+    """Return validated live Bark settings; malformed persisted values disable delivery."""
+    notification = get_notification()
+    enabled = notification.get("bark_enabled")
+    url = notification.get("bark_url")
+    if enabled is not True or not is_valid_bark_url(url):
+        return False, ""
+    return True, url
 
 
 def get_server_settings():
