@@ -634,7 +634,34 @@ async def run_bark_lifecycle_case() -> None:
 
                 async def drive_and_capture(name: str, arguments: dict[str, Any]) -> None:
                     before = len(_BarkRecorder.requests)
-                    await _drive(client, name, arguments)
+                    result, trace = await _drive(client, name, arguments)
+                    # A Bark delivery alone is insufficient evidence: every
+                    # interactive endpoint must still finish with its normal
+                    # public MCP result after the real Tk action.
+                    terminal = _result_data(result)
+                    if name == "assign_task_to_human":
+                        terminal = _task_summary(result)
+                    if not trace or not isinstance(terminal, dict):
+                        failures.append(f"{name}: missing terminal MCP result or trace")
+                    elif name == "assign_task_to_human":
+                        if (terminal.get("status") != "completed" or
+                                terminal.get("body") != "automated task report 1" or
+                                terminal.get("needs_continuation") is not False):
+                            failures.append(f"{name}: unexpected task summary: {terminal!r}")
+                    elif terminal.get("success") is not True:
+                        failures.append(f"{name}: unsuccessful terminal result: {terminal!r}")
+                    elif name == "get_user_input" and terminal.get("user_input") != "auto text":
+                        failures.append(f"{name}: missing normal input result: {terminal!r}")
+                    elif name == "get_user_choice" and terminal.get("selected_choices") != ["two"]:
+                        failures.append(f"{name}: missing normal choice result: {terminal!r}")
+                    elif name == "get_multiline_input" and terminal.get("user_input") != "first line\nsecond line":
+                        failures.append(f"{name}: missing normal multiline result: {terminal!r}")
+                    elif name == "show_confirmation_dialog" and terminal.get("confirmed") is not False:
+                        failures.append(f"{name}: missing normal confirmation result: {terminal!r}")
+                    elif name == "show_info_message" and terminal.get("acknowledged") is not True:
+                        failures.append(f"{name}: missing normal acknowledgement result: {terminal!r}")
+                    elif name == "get_feedback_from_user" and not terminal.get("feedback_type"):
+                        failures.append(f"{name}: missing normal feedback result: {terminal!r}")
                     if not await wait_for_count(before + 1):
                         failures.append(f"{name}: expected one Bark request, got {len(_BarkRecorder.requests) - before}")
 
@@ -680,23 +707,37 @@ async def run_bark_lifecycle_case() -> None:
 
                 # A fresh config read controls the next toast: disabled means no
                 # delivery; a changed URL reaches its new key path without a restart.
+                # Settle the preceding heartbeat's request first, so a delayed
+                # prior request cannot be attributed to the disabled case.
+                await asyncio.sleep(0.15)
                 changed = json.loads(config_path.read_text(encoding="utf-8"))
                 changed["notification"]["bark_enabled"] = False
                 config_path.write_text(json.dumps(changed), encoding="utf-8")
                 before_disabled = len(_BarkRecorder.requests)
-                await _drive(client, "show_info_message", {
+                disabled_result, disabled_trace = await _drive(client, "show_info_message", {
                     "title": "Bark disabled", "message": "do not deliver", "client_timeout_seconds": 4,
                 })
+                disabled = _result_data(disabled_result)
+                if (not disabled_trace or not isinstance(disabled, dict) or
+                        disabled.get("success") is not True or disabled.get("acknowledged") is not True):
+                    failures.append("disabled Bark: info dialog did not return its normal terminal result")
+                await asyncio.sleep(0.2)
                 if len(_BarkRecorder.requests) != before_disabled:
                     failures.append("disabled Bark: a later toast still delivered")
                 changed["notification"].update({"bark_enabled": True, "bark_url": bark_url + "-changed"})
                 config_path.write_text(json.dumps(changed), encoding="utf-8")
                 before_changed = len(_BarkRecorder.requests)
-                await _drive(client, "show_info_message", {
+                changed_result, changed_trace = await _drive(client, "show_info_message", {
                     "title": "Bark changed", "message": "deliver to new URL", "client_timeout_seconds": 4,
                 })
+                changed_terminal = _result_data(changed_result)
+                if (not changed_trace or not isinstance(changed_terminal, dict) or
+                        changed_terminal.get("success") is not True or changed_terminal.get("acknowledged") is not True):
+                    failures.append("changed Bark URL: info dialog did not return its normal terminal result")
                 if not await wait_for_count(before_changed + 1):
                     failures.append("changed Bark URL: next toast did not deliver exactly once")
+                elif urlsplit(_BarkRecorder.requests[-1]).path != "/device%2Fkey-changed":
+                    failures.append("changed Bark URL: request did not use the changed key path")
 
                 await asyncio.sleep(0.15)
 
