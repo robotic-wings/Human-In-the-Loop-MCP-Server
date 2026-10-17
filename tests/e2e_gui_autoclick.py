@@ -16,11 +16,14 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 TEST_LOG_DIR = "/private/tmp/hitl-unattended-e2e-logs"
@@ -259,6 +262,18 @@ class TkAutoClicker:
         if isinstance(dialog, self.app.HumanTaskDialog):
             attempt = self.task_attempts.get(session.id, 0)
             self.task_attempts[session.id] = attempt + 1
+            if title == "AUTO_BARK_DORMANT":
+                dialog.body_text.insert("1.0", f"Bark task update {attempt + 1}")
+                if attempt < 2:
+                    _click_button(dialog.dialog, "Still progressing")
+                    if attempt == 1:
+                        # Test-only time setup: the public third continuation must
+                        # re-toast after this simulated 180-second idle interval.
+                        dialog.dialog.after(20, lambda: setattr(
+                            session, "last_human_action_at", time.monotonic() - 181))
+                else:
+                    _click_button(dialog.dialog, "Completed")
+                return
             if title == "AUTO_TASK_AUTOCLOSE":
                 if attempt == 0:
                     # The client intentionally stops heartbeating after this
@@ -551,6 +566,199 @@ async def run_gui_startup_race_case() -> None:
         "case": "interactive_call_before_gui_ready_is_retryable",
         "status": "passed", "elapsed": elapsed,
     }, ensure_ascii=False))
+
+
+class _BarkRecorder(BaseHTTPRequestHandler):
+    """Local Bark-shaped endpoint; records decoded requests without a phone key."""
+
+    requests: list[str] = []
+
+    def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
+        type(self).requests.append(self.path)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"code":200}')
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
+async def run_bark_lifecycle_case() -> None:
+    """Every interactive MCP tool sends one encoded, non-blocking Bark request."""
+    from fastmcp import Client
+    from fastmcp.client.transports import StdioTransport
+
+    recorder = ThreadingHTTPServer(("127.0.0.1", 0), _BarkRecorder)
+    recorder_thread = threading.Thread(target=recorder.serve_forever, daemon=True)
+    recorder_thread.start()
+    _BarkRecorder.requests.clear()
+    bark_url = f"http://127.0.0.1:{recorder.server_port}/device%2Fkey"
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.json"
+            config_path.write_text(json.dumps({"notification": {
+                "bark_enabled": True, "bark_url": bark_url, "muted": True,
+            }}), encoding="utf-8")
+            transport = StdioTransport(
+                command=sys.executable, args=[str(Path(__file__).resolve()), "--server"],
+                cwd=str(ROOT), keep_alive=False,
+                env={**os.environ, "HUMAN_LOOP_CONFIG": str(config_path), "HUMAN_LOOP_LOGS_DIR": TEST_LOG_DIR},
+                log_file=SERVER_LOG,
+            )
+            async with Client(transport, timeout=30) as client:
+                failures: list[str] = []
+
+                async def wait_for_count(expected: int) -> bool:
+                    deadline = time.monotonic() + 3
+                    while time.monotonic() < deadline:
+                        if len(_BarkRecorder.requests) >= expected:
+                            return len(_BarkRecorder.requests) == expected
+                        await asyncio.sleep(0.02)
+                    return len(_BarkRecorder.requests) == expected
+                for _ in range(50):
+                    health = _result_data(await client.call_tool("health_check"))
+                    if health and health["gui_available"]:
+                        break
+                    await asyncio.sleep(0.05)
+                else:
+                    raise AssertionError("GUI never became ready")
+
+                # Health/profile/invalid input must not create a phone request.
+                await client.call_tool("get_operator_profile")
+                invalid = _result_data(await client.call_tool("get_user_input", {
+                    "title": "AUTO_TIMEOUT_ONE_SECOND", "prompt": "not a notification", "client_timeout_seconds": 1,
+                }))
+                assert invalid["success"] is False
+                assert _BarkRecorder.requests == []
+
+                async def drive_and_capture(name: str, arguments: dict[str, Any]) -> None:
+                    before = len(_BarkRecorder.requests)
+                    result, trace = await _drive(client, name, arguments)
+                    # A Bark delivery alone is insufficient evidence: every
+                    # interactive endpoint must still finish with its normal
+                    # public MCP result after the real Tk action.
+                    terminal = _result_data(result)
+                    if name == "assign_task_to_human":
+                        terminal = _task_summary(result)
+                    if not trace or not isinstance(terminal, dict):
+                        failures.append(f"{name}: missing terminal MCP result or trace")
+                    elif name == "assign_task_to_human":
+                        if (terminal.get("status") != "completed" or
+                                terminal.get("body") != "automated task report 1" or
+                                terminal.get("needs_continuation") is not False):
+                            failures.append(f"{name}: unexpected task summary: {terminal!r}")
+                    elif terminal.get("success") is not True:
+                        failures.append(f"{name}: unsuccessful terminal result: {terminal!r}")
+                    elif name == "get_user_input" and terminal.get("user_input") != "auto text":
+                        failures.append(f"{name}: missing normal input result: {terminal!r}")
+                    elif name == "get_user_choice" and terminal.get("selected_choices") != ["two"]:
+                        failures.append(f"{name}: missing normal choice result: {terminal!r}")
+                    elif name == "get_multiline_input" and terminal.get("user_input") != "first line\nsecond line":
+                        failures.append(f"{name}: missing normal multiline result: {terminal!r}")
+                    elif name == "show_confirmation_dialog" and terminal.get("confirmed") is not False:
+                        failures.append(f"{name}: missing normal confirmation result: {terminal!r}")
+                    elif name == "show_info_message" and terminal.get("acknowledged") is not True:
+                        failures.append(f"{name}: missing normal acknowledgement result: {terminal!r}")
+                    elif name == "get_feedback_from_user" and not terminal.get("feedback_type"):
+                        failures.append(f"{name}: missing normal feedback result: {terminal!r}")
+                    if not await wait_for_count(before + 1):
+                        failures.append(f"{name}: expected one Bark request, got {len(_BarkRecorder.requests) - before}")
+
+                await drive_and_capture("get_user_input", {
+                    "title": "Bark 标题 & /", "prompt": "正文 & / ? 雪", "client_timeout_seconds": 4,
+                })
+                await drive_and_capture("get_user_choice", {
+                    "title": "Bark choice", "prompt": "choose", "choices": ["one", "two"], "client_timeout_seconds": 4,
+                })
+                await drive_and_capture("get_multiline_input", {
+                    "title": "Bark multiline", "prompt": "write", "client_timeout_seconds": 4,
+                })
+                await drive_and_capture("show_confirmation_dialog", {
+                    "title": "Bark confirm", "message": "confirm", "client_timeout_seconds": 4,
+                })
+                await drive_and_capture("show_info_message", {
+                    "title": "Bark info", "message": "info", "client_timeout_seconds": 4,
+                })
+                await drive_and_capture("get_feedback_from_user", {"client_timeout_seconds": 4})
+                await drive_and_capture("assign_task_to_human", {
+                    "task_title": "Bark task", "task_description": "complete", "client_timeout_seconds": 4,
+                })
+
+                # A heartbeat continues the existing toast/window and cannot push again.
+                heartbeat_baseline = len(_BarkRecorder.requests)
+                opened = _result_data(await client.call_tool("get_user_input", {
+                    "title": "AUTO_TIMEOUT_HEARTBEAT", "prompt": "wait", "client_timeout_seconds": 2,
+                }))
+                assert opened["status"] == "opened"
+                started = time.monotonic()
+                heartbeat = _result_data(await client.call_tool("get_user_input", {
+                    "title": "AUTO_TIMEOUT_HEARTBEAT", "prompt": "wait",
+                    "interaction_id": opened["interaction_id"], "client_timeout_seconds": 2,
+                }))
+                assert heartbeat["status"] == "heartbeat"
+                assert time.monotonic() - started < 2
+                expected_after_open = heartbeat_baseline + 1
+                if not await wait_for_count(expected_after_open):
+                    failures.append("opened: new toast did not deliver exactly once")
+                await asyncio.sleep(0.15)
+                if len(_BarkRecorder.requests) > expected_after_open:
+                    failures.append("heartbeat: continuation created a duplicate Bark request")
+
+                # A fresh config read controls the next toast: disabled means no
+                # delivery; a changed URL reaches its new key path without a restart.
+                # Settle the preceding heartbeat's request first, so a delayed
+                # prior request cannot be attributed to the disabled case.
+                await asyncio.sleep(0.15)
+                changed = json.loads(config_path.read_text(encoding="utf-8"))
+                changed["notification"]["bark_enabled"] = False
+                config_path.write_text(json.dumps(changed), encoding="utf-8")
+                before_disabled = len(_BarkRecorder.requests)
+                disabled_result, disabled_trace = await _drive(client, "show_info_message", {
+                    "title": "Bark disabled", "message": "do not deliver", "client_timeout_seconds": 4,
+                })
+                disabled = _result_data(disabled_result)
+                if (not disabled_trace or not isinstance(disabled, dict) or
+                        disabled.get("success") is not True or disabled.get("acknowledged") is not True):
+                    failures.append("disabled Bark: info dialog did not return its normal terminal result")
+                await asyncio.sleep(0.2)
+                if len(_BarkRecorder.requests) != before_disabled:
+                    failures.append("disabled Bark: a later toast still delivered")
+                changed["notification"].update({"bark_enabled": True, "bark_url": bark_url + "-changed"})
+                config_path.write_text(json.dumps(changed), encoding="utf-8")
+                before_changed = len(_BarkRecorder.requests)
+                changed_result, changed_trace = await _drive(client, "show_info_message", {
+                    "title": "Bark changed", "message": "deliver to new URL", "client_timeout_seconds": 4,
+                })
+                changed_terminal = _result_data(changed_result)
+                if (not changed_trace or not isinstance(changed_terminal, dict) or
+                        changed_terminal.get("success") is not True or changed_terminal.get("acknowledged") is not True):
+                    failures.append("changed Bark URL: info dialog did not return its normal terminal result")
+                if not await wait_for_count(before_changed + 1):
+                    failures.append("changed Bark URL: next toast did not deliver exactly once")
+                elif urlsplit(_BarkRecorder.requests[-1]).path != "/device%2Fkey-changed":
+                    failures.append("changed Bark URL: request did not use the changed key path")
+
+                await asyncio.sleep(0.15)
+
+        if len(_BarkRecorder.requests) != 9:
+            failures.append(f"total: expected nine requests, got {len(_BarkRecorder.requests)}")
+        parsed = [urlsplit(request) for request in _BarkRecorder.requests]
+        if [part.path for part in parsed[:-1]] != ["/device%2Fkey"] * 8:
+            failures.append("key path was not preserved for initial URL")
+        if not parsed or parsed[-1].path != "/device%2Fkey-changed":
+            failures.append("changed URL key path was not used")
+        decoded = [parse_qs(part.query) for part in parsed]
+        if not all(values.get("title", [""])[0] and values.get("body", [""])[0] for values in decoded):
+            failures.append("title/body were absent or empty")
+        if not any(values.get("title", [""])[0] == "The assistant needs some input" and "正文 & / ? 雪" in values.get("body", [""])[0]
+                   for values in decoded):
+            failures.append("Unicode/reserved preview was not decoded correctly")
+        assert not failures, "\n".join(failures)
+    finally:
+        recorder.shutdown()
+        recorder.server_close()
+    print(json.dumps({"case": "bark_all_interactive_tools", "status": "passed"}, ensure_ascii=False))
 
 
 async def run_tests() -> None:
@@ -1024,5 +1232,7 @@ if __name__ == "__main__":
         asyncio.run(run_gui_startup_race_case())
     elif sys.argv[1:] == ["--quick-vanished-widget"]:
         run_vanished_widget_case()
+    elif sys.argv[1:] == ["--quick-bark-lifecycle"]:
+        asyncio.run(run_bark_lifecycle_case())
     else:
         asyncio.run(run_tests())
