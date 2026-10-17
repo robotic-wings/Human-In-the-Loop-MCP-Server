@@ -135,7 +135,9 @@ async def run_transport_cases() -> None:
                 failures.append("synthetic credential key leaked to MCP result after HTTP 500")
             if not await _wait_for_attempts(1):
                 failures.append("HTTP 500: initial delivery attempt was not observed")
-            await asyncio.sleep(0.4)
+            # Keep the real MCP process alive past the delivery timeout, so a
+            # delayed retry at one or two seconds cannot be hidden by teardown.
+            await asyncio.sleep(3.2)
 
         diagnostics = await _with_client(endpoint.url(f"{synthetic_key}-500"), rejected_delivery)
         if synthetic_key in diagnostics:
