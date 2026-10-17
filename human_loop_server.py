@@ -25,10 +25,9 @@ import uuid
 from datetime import datetime, timezone
 from tkinter import filedialog, messagebox, ttk
 from typing import Annotated, Any, Dict, List, Literal, Optional
-from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
-from urllib.request import Request, urlopen
 
+import httpx
 from pydantic import Field
 
 # Set required environment variable for FastMCP 2.8.1+
@@ -172,14 +171,12 @@ DISCONNECT_GRACE_SECONDS = 20      # past a leg deadline before we warn "may be 
 AUTO_CLOSE_AFTER_SECONDS = 180     # further silence before auto-saving the draft & closing
 GUI_STARTUP_WAIT_SECONDS = 0.5     # bounded wait for the main-thread Tk loop
 
-# Bark is best-effort and must never hold up an MCP call. Keep both the worker
-# count and queued work finite so repeated calls cannot grow an unbounded queue.
+# Bark is best-effort and must never hold up an MCP call. Admit only a bounded
+# number of delivery tasks so repeated calls cannot grow an unbounded queue.
 BARK_HTTP_TIMEOUT_SECONDS = 2.5
-BARK_RESPONSE_READ_LIMIT = 64 * 1024
 BARK_MAX_IN_FLIGHT = 8
-_bark_executor = concurrent.futures.ThreadPoolExecutor(
-    max_workers=2, thread_name_prefix="hitl-bark")
 _bark_slots = threading.BoundedSemaphore(BARK_MAX_IN_FLIGHT)
+_bark_tasks: set[asyncio.Task] = set()
 
 # Pre-task notification / ringtone.
 RINGTONE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notify.wav")
@@ -239,27 +236,57 @@ def _schedule_bark_notification(params):
     if not _bark_slots.acquire(blocking=False):
         return
 
-    def deliver():
-        try:
-            request = Request(request_url, headers={"User-Agent": "Human-In-the-Loop-MCP-Server"})
-            with urlopen(request, timeout=BARK_HTTP_TIMEOUT_SECONDS) as response:
-                response.read(BARK_RESPONSE_READ_LIMIT)
-        except HTTPError:
-            _out("Bark notification attempt failed (HTTP response)")
-        except (URLError, TimeoutError, OSError, ValueError):
-            # Do not print exception text: urllib errors can include the secret URL.
-            _out("Bark notification attempt failed (network error)")
-        except Exception:
-            # Notification delivery is deliberately isolated from user input.
-            _out("Bark notification attempt failed")
-        finally:
-            _bark_slots.release()
-
     try:
-        _bark_executor.submit(deliver)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + BARK_HTTP_TIMEOUT_SECONDS
+        delivery = _deliver_bark_notification(request_url, deadline)
+        try:
+            task = loop.create_task(delivery)
+        except Exception:
+            delivery.close()
+            raise
+        _bark_tasks.add(task)
+        task.add_done_callback(_bark_task_done)
     except Exception:
         _bark_slots.release()
         _out("Bark notification could not be queued")
+
+
+def _bark_task_done(task):
+    """Retire one task and release capacity even if it was cancelled before start."""
+    _bark_tasks.discard(task)
+    try:
+        error = task.exception()
+    except asyncio.CancelledError:
+        error = None
+    if error is not None:
+        # Never include exception text: request errors can contain the Bark URL.
+        _out("Bark notification attempt failed")
+    _bark_slots.release()
+
+
+async def _deliver_bark_notification(request_url, deadline):
+    """Send one no-retry Bark GET under a total deadline, without reading its body."""
+    try:
+        async with asyncio.timeout_at(deadline):
+            async with httpx.AsyncClient(follow_redirects=False, timeout=None) as client:
+                async with client.stream(
+                    "GET",
+                    request_url,
+                    headers={"User-Agent": "Human-In-the-Loop-MCP-Server"},
+                ) as response:
+                    response.raise_for_status()
+    except TimeoutError:
+        _out("Bark notification attempt timed out")
+    except httpx.HTTPStatusError:
+        _out("Bark notification attempt failed (HTTP response)")
+    except httpx.RequestError:
+        _out("Bark notification attempt failed (network error)")
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        # Notification delivery is deliberately isolated from user input.
+        _out("Bark notification attempt failed")
 
 
 def get_logs_dir() -> str:
