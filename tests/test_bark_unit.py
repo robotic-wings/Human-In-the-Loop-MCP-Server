@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import os
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
@@ -45,74 +49,96 @@ class BarkConfigDefaultsTests(unittest.TestCase):
         self.assertEqual(fresh["bark_url"], "http://127.0.0.1:8081/test-key")
 
 
-class _CountingSlots:
-    def __init__(self) -> None:
-        self.available = 1
+class _BarkCapture(BaseHTTPRequestHandler):
+    requests = []
 
-    def acquire(self, blocking: bool = True) -> bool:
-        if self.available == 0:
-            return False
-        self.available -= 1
-        return True
+    def do_GET(self) -> None:  # noqa: N802 - required BaseHTTPRequestHandler spelling
+        type(self).requests.append(self.path)
+        self.send_response(200)
+        self.end_headers()
 
-    def release(self) -> None:
-        self.available += 1
+    def log_message(self, _format, *_args) -> None:
+        pass
 
 
-class _RecordingExecutor:
-    def __init__(self) -> None:
-        self.jobs = []
+class BarkSchedulerFailureTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        _BarkCapture.requests = []
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _BarkCapture)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.bark_url = f"http://127.0.0.1:{self.server.server_port}/synthetic-key"
 
-    def submit(self, callback) -> None:
-        self.jobs.append(callback)
+    async def asyncTearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
 
-
-class BarkSchedulerFailureTests(unittest.TestCase):
-    def test_unencodable_title_is_skipped_and_later_valid_send_runs(self) -> None:
+    async def _schedule(self, params) -> None:
         import human_loop_server
 
-        slots = _CountingSlots()
-        executor = _RecordingExecutor()
-        synthetic_url = "http://127.0.0.1:8081/synthetic-key"
-        with (
-            mock.patch.object(human_loop_server.human_loop_config, "get_bark_settings",
-                              return_value=(True, synthetic_url)),
-            mock.patch.object(human_loop_server, "_bark_slots", slots),
-            mock.patch.object(human_loop_server, "_bark_executor", executor),
-            mock.patch.object(human_loop_server, "_out") as diagnostic,
-        ):
-            human_loop_server._schedule_bark_notification({
+        scheduled = human_loop_server._schedule_bark_notification(params)
+        if inspect.isawaitable(scheduled):
+            await scheduled
+
+    async def _wait_for_requests(self, count: int) -> None:
+        for _ in range(100):
+            if len(_BarkCapture.requests) >= count:
+                return
+            await asyncio.sleep(0.01)
+        self.fail(f"expected {count} Bark request(s), got {_BarkCapture.requests!r}")
+
+    def _settings(self, human_loop_server):
+        return mock.patch.object(human_loop_server.human_loop_config, "get_bark_settings",
+                                 return_value=(True, self.bark_url))
+
+    async def test_unencodable_title_is_skipped_and_later_valid_send_runs(self) -> None:
+        import human_loop_server
+
+        with self._settings(human_loop_server):
+            await self._schedule({
                 "notify_heading": chr(0xD800), "notify_preview": "malformed title",
             })
-            self.assertEqual(slots.available, 1)
-            self.assertEqual(executor.jobs, [])
-            diagnostic.assert_called_once()
-            self.assertNotIn(synthetic_url, str(diagnostic.call_args))
-
-            human_loop_server._schedule_bark_notification({
+            await asyncio.sleep(0.05)
+            self.assertEqual(_BarkCapture.requests, [])
+            await self._schedule({
                 "notify_heading": "Valid title", "notify_preview": "Valid body",
             })
-            self.assertEqual(slots.available, 0)
-            self.assertEqual(len(executor.jobs), 1)
+            await self._wait_for_requests(1)
+        query = parse_qs(urlsplit(_BarkCapture.requests[0]).query)
+        self.assertEqual(query["title"], ["Valid title"])
+        self.assertEqual(query["body"], ["Valid body"])
 
-            response = mock.MagicMock()
-            response.__enter__.return_value = response
-            with mock.patch.object(human_loop_server, "urlopen", return_value=response) as urlopen:
-                executor.jobs[0]()
+    async def test_failed_task_creation_does_not_exhaust_future_delivery(self) -> None:
+        import human_loop_server
 
-            request = urlopen.call_args.args[0]
-            query = parse_qs(urlsplit(request.full_url).query)
-            self.assertEqual(query["title"], ["Valid title"])
-            self.assertEqual(query["body"], ["Valid body"])
-            self.assertEqual(slots.available, 1)
+        with self._settings(human_loop_server):
+            with mock.patch.object(asyncio.get_running_loop(), "create_task",
+                                   side_effect=RuntimeError("task creation failed")):
+                for attempt in range(8):
+                    await self._schedule({
+                        "notify_heading": f"failed {attempt}", "notify_preview": "retry later",
+                    })
+            await self._schedule({"notify_heading": "Healthy", "notify_preview": "delivers"})
+            await self._wait_for_requests(1)
+        query = parse_qs(urlsplit(_BarkCapture.requests[0]).query)
+        self.assertEqual(query["title"], ["Healthy"])
 
-            with mock.patch.object(human_loop_server, "_bark_executor") as failed_executor:
-                failed_executor.submit.side_effect = RuntimeError(synthetic_url)
-                human_loop_server._schedule_bark_notification({
-                    "notify_heading": "Queue failure", "notify_preview": "must stay isolated",
-                })
-            self.assertEqual(slots.available, 1)
-            self.assertNotIn(synthetic_url, str(diagnostic.call_args))
+    async def test_cancel_before_first_step_releases_future_delivery(self) -> None:
+        import human_loop_server
+
+        with self._settings(human_loop_server):
+            before = asyncio.all_tasks()
+            await self._schedule({"notify_heading": "Cancel", "notify_preview": "never starts"})
+            created = asyncio.all_tasks() - before
+            self.assertTrue(created, "scheduling a Bark notification must create deliverable work")
+            for task in created:
+                task.cancel()
+            await asyncio.gather(*created, return_exceptions=True)
+            await self._schedule({"notify_heading": "Healthy", "notify_preview": "delivers"})
+            await self._wait_for_requests(1)
+        query = parse_qs(urlsplit(_BarkCapture.requests[0]).query)
+        self.assertEqual(query["title"], ["Healthy"])
 
 
 if __name__ == "__main__":
