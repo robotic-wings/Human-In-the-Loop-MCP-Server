@@ -82,7 +82,7 @@ class BarkSchedulerFailureTests(unittest.IsolatedAsyncioTestCase):
             await scheduled
 
     async def _wait_for_requests(self, count: int) -> None:
-        for _ in range(100):
+        for _ in range(300):
             if len(_BarkCapture.requests) >= count:
                 return
             await asyncio.sleep(0.01)
@@ -95,16 +95,21 @@ class BarkSchedulerFailureTests(unittest.IsolatedAsyncioTestCase):
     async def test_unencodable_title_is_skipped_and_later_valid_send_runs(self) -> None:
         import human_loop_server
 
+        diagnostics = []
         with self._settings(human_loop_server):
-            await self._schedule({
-                "notify_heading": chr(0xD800), "notify_preview": "malformed title",
-            })
+            with mock.patch.object(human_loop_server, "_out", side_effect=diagnostics.append):
+                for _ in range(8):
+                    await self._schedule({
+                        "notify_heading": chr(0xD800), "notify_preview": "malformed title",
+                    })
             await asyncio.sleep(0.05)
             self.assertEqual(_BarkCapture.requests, [])
             await self._schedule({
                 "notify_heading": "Valid title", "notify_preview": "Valid body",
             })
             await self._wait_for_requests(1)
+        self.assertEqual(diagnostics, ["Bark notification skipped (invalid message)"] * 8)
+        self.assertNotIn(self.bark_url, str(diagnostics))
         query = parse_qs(urlsplit(_BarkCapture.requests[0]).query)
         self.assertEqual(query["title"], ["Valid title"])
         self.assertEqual(query["body"], ["Valid body"])
@@ -112,15 +117,19 @@ class BarkSchedulerFailureTests(unittest.IsolatedAsyncioTestCase):
     async def test_failed_task_creation_does_not_exhaust_future_delivery(self) -> None:
         import human_loop_server
 
+        diagnostics = []
         with self._settings(human_loop_server):
-            with mock.patch.object(asyncio.get_running_loop(), "create_task",
-                                   side_effect=RuntimeError("task creation failed")):
-                for attempt in range(8):
-                    await self._schedule({
-                        "notify_heading": f"failed {attempt}", "notify_preview": "retry later",
-                    })
+            with mock.patch.object(human_loop_server, "_out", side_effect=diagnostics.append):
+                with mock.patch.object(asyncio.get_running_loop(), "create_task",
+                                       side_effect=RuntimeError(self.bark_url)):
+                    for attempt in range(8):
+                        await self._schedule({
+                            "notify_heading": f"failed {attempt}", "notify_preview": "retry later",
+                        })
             await self._schedule({"notify_heading": "Healthy", "notify_preview": "delivers"})
             await self._wait_for_requests(1)
+        self.assertEqual(diagnostics, ["Bark notification could not be queued"] * 8)
+        self.assertNotIn(self.bark_url, str(diagnostics))
         query = parse_qs(urlsplit(_BarkCapture.requests[0]).query)
         self.assertEqual(query["title"], ["Healthy"])
 
@@ -128,13 +137,16 @@ class BarkSchedulerFailureTests(unittest.IsolatedAsyncioTestCase):
         import human_loop_server
 
         with self._settings(human_loop_server):
-            before = asyncio.all_tasks()
-            await self._schedule({"notify_heading": "Cancel", "notify_preview": "never starts"})
-            created = asyncio.all_tasks() - before
-            self.assertTrue(created, "scheduling a Bark notification must create deliverable work")
-            for task in created:
-                task.cancel()
-            await asyncio.gather(*created, return_exceptions=True)
+            for attempt in range(8):
+                before = asyncio.all_tasks()
+                await self._schedule({
+                    "notify_heading": f"Cancel {attempt}", "notify_preview": "never starts",
+                })
+                created = asyncio.all_tasks() - before
+                self.assertTrue(created, "scheduling a Bark notification must create deliverable work")
+                for task in created:
+                    task.cancel()
+                await asyncio.gather(*created, return_exceptions=True)
             await self._schedule({"notify_heading": "Healthy", "notify_preview": "delivers"})
             await self._wait_for_requests(1)
         query = parse_qs(urlsplit(_BarkCapture.requests[0]).query)
