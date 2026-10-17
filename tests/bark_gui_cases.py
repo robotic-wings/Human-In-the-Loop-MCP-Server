@@ -77,6 +77,23 @@ class BarkSettingsGuiCases(unittest.TestCase):
         self.assertEqual(int(reopened_toggle.getvar(reopened_toggle.cget("variable"))), 1)
         self.assertEqual(reopened_url.get(), "http://127.0.0.1:8081/key/保留")
 
+    def test_disable_then_save_and_reopen_keeps_the_url(self) -> None:
+        bark_url = "https://bark.example.test/disabled-key"
+        human_loop_config.save_config({"notification": {
+            "bark_enabled": True, "bark_url": bark_url,
+        }})
+        tab = self._tab()
+        toggle, _ = self._controls(tab)
+        self.assertEqual(int(toggle.getvar(toggle.cget("variable"))), 1)
+        toggle.invoke()
+        self._save(tab)
+        saved = human_loop_config.load_config()["notification"]
+        self.assertFalse(saved["bark_enabled"])
+        self.assertEqual(saved["bark_url"], bark_url)
+        reopened_toggle, reopened_url = self._controls(self._tab())
+        self.assertEqual(int(reopened_toggle.getvar(reopened_toggle.cget("variable"))), 0)
+        self.assertEqual(reopened_url.get(), bark_url)
+
     def test_invalid_enabled_urls_warn_and_leave_saved_bytes_unchanged(self) -> None:
         human_loop_config.save_config({"notification": {"bark_enabled": True, "bark_url": "http://127.0.0.1:8081/key"}})
         before = self.path.read_bytes()
@@ -114,6 +131,37 @@ class BarkSettingsGuiCases(unittest.TestCase):
         self.assertEqual(config["notification"]["ringtone_path"], "/tmp/ring.wav")
         self.assertTrue(config["notification"]["muted"])
         self.assertEqual(config["notification"]["future_key"], "kept")
+        self.assertTrue(config["notification"]["bark_enabled"])
+        self.assertEqual(config["notification"]["bark_url"], "https://bark.example.test/key")
+
+    def test_save_write_failure_shows_error_without_saved_status_or_disk_change(self) -> None:
+        human_loop_config.save_config({"notification": {
+            "bark_enabled": True, "bark_url": "https://bark.example.test/original",
+        }})
+        before = self.path.read_bytes()
+        tab = self._tab()
+        toggle, url = self._controls(tab)
+        if not int(toggle.getvar(toggle.cget("variable"))):
+            toggle.invoke()
+        url.delete(0, tk.END)
+        url.insert(0, "https://bark.example.test/not-written")
+        errors = []
+        original_save = management_console.human_loop_config.save_config
+        original_error = management_console.messagebox.showerror
+
+        def fail_save(_config):
+            raise OSError("disk write failed")
+
+        management_console.human_loop_config.save_config = fail_save
+        management_console.messagebox.showerror = lambda title, message: errors.append((title, message))
+        try:
+            self._save(tab)
+        finally:
+            management_console.human_loop_config.save_config = original_save
+            management_console.messagebox.showerror = original_error
+        self.assertEqual(errors, [("Save", "Could not save config:\ndisk write failed")])
+        self.assertNotEqual(tab.status.cget("text"), "Saved.")
+        self.assertEqual(self.path.read_bytes(), before)
 
 
 if __name__ == "__main__":
