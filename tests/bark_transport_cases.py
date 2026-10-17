@@ -46,11 +46,11 @@ class _TransportEndpoint(BaseHTTPRequestHandler):
                 self.wfile.write(b'{"code":200}')
                 return
             self.send_response(200)
-            self.send_header("Content-Length", "13")
+            self.send_header("Content-Length", "17")
             self.end_headers()
             # Every gap is below the ordinary socket inactivity timeout, but
             # the complete response exceeds the total Bark delivery budget.
-            for _ in range(13):
+            for _ in range(17):
                 try:
                     self.wfile.write(b"x")
                     self.wfile.flush()
@@ -88,6 +88,15 @@ class _TransportEndpoint(BaseHTTPRequestHandler):
                     cls.client_closed_at = time.monotonic()
                     return
                 time.sleep(0.05)
+            self.connection.settimeout(0.05)
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                try:
+                    if self.connection.recv(1) == b"":
+                        cls.client_closed_at = time.monotonic()
+                        return
+                except TimeoutError:
+                    continue
             return
 
         # Deliberately do not send a response. A bounded client must abandon
@@ -254,9 +263,10 @@ async def run_slow_trickle_case(kind: str = "trickle") -> None:
     with _Endpoint() as endpoint:
         attempt_started: float | None = None
         closed_at: float | None = None
+        followup_ok = False
 
         async def trickle_delivery(client: Any) -> None:
-            nonlocal attempt_started, closed_at
+            nonlocal attempt_started, closed_at, followup_ok
             result, _ = await _drive(client, "get_user_input", {
                 "title": "Bark trickle", "prompt": "GUI/MCP stays normal", "client_timeout_seconds": 4,
             })
@@ -280,6 +290,8 @@ async def run_slow_trickle_case(kind: str = "trickle") -> None:
             followup_value = _result_data(followup)
             if not followup_value or followup_value.get("success") is not True:
                 failures.append(f"slow {kind} prevented a valid followup interaction: {followup_value!r}")
+            else:
+                followup_ok = True
             if not await _wait_for_attempts(2):
                 failures.append(f"slow {kind} prevented a valid followup Bark push")
 
@@ -296,6 +308,13 @@ async def run_slow_trickle_case(kind: str = "trickle") -> None:
             followup_query = parse_qs(urlsplit(_TransportEndpoint.attempts[1][0]).query)
             if not followup_query.get("title", [""])[0] or "valid followup" not in followup_query.get("body", [""])[0]:
                 failures.append(f"slow {kind}: valid followup request lacked decoded title/body")
+        elapsed = closed_at - attempt_started if attempt_started is not None and closed_at is not None else None
+        print(json.dumps({
+            "case": f"bark_slow_{kind}_evidence",
+            "attempts": len(_TransportEndpoint.attempts),
+            "elapsed_to_close": elapsed,
+            "followup_ok": followup_ok,
+        }))
     assert not failures, "\n".join(failures)
     print(json.dumps({"case": f"bark_slow_{kind}_is_total_time_bounded", "status": "passed"}))
 
