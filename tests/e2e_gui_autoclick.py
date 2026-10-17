@@ -702,7 +702,7 @@ async def run_bark_lifecycle_case() -> None:
                 if not await wait_for_count(expected_after_open):
                     failures.append("opened: new toast did not deliver exactly once")
                 await asyncio.sleep(0.15)
-                if len(_BarkRecorder.requests) != expected_after_open:
+                if len(_BarkRecorder.requests) > expected_after_open:
                     failures.append("heartbeat: continuation created a duplicate Bark request")
 
                 # A fresh config read controls the next toast: disabled means no
