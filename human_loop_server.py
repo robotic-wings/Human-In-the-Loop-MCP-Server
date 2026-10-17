@@ -200,7 +200,11 @@ def compute_leg_seconds(client_timeout_seconds: int) -> int:
 
 
 def _build_bark_request_url(bark_url, params):
-    """Build an encoded Bark request URL from the configured endpoint and toast text."""
+    """Build an encoded Bark request URL from the configured endpoint and toast text.
+
+    Every push carries call=1 so the phone rings repeatedly for 30 seconds,
+    like an incoming call, instead of a single notification sound.
+    """
     params = params if isinstance(params, dict) else {}
     heading = params.get("notify_heading")
     if not isinstance(heading, str) or not heading.strip():
@@ -216,6 +220,7 @@ def _build_bark_request_url(bark_url, params):
     query = [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True)
              if key not in {"title", "body"}]
     query.extend((("title", heading), ("body", preview)))
+    query.append(("call", "1"))
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path,
                        urlencode(query, doseq=True), ""))
 
