@@ -202,12 +202,8 @@ def compute_leg_seconds(client_timeout_seconds: int) -> int:
     return max(1, ct - margin)
 
 
-def _schedule_bark_notification(params):
-    """Queue one bounded, best-effort Bark GET without delaying the GUI/MCP path."""
-    enabled, bark_url = human_loop_config.get_bark_settings()
-    if not enabled or not _bark_slots.acquire(blocking=False):
-        return
-
+def _build_bark_request_url(bark_url, params):
+    """Build an encoded Bark request URL from the configured endpoint and toast text."""
     params = params if isinstance(params, dict) else {}
     heading = params.get("notify_heading")
     if not isinstance(heading, str) or not heading.strip():
@@ -223,8 +219,25 @@ def _schedule_bark_notification(params):
     query = [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True)
              if key not in {"title", "body"}]
     query.extend((("title", heading), ("body", preview)))
-    request_url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path,
-                              urlencode(query, doseq=True), ""))
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path,
+                       urlencode(query, doseq=True), ""))
+
+
+def _schedule_bark_notification(params):
+    """Queue one bounded, best-effort Bark GET without delaying the GUI/MCP path."""
+    enabled, bark_url = human_loop_config.get_bark_settings()
+    if not enabled:
+        return
+
+    try:
+        request_url = _build_bark_request_url(bark_url, params)
+    except Exception:
+        # Malformed text must not affect the interaction or leak the endpoint.
+        _out("Bark notification skipped (invalid message)")
+        return
+
+    if not _bark_slots.acquire(blocking=False):
+        return
 
     def deliver():
         try:
@@ -244,8 +257,9 @@ def _schedule_bark_notification(params):
 
     try:
         _bark_executor.submit(deliver)
-    except RuntimeError:
+    except Exception:
         _bark_slots.release()
+        _out("Bark notification could not be queued")
 
 
 def get_logs_dir() -> str:
