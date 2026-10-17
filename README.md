@@ -350,7 +350,7 @@ Bark notifications are disabled by default (`bark_enabled: false`), and the Bark
 
 The server starts a Bark request asynchronously when an interactive tool creates a new ringing toast. It also sends one when a dormant task creates a new toast after the existing three-minute idle threshold. Heartbeat and `opened` continuations, and immediate same-ID reopens that do not create a toast, do not send another request. The toast title and preview are URL-encoded into the Bark request.
 
-Delivery is best-effort: the network request has a 2.5-second timeout, is not retried, and failures do not change the GUI or MCP result. The server cannot guarantee that Bark received or displayed a notification.
+Delivery is best-effort. Each async request has an absolute 2.5-second total attempt deadline measured from scheduling. It covers the cancellable HTTP request, waiting for response headers, and closing the response stream; the response body is not read. There are no retries, and failures do not change the GUI or MCP result. This is not a hard-real-time guarantee for every OS networking call: asyncio/AnyIO cancellation cannot forcibly terminate an OS resolver call already running in the shared default resolver executor, so that resolver call can continue after the Bark attempt is cancelled. Resolution uses the shared executor; this limitation does not mean a per-push worker is abandoned or created.
 
 Settings persist to `~/.human_loop_config.json` (override with `HUMAN_LOOP_CONFIG`). The server reads this file live, so most changes apply without restarting it. Environment variables still win over the config file where both apply.
 
