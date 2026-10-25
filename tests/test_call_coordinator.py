@@ -13,6 +13,8 @@ from pathlib import Path
 from threading import Barrier, Thread
 from typing import Any
 
+import pytest
+
 from call_coordinator import AcceptCall, CallCoordinator, CreateCall, DeclineCall
 
 
@@ -274,6 +276,16 @@ def test_reopen_settles_expired_before_new_create_releases_busy(tmp_path: Path) 
         create_request(caller_id="agent-b", request_id="request-b")
     )
     assert_envelope(new_call, status="ringing")
+
+
+def test_unknown_call_error_releases_transaction_for_later_create(tmp_path: Path) -> None:
+    service = coordinator(tmp_path, make_clock())
+
+    with pytest.raises(KeyError):
+        service.get_call("unknown-call")
+
+    created = service.create_call(create_request())
+    assert_envelope(created, status="ringing")
 
 
 def test_accept_and_decline_races_have_exactly_one_legal_winner(tmp_path: Path) -> None:
