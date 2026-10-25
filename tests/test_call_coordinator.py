@@ -247,13 +247,16 @@ def test_accept_and_decline_action_ids_replay_without_duplicate_events(
     assert conflict["status"] == "request_conflict"
     assert service.events_for(call_id) == [accepted]
 
-    declined = service.create_call(
+    decline_data_dir = tmp_path / "decline-idempotency"
+    decline_data_dir.mkdir()
+    decline_service = coordinator(decline_data_dir, make_clock())
+    declined = decline_service.create_call(
         create_request(caller_id="agent-b", request_id="request-b")
     )
     declined_id = declined["call_id"]
-    result = service.decline_call(decline_request(declined_id))
-    assert service.decline_call(decline_request(declined_id)) == result
-    assert service.events_for(declined_id) == [result]
+    result = decline_service.decline_call(decline_request(declined_id))
+    assert decline_service.decline_call(decline_request(declined_id)) == result
+    assert decline_service.events_for(declined_id) == [result]
 
 
 def test_reopen_settles_expired_before_new_create_releases_busy(tmp_path: Path) -> None:
