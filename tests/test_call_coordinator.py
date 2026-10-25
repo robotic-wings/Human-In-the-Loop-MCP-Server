@@ -117,6 +117,34 @@ def test_ringing_call_persists_across_reopen_and_remains_busy(tmp_path: Path) ->
     assert busy["event_seq"] is None
 
 
+def test_accepted_call_persists_across_reopen_and_remains_busy(
+    tmp_path: Path,
+) -> None:
+    clock = make_clock()
+    first = coordinator(tmp_path, clock)
+    created = first.create_call(create_request())
+    call_id = created["call_id"]
+    accepted = first.accept_call(accept_request(call_id))
+    assert_envelope(accepted, status="opened", call_state="accepted")
+    first.close()
+
+    reopened = coordinator(tmp_path, clock)
+    recovered = reopened.get_call(call_id)
+    assert_envelope(recovered, status="accepted")
+    assert recovered["call_id"] == call_id
+    assert recovered["owner_device_id"] == "iphone-1"
+    assert recovered["owner_session_id"] == "browser-session-1"
+    busy = reopened.create_call(
+        create_request(caller_id="agent-b", request_id="request-b")
+    )
+    assert_envelope(busy, status="busy", call_state=None)
+    assert busy["call_state"] is None
+    assert busy["call_id"] is None
+    assert busy["handled_on"] is None
+    assert busy["terminal_platform"] is None
+    assert busy["event_seq"] is None
+
+
 def test_expiration_settles_on_request_path_and_cannot_be_revived(
     tmp_path: Path,
 ) -> None:
