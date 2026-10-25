@@ -399,12 +399,18 @@ class _Transaction:
 
     def __enter__(self) -> sqlite3.Connection:
         self._lock.acquire()
-        self._connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+        except BaseException:
+            self._lock.release()
+            raise
         return self._connection
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
-        if exc_type is None:
-            self._connection.commit()
-        else:
-            self._connection.rollback()
-        self._lock.release()
+        try:
+            if exc_type is None:
+                self._connection.commit()
+            else:
+                self._connection.rollback()
+        finally:
+            self._lock.release()
