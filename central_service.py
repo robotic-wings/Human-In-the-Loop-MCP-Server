@@ -15,7 +15,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import NoReturn
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 
 class ConfigurationError(ValueError):
@@ -69,7 +69,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
     server_version = "HITLCentralService/0.1"
 
     def do_GET(self) -> None:  # noqa: N802
-        if self.path.startswith("/calls/"):
+        if urlsplit(self.path).path.startswith("/calls/"):
             self.send_error(HTTPStatus.NOT_FOUND, "call not found")
             return
         self.send_error(HTTPStatus.NOT_FOUND, "route not found")
@@ -78,12 +78,28 @@ class _PublicHandler(BaseHTTPRequestHandler):
         """Avoid writing request contents to diagnostic output."""
 
 
-def _serve(config: ServiceConfig) -> None:
-    config.data_dir.mkdir(parents=True, exist_ok=True)
-    server = ThreadingHTTPServer((config.listen_host, config.listen_port), _PublicHandler)
+def _build_tls_context(config: ServiceConfig) -> ssl.SSLContext:
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(certfile=config.certfile, keyfile=config.keyfile)
-    server.socket = context.wrap_socket(server.socket, server_side=True)
+    return context
+
+
+def _create_secure_server(
+    config: ServiceConfig, context: ssl.SSLContext
+) -> ThreadingHTTPServer:
+    server = ThreadingHTTPServer((config.listen_host, config.listen_port), _PublicHandler)
+    try:
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+    except BaseException:
+        server.server_close()
+        raise
+    return server
+
+
+def _serve(config: ServiceConfig) -> None:
+    context = _build_tls_context(config)
+    config.data_dir.mkdir(parents=True, exist_ok=True)
+    server = _create_secure_server(config, context)
     try:
         server.serve_forever()
     finally:
@@ -95,8 +111,7 @@ def _fail(message: str) -> NoReturn:
     raise SystemExit(2)
 
 
-def main(argv: list[str] | None = None) -> None:
-    arguments = sys.argv[1:] if argv is None else argv
+def _parse_config_path(arguments: list[str]) -> Path:
     legacy_modes = {"--stdio", "--local", "--service"}
     if any(argument in legacy_modes for argument in arguments):
         _fail("legacy stdio/local/service modes are rejected and not supported")
@@ -105,15 +120,20 @@ def main(argv: list[str] | None = None) -> None:
     parsed = parser.parse_args(arguments)
     if parsed.config is None:
         _fail("config is required; no default listener or stdio mode exists")
+    return parsed.config
+
+
+def main(argv: list[str] | None = None) -> None:
+    arguments = sys.argv[1:] if argv is None else argv
     try:
-        config = _load_config(parsed.config)
+        config = _load_config(_parse_config_path(arguments))
         _serve(config)
     except ConfigurationError as error:
         _fail(f"configuration error: {error}")
-    except OSError as error:
-        _fail(f"configuration error: unable to create HTTPS listener: {error}")
     except ssl.SSLError as error:
         _fail(f"configuration error: HTTPS setup failed: {error}")
+    except OSError as error:
+        _fail(f"configuration error: unable to create HTTPS listener: {error}")
 
 
 if __name__ == "__main__":
