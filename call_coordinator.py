@@ -61,10 +61,12 @@ class CallCoordinator:
     """
 
     def __init__(
-        self, database_path: Path, *, clock: Clock, terminal_disconnect_seconds: int = 180
+        self, database_path: Path, *, clock: Clock, terminal_disconnect_seconds: int = 180,
+        terminal_presence_seconds: int = 30,
     ) -> None:
         self._clock = clock
         self._terminal_disconnect_seconds = terminal_disconnect_seconds
+        self._terminal_presence_seconds = terminal_presence_seconds
         self._lock = threading.RLock()
         self._connection = sqlite3.connect(database_path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
@@ -144,7 +146,70 @@ class CallCoordinator:
                 return None
             self._settle_if_expired(connection, row)
             row = self._call_or_raise(connection, row["call_id"])
+            if row["state"] not in {"ringing", "accepted"}:
+                return self._current_result(connection, row)
             return self._terminal_state_result(row)
+
+    def register_terminal_presence(
+        self, *, device_id: str, terminal_platform: str, route_device_id: str,
+        callback_url: str | None, instance_id: str, gui_ready: bool,
+    ) -> dict[str, Any]:
+        """Persist only credential-derived device health; never touch call liveness."""
+        now = self._now()
+        expires_at = now + timedelta(seconds=self._terminal_presence_seconds)
+        with self._write_transaction() as connection:
+            connection.execute(
+                "INSERT INTO terminal_presence "
+                "(device_id, terminal_platform, route_device_id, callback_url, instance_id, "
+                "gui_ready, last_seen_at, online_expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(device_id) DO UPDATE SET terminal_platform = excluded.terminal_platform, "
+                "route_device_id = excluded.route_device_id, callback_url = excluded.callback_url, "
+                "instance_id = excluded.instance_id, gui_ready = excluded.gui_ready, "
+                "last_seen_at = excluded.last_seen_at, online_expires_at = excluded.online_expires_at",
+                (device_id, terminal_platform, route_device_id, callback_url, instance_id,
+                 int(gui_ready), self._stamp(now), self._stamp(expires_at)),
+            )
+            return self._terminal_presence_result(self._presence_or_raise(connection, device_id))
+
+    def terminal_device_heartbeat(self, device_id: str, instance_id: str) -> dict[str, Any]:
+        now = self._now()
+        expires_at = now + timedelta(seconds=self._terminal_presence_seconds)
+        with self._write_transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM terminal_presence WHERE device_id = ?", (device_id,)
+            ).fetchone()
+            if row is None or row["instance_id"] != instance_id:
+                return self._instance_conflict()
+            connection.execute(
+                "UPDATE terminal_presence SET last_seen_at = ?, online_expires_at = ? WHERE device_id = ?",
+                (self._stamp(now), self._stamp(expires_at), device_id),
+            )
+            return self._terminal_presence_result(self._presence_or_raise(connection, device_id))
+
+    def terminal_presence(self, device_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM terminal_presence WHERE device_id = ?", (device_id,)
+            ).fetchone()
+            return self._terminal_presence_result(row) if row is not None else None
+
+    def terminal_poll_snapshot(
+        self, device_id: str, call_id: str | None = None
+    ) -> dict[str, Any] | None:
+        """Return the content-free registered-terminal call view after expiry settlement."""
+        with self._write_transaction() as connection:
+            row = self._routed_terminal_call(connection, device_id, call_id)
+            if row is None:
+                return None
+            self._settle_if_expired(connection, row)
+            row = self._call_or_raise(connection, row["call_id"])
+            return {
+                "call_id": row["call_id"],
+                "state": row["state"],
+                "version": row["version"],
+                "ring_deadline": row["ring_deadline"],
+                "terminal_disconnect_deadline": row["terminal_disconnect_deadline"],
+            }
 
     def terminal_action(
         self,
@@ -246,6 +311,32 @@ class CallCoordinator:
             result["owner_device_id"] = row["owner_device_id"]
             result["owner_session_id"] = row["owner_session_id"]
         return result
+
+    def _terminal_presence_result(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "device_id": row["device_id"],
+            "terminal_platform": row["terminal_platform"],
+            "route_device_id": row["route_device_id"],
+            "callback_url": row["callback_url"],
+            "instance_id": row["instance_id"],
+            "gui_ready": bool(row["gui_ready"]),
+            "online": self._now() < self._parse_stamp(row["online_expires_at"]),
+            "last_seen_at": row["last_seen_at"],
+            "online_expires_at": row["online_expires_at"],
+        }
+
+    @staticmethod
+    def _instance_conflict() -> dict[str, Any]:
+        return {"success": False, "status": "instance_conflict", "needs_continuation": False}
+
+    @staticmethod
+    def _presence_or_raise(connection: sqlite3.Connection, device_id: str) -> sqlite3.Row:
+        row = connection.execute(
+            "SELECT * FROM terminal_presence WHERE device_id = ?", (device_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(device_id)
+        return row
 
     @staticmethod
     def _terminal_action_request(
@@ -700,6 +791,11 @@ class CallCoordinator:
             CREATE TABLE IF NOT EXISTS continuation_operations (
                 caller_id TEXT NOT NULL, request_id TEXT NOT NULL, payload TEXT NOT NULL,
                 result TEXT NOT NULL, PRIMARY KEY (caller_id, request_id)
+            );
+            CREATE TABLE IF NOT EXISTS terminal_presence (
+                device_id TEXT PRIMARY KEY, terminal_platform TEXT NOT NULL,
+                route_device_id TEXT NOT NULL, callback_url TEXT, instance_id TEXT NOT NULL,
+                gui_ready INTEGER NOT NULL, last_seen_at TEXT NOT NULL, online_expires_at TEXT NOT NULL
             );
             """
         )
