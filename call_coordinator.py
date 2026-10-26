@@ -128,31 +128,12 @@ class CallCoordinator:
 
     def terminal_state(self, device_id: str, call_id: str | None = None) -> dict[str, Any] | None:
         with self._write_transaction() as connection:
-            if call_id is None:
-                row = connection.execute(
-                    "SELECT * FROM calls WHERE desktop_route_device_id = ? "
-                    "AND state IN ('ringing', 'accepted') ORDER BY created_at LIMIT 1",
-                    (device_id,),
-                ).fetchone()
-            else:
-                row = connection.execute(
-                    "SELECT * FROM calls WHERE call_id = ? AND desktop_route_device_id = ?",
-                    (call_id, device_id),
-                ).fetchone()
+            row = self._routed_terminal_call(connection, device_id, call_id)
             if row is None:
                 return None
             self._settle_if_expired(connection, row)
             row = self._call_or_raise(connection, row["call_id"])
-            result: dict[str, Any] = {
-                "call_id": row["call_id"],
-                "call_state": row["state"],
-                "version": row["version"],
-                "ring_deadline": row["ring_deadline"],
-            }
-            if row["owner_device_id"] is not None:
-                result["owner_device_id"] = row["owner_device_id"]
-                result["owner_session_id"] = row["owner_session_id"]
-            return result
+            return self._terminal_state_result(row)
 
     def terminal_action(
         self,
@@ -166,50 +147,115 @@ class CallCoordinator:
         """Perform a routed terminal action without allowing an outsider to reserve an ID."""
         if kind not in {"accept", "decline"}:
             raise ValueError(kind)
-        scoped_action_id = f"terminal:{device_id}:{call_id}:{action_id}"
-        action: dict[str, Any]
-        if kind == "accept":
-            action = asdict(
-                AcceptCall(call_id, scoped_action_id, device_id, session_id or "", "desktop", terminal_platform)
-            )
-        else:
-            action = asdict(DeclineCall(call_id, scoped_action_id, device_id))
+        scoped_action_id, action = self._terminal_action_request(
+            kind, call_id, device_id, action_id, session_id, terminal_platform
+        )
         payload = self._canonical(action)
         with self._write_transaction() as connection:
-            row = connection.execute(
-                "SELECT * FROM calls WHERE call_id = ? AND "
-                "(desktop_route_device_id = ? OR desktop_route_device_id IS NULL)",
-                (call_id, device_id),
-            ).fetchone()
+            row = self._routed_terminal_call(connection, device_id, call_id, allow_unrouted=True)
             if row is None:
-                existing = connection.execute(
-                    "SELECT state FROM calls WHERE call_id = ?", (call_id,)
-                ).fetchone()
-                if existing is not None and existing["state"] == "accepted":
-                    return {
-                        "success": False,
-                        "status": "ownership_conflict",
-                        "needs_continuation": False,
-                    }
-                return None
-            replay = connection.execute(
-                "SELECT payload, result FROM action_operations WHERE action_id = ?",
-                (scoped_action_id,),
-            ).fetchone()
+                return self._terminal_route_denial(connection, call_id)
+            # Route authorization deliberately precedes replay lookup.  An
+            # unauthorized credential must neither observe nor reserve an ID.
+            replay = self._action_replay(connection, scoped_action_id, payload)
             if replay is not None:
-                if replay["payload"] == payload:
-                    return self._decode(replay["result"])
-                return self._conflict()
-            self._settle_if_expired(connection, row)
-            row = self._call_or_raise(connection, call_id)
-            if row["state"] != "ringing":
-                return self._current_result(connection, row)
-            result = self._accept(connection, row, action) if kind == "accept" else self._decline(connection, row)
-            connection.execute(
-                "INSERT INTO action_operations (action_id, payload, result) VALUES (?, ?, ?)",
-                (scoped_action_id, payload, self._canonical(result)),
+                return replay
+            return self._perform_terminal_action(
+                connection, kind, call_id, scoped_action_id, payload, action, row
             )
-            return result
+
+    def _routed_terminal_call(
+        self,
+        connection: sqlite3.Connection,
+        device_id: str,
+        call_id: str | None,
+        *,
+        allow_unrouted: bool = False,
+    ) -> sqlite3.Row | None:
+        """Look up only a call visible to this terminal credential."""
+        if call_id is None:
+            return connection.execute(
+                "SELECT * FROM calls WHERE desktop_route_device_id = ? "
+                "AND state IN ('ringing', 'accepted') ORDER BY created_at LIMIT 1",
+                (device_id,),
+            ).fetchone()
+        route_predicate = "(desktop_route_device_id = ? OR desktop_route_device_id IS NULL)" if allow_unrouted else "desktop_route_device_id = ?"
+        return connection.execute(
+            f"SELECT * FROM calls WHERE call_id = ? AND {route_predicate}",
+            (call_id, device_id),
+        ).fetchone()
+
+    @staticmethod
+    def _terminal_state_result(row: sqlite3.Row) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "call_id": row["call_id"],
+            "call_state": row["state"],
+            "version": row["version"],
+            "ring_deadline": row["ring_deadline"],
+        }
+        if row["owner_device_id"] is not None:
+            result["owner_device_id"] = row["owner_device_id"]
+            result["owner_session_id"] = row["owner_session_id"]
+        return result
+
+    @staticmethod
+    def _terminal_action_request(
+        kind: str,
+        call_id: str,
+        device_id: str,
+        action_id: str,
+        session_id: str | None,
+        terminal_platform: str,
+    ) -> tuple[str, dict[str, Any]]:
+        scoped_action_id = f"terminal:{device_id}:{call_id}:{action_id}"
+        if kind == "accept":
+            return scoped_action_id, asdict(
+                AcceptCall(call_id, scoped_action_id, device_id, session_id or "", "desktop", terminal_platform)
+            )
+        return scoped_action_id, asdict(DeclineCall(call_id, scoped_action_id, device_id))
+
+    def _terminal_route_denial(
+        self, connection: sqlite3.Connection, call_id: str
+    ) -> dict[str, Any] | None:
+        existing = connection.execute("SELECT state FROM calls WHERE call_id = ?", (call_id,)).fetchone()
+        if existing is not None and existing["state"] == "accepted":
+            return {"success": False, "status": "ownership_conflict", "needs_continuation": False}
+        return None
+
+    def _action_replay(
+        self, connection: sqlite3.Connection, action_id: str, payload: str
+    ) -> dict[str, Any] | None:
+        replay = connection.execute(
+            "SELECT payload, result FROM action_operations WHERE action_id = ?", (action_id,)
+        ).fetchone()
+        if replay is None:
+            return None
+        if replay["payload"] == payload:
+            return self._decode(replay["result"])
+        return self._conflict()
+
+    def _perform_terminal_action(
+        self,
+        connection: sqlite3.Connection,
+        kind: str,
+        call_id: str,
+        action_id: str,
+        payload: str,
+        action: dict[str, Any],
+        row: sqlite3.Row,
+    ) -> dict[str, Any]:
+        # Expiry settlement occurs only after authorization and replay lookup.
+        self._settle_if_expired(connection, row)
+        row = self._call_or_raise(connection, call_id)
+        if row["state"] != "ringing":
+            return self._current_result(connection, row)
+        result = self._accept(connection, row, action) if kind == "accept" else self._decline(connection, row)
+        # Persist the replay snapshot only after the routed mutation succeeds.
+        connection.execute(
+            "INSERT INTO action_operations (action_id, payload, result) VALUES (?, ?, ?)",
+            (action_id, payload, self._canonical(result)),
+        )
+        return result
 
     def continue_call(
         self,

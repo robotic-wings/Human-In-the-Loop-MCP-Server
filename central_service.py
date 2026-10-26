@@ -483,14 +483,10 @@ class _TerminalGateway:
     def action(
         self, identity: _TerminalIdentity, kind: str, call_id: str, payload: object
     ) -> tuple[HTTPStatus, dict[str, object]]:
-        if not isinstance(payload, dict):
+        request = self._action_request(kind, payload)
+        if request is None:
             return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
-        action_id = payload.get("action_id")
-        session_id = payload.get("owner_session_id")
-        if not isinstance(action_id, str) or not action_id:
-            return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
-        if kind == "accept" and (not isinstance(session_id, str) or not session_id):
-            return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
+        action_id, session_id = request
         result = self._coordinator.terminal_action(
             kind,
             call_id,
@@ -499,6 +495,22 @@ class _TerminalGateway:
             session_id if isinstance(session_id, str) else None,
             identity.terminal_platform,
         )
+        return self._action_response(result)
+
+    @staticmethod
+    def _action_request(kind: str, payload: object) -> tuple[str, str | None] | None:
+        if not isinstance(payload, dict):
+            return None
+        action_id = payload.get("action_id")
+        session_id = payload.get("owner_session_id")
+        if not isinstance(action_id, str) or not action_id:
+            return None
+        if kind == "accept" and (not isinstance(session_id, str) or not session_id):
+            return None
+        return action_id, session_id if isinstance(session_id, str) else None
+
+    @staticmethod
+    def _action_response(result: dict[str, Any] | None) -> tuple[HTTPStatus, dict[str, object]]:
         if result is None:
             return HTTPStatus.NOT_FOUND, {"error": "not found"}
         if result["status"] in {"request_conflict", "ownership_conflict"}:
@@ -511,20 +523,16 @@ class _PublicHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path
-        terminal = self._terminal_gateway()
-        if terminal is None:
-            self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+        authenticated = self._terminal_request_identity()
+        if authenticated is None:
             return
-        identity = terminal.identity_for(self.headers.get("Authorization"))
-        if identity is None:
-            self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
-            return
+        terminal, identity = authenticated
         if path == "/api/terminals/state":
             self._send_json(HTTPStatus.OK, terminal.state(identity))
             return
-        parts = path.split("/")
-        if len(parts) == 4 and parts[:3] == ["", "api", "calls"] and parts[3]:
-            state = terminal.state(identity, parts[3])
+        call_id = self._terminal_state_call_id(path)
+        if call_id is not None:
+            state = terminal.state(identity, call_id)
             if state["call"] is None:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
             else:
@@ -570,28 +578,55 @@ class _PublicHandler(BaseHTTPRequestHandler):
         terminal = getattr(self.server, "terminal_gateway", None)
         return terminal if isinstance(terminal, _TerminalGateway) else None
 
-    def _terminal_post(self, path: str) -> None:
+    def _terminal_request_identity(self) -> tuple[_TerminalGateway, _TerminalIdentity] | None:
         terminal = self._terminal_gateway()
         if terminal is None:
             self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
-            return
+            return None
         identity = terminal.identity_for(self.headers.get("Authorization"))
         if identity is None:
             self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
-            return
+            return None
+        return terminal, identity
+
+    @staticmethod
+    def _terminal_state_call_id(path: str) -> str | None:
+        parts = path.split("/")
+        if len(parts) == 4 and parts[:3] == ["", "api", "calls"] and parts[3]:
+            return parts[3]
+        return None
+
+    @staticmethod
+    def _terminal_action_route(path: str) -> tuple[str, str] | None:
         parts = path.split("/")
         if len(parts) != 5 or parts[:3] != ["", "api", "calls"] or parts[4] not in {"accept", "decline"}:
-            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
-            return
+            return None
+        return parts[3], parts[4]
+
+    def _terminal_request_body(self) -> tuple[bool, object]:
         try:
             content_length = int(self.headers.get("Content-Length", ""))
             if content_length < 0 or content_length > 1_000_000:
                 raise ValueError
-            payload = json.loads(self.rfile.read(content_length).decode("utf-8"))
+            return True, json.loads(self.rfile.read(content_length).decode("utf-8"))
         except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid request"})
+            return False, None
+
+    def _terminal_post(self, path: str) -> None:
+        authenticated = self._terminal_request_identity()
+        if authenticated is None:
             return
-        status, response = terminal.action(identity, parts[4], parts[3], payload)
+        terminal, identity = authenticated
+        route = self._terminal_action_route(path)
+        if route is None:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+            return
+        body_ok, payload = self._terminal_request_body()
+        if not body_ok:
+            return
+        call_id, kind = route
+        status, response = terminal.action(identity, kind, call_id, payload)
         self._send_json(status, response)
 
     def log_message(self, _format: str, *_args: object) -> None:
