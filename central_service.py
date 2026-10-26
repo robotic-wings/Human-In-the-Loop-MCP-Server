@@ -1023,6 +1023,35 @@ class _OperatorGateway:
             return HTTPStatus.CONFLICT, result
         return HTTPStatus.OK, result
 
+    def submit(
+        self, session: str | None, csrf: str | None, origin: str | None, host: str | None,
+        call_id: str, payload: object,
+    ) -> tuple[HTTPStatus, dict[str, object]]:
+        if (
+            not self._session_matches(session, csrf)
+            or origin != f"https://{self._expected_host}"
+            or host != self._expected_host
+            or not isinstance(payload, dict)
+        ):
+            return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+        submission_id, user_input = payload.get("submission_id"), payload.get("user_input")
+        if not isinstance(submission_id, str) or not isinstance(user_input, str) or not user_input:
+            return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
+        result = self._coordinator.submit_terminal_text(
+            call_id, "iphone_web", session or "", submission_id, user_input, operator_owner=True
+        )
+        if result is None:
+            # An authenticated operator may know a ringing call without owning
+            # it; do not turn that into a content-bearing response.
+            return HTTPStatus.CONFLICT, {"error": "cannot submit"}
+        if result["status"] == "invalid_submission":
+            return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
+        if result["status"] == "request_conflict":
+            return HTTPStatus.CONFLICT, result
+        if result["status"] != "answered":
+            return HTTPStatus.CONFLICT, {"status": result["status"]}
+        return HTTPStatus.OK, result
+
     def _session_exists(self, session: str | None) -> bool:
         with self._lock:
             return isinstance(session, str) and session in self._sessions
@@ -1100,6 +1129,14 @@ class _PublicHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path
         operator = self._operator_gateway()
+        # The phone and desktop protocols deliberately share the call action
+        # paths.  A device bearer credential selects the desktop protocol;
+        # only browser requests without one may enter the operator-session
+        # boundary below.  This keeps a configured phone gateway from
+        # shadowing existing desktop submissions and actions.
+        if self.headers.get("Authorization") and path != "/mcp":
+            self._terminal_post(path)
+            return
         if operator is not None and path == "/api/operator/login":
             body_ok, payload = self._terminal_request_body()
             if not body_ok:
@@ -1122,6 +1159,17 @@ class _PublicHandler(BaseHTTPRequestHandler):
             status, response = operator.accept(
                 self._operator_session(), self.headers.get("X-CSRF-Token"), self.headers.get("Origin"),
                 self.headers.get("Host"), web_accept_id, action_id,
+            )
+            self._send_json(status, response)
+            return
+        web_submission_id = self._web_submission_call_id(path)
+        if operator is not None and web_submission_id is not None:
+            body_ok, payload = self._terminal_request_body()
+            if not body_ok:
+                return
+            status, response = operator.submit(
+                self._operator_session(), self.headers.get("X-CSRF-Token"), self.headers.get("Origin"),
+                self.headers.get("Host"), web_submission_id, payload,
             )
             self._send_json(status, response)
             return
@@ -1224,6 +1272,13 @@ class _PublicHandler(BaseHTTPRequestHandler):
     def _web_accept_call_id(path: str) -> str | None:
         parts = path.split("/")
         if len(parts) == 5 and parts[:3] == ["", "api", "calls"] and parts[3] and parts[4] == "accept":
+            return parts[3]
+        return None
+
+    @staticmethod
+    def _web_submission_call_id(path: str) -> str | None:
+        parts = path.split("/")
+        if len(parts) == 5 and parts[:3] == ["", "api", "calls"] and parts[3] and parts[4] == "submissions":
             return parts[3]
         return None
 

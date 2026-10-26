@@ -100,7 +100,10 @@ def test_tls_accepted_iphone_owner_submits_once_replays_and_agent_reads_final_ev
     assert first[2]["user_input"] == "final phone answer"
     assert first[2]["handled_on"] == "iphone_web"
     assert first[2]["terminal_platform"] == "ios"
-    assert busy_released["status"] == "ringing"
+    assert busy_released["status"] == "heartbeat"
+    assert busy_released["call_state"] == "ringing"
+    assert isinstance(busy_released["call_id"], str)
+    assert busy_released["call_id"]
     assert _structured(continuation_response) == first[2]
     assert call == ("answered", "iphone_web", "iphone_web", "ios")
     assert [event[0] for event in events] == [1, 2]
