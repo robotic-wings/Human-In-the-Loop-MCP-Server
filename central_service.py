@@ -579,6 +579,20 @@ class _TerminalGateway:
             return HTTPStatus.BAD_REQUEST, result
         return HTTPStatus.OK, result
 
+    def read_draft(
+        self, identity: _TerminalIdentity, call_id: str, owner_session_id: str | None
+    ) -> tuple[HTTPStatus, dict[str, object]]:
+        if not isinstance(owner_session_id, str) or not owner_session_id:
+            return HTTPStatus.NOT_FOUND, {"error": "not found"}
+        draft = self._coordinator.read_terminal_draft(
+            call_id, identity.device_id, owner_session_id
+        )
+        if draft is None:
+            # Do not distinguish an unknown call from a call that belongs to
+            # another terminal or accepted session.
+            return HTTPStatus.NOT_FOUND, {"error": "not found"}
+        return HTTPStatus.OK, draft
+
     @staticmethod
     def _action_request(kind: str, payload: object) -> tuple[str, str | None] | None:
         if not isinstance(payload, dict):
@@ -605,6 +619,24 @@ class _PublicHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path
+        draft_call_id = self._terminal_draft_call_id(path)
+        if draft_call_id is not None:
+            terminal = self._terminal_gateway()
+            identity = (
+                terminal.identity_for(self.headers.get("Authorization"))
+                if terminal is not None
+                else None
+            )
+            if identity is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+                return
+            status, response = terminal.read_draft(
+                identity,
+                draft_call_id,
+                self.headers.get("X-Owner-Session-Id"),
+            )
+            self._send_json(status, response)
+            return
         authenticated = self._terminal_request_identity()
         if authenticated is None:
             return
@@ -691,6 +723,18 @@ class _PublicHandler(BaseHTTPRequestHandler):
     def _terminal_state_call_id(path: str) -> str | None:
         parts = path.split("/")
         if len(parts) == 4 and parts[:3] == ["", "api", "calls"] and parts[3]:
+            return parts[3]
+        return None
+
+    @staticmethod
+    def _terminal_draft_call_id(path: str) -> str | None:
+        parts = path.split("/")
+        if (
+            len(parts) == 5
+            and parts[:3] == ["", "api", "calls"]
+            and parts[3]
+            and parts[4] == "draft"
+        ):
             return parts[3]
         return None
 
