@@ -52,8 +52,11 @@ class CallCoordinator:
     single active call and a single owner are preserved across threads/restarts.
     """
 
-    def __init__(self, database_path: Path, *, clock: Clock) -> None:
+    def __init__(
+        self, database_path: Path, *, clock: Clock, terminal_disconnect_seconds: int = 180
+    ) -> None:
         self._clock = clock
+        self._terminal_disconnect_seconds = terminal_disconnect_seconds
         self._lock = threading.RLock()
         self._connection = sqlite3.connect(database_path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
@@ -166,6 +169,38 @@ class CallCoordinator:
             return self._perform_terminal_action(
                 connection, kind, call_id, scoped_action_id, payload, action, row
             )
+
+    def terminal_heartbeat(
+        self,
+        call_id: str,
+        device_id: str,
+        owner_session_id: str,
+        legacy_route_device_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Refresh one accepted terminal session without creating an operation replay."""
+        with self._write_transaction() as connection:
+            row = self._routed_terminal_call(
+                connection, device_id, call_id, legacy_route_device_id=legacy_route_device_id
+            )
+            if row is None:
+                return None
+            if (
+                row["owner_device_id"] != device_id
+                or row["owner_session_id"] != owner_session_id
+            ):
+                return self._ownership_conflict()
+            self._settle_if_expired(connection, row)
+            row = self._call_or_raise(connection, call_id)
+            if row["state"] != "accepted":
+                return self._current_result(connection, row)
+            now = self._now()
+            disconnect_deadline = now + timedelta(seconds=self._terminal_disconnect_seconds)
+            connection.execute(
+                "UPDATE calls SET terminal_last_seen_at = ?, terminal_disconnect_deadline = ? "
+                "WHERE call_id = ?",
+                (self._stamp(now), self._stamp(disconnect_deadline), call_id),
+            )
+            return self._current_result(connection, self._call_or_raise(connection, call_id))
 
     def _routed_terminal_call(
         self,
@@ -365,15 +400,20 @@ class CallCoordinator:
             owner_device_id=action["device_id"],
             owner_session_id=action["session_id"],
         )
+        now = self._now()
+        disconnect_deadline = now + timedelta(seconds=self._terminal_disconnect_seconds)
         connection.execute(
             "UPDATE calls SET state = 'accepted', owner_device_id = ?, "
-            "owner_session_id = ?, handled_on = ?, terminal_platform = ?, version = version + 1 "
+            "owner_session_id = ?, handled_on = ?, terminal_platform = ?, "
+            "terminal_last_seen_at = ?, terminal_disconnect_deadline = ?, version = version + 1 "
             "WHERE call_id = ?",
             (
                 action["device_id"],
                 action["session_id"],
                 action["handled_on"],
                 action["terminal_platform"],
+                self._stamp(now),
+                self._stamp(disconnect_deadline),
                 row["call_id"],
             ),
         )
@@ -398,7 +438,9 @@ class CallCoordinator:
         return result
 
     def _settle_all_expired(self, connection: sqlite3.Connection) -> list[dict[str, Any]]:
-        rows = connection.execute("SELECT * FROM calls WHERE state = 'ringing'").fetchall()
+        rows = connection.execute(
+            "SELECT * FROM calls WHERE state IN ('ringing', 'accepted')"
+        ).fetchall()
         settled: list[dict[str, Any]] = []
         for row in rows:
             result = self._settle_if_expired(connection, row)
@@ -409,20 +451,44 @@ class CallCoordinator:
     def _settle_if_expired(
         self, connection: sqlite3.Connection, row: sqlite3.Row
     ) -> dict[str, Any] | None:
-        if row["state"] != "ringing" or self._now() < self._parse_stamp(row["ring_deadline"]):
+        if row["state"] == "ringing":
+            if self._now() < self._parse_stamp(row["ring_deadline"]):
+                return None
+            result = self._envelope(
+                status="not_accepted",
+                call_state="not_accepted",
+                interaction_id=row["interaction_id"],
+                call_id=row["call_id"],
+                reason="ring_timeout",
+                retryable=True,
+                retry_after_seconds=60,
+                event_seq=1,
+            )
+            connection.execute(
+                "UPDATE calls SET state = 'not_accepted', version = version + 1 WHERE call_id = ?",
+                (row["call_id"],),
+            )
+            self._add_event(connection, row["call_id"], result)
+            return result
+        if row["state"] != "accepted" or row["terminal_disconnect_deadline"] is None:
+            return None
+        if self._now() < self._parse_stamp(row["terminal_disconnect_deadline"]):
             return None
         result = self._envelope(
-            status="not_accepted",
-            call_state="not_accepted",
+            status="disconnected",
+            call_state="disconnected",
             interaction_id=row["interaction_id"],
             call_id=row["call_id"],
-            reason="ring_timeout",
-            retryable=True,
-            retry_after_seconds=60,
-            event_seq=1,
+            reason="terminal_disconnected",
+            event_seq=(self._event_seq(connection, row["call_id"]) or 0) + 1,
+            handled_on=row["handled_on"],
+            terminal_platform=row["terminal_platform"],
+            owner_device_id=row["owner_device_id"],
+            owner_session_id=row["owner_session_id"],
+            ring_deadline=row["ring_deadline"],
         )
         connection.execute(
-            "UPDATE calls SET state = 'not_accepted', version = version + 1 WHERE call_id = ?",
+            "UPDATE calls SET state = 'disconnected', version = version + 1 WHERE call_id = ?",
             (row["call_id"],),
         )
         self._add_event(connection, row["call_id"], result)
@@ -431,7 +497,7 @@ class CallCoordinator:
     def _current_result(
         self, connection: sqlite3.Connection, row: sqlite3.Row
     ) -> dict[str, Any]:
-        if row["state"] in {"declined", "not_accepted"}:
+        if row["state"] in {"declined", "not_accepted", "disconnected"}:
             event = connection.execute(
                 "SELECT result FROM events WHERE call_id = ? ORDER BY event_seq DESC LIMIT 1",
                 (row["call_id"],),
@@ -449,6 +515,7 @@ class CallCoordinator:
             event_seq=self._event_seq(connection, row["call_id"]),
             owner_device_id=row["owner_device_id"],
             owner_session_id=row["owner_session_id"],
+            version=row["version"],
         )
 
     @staticmethod
@@ -490,7 +557,7 @@ class CallCoordinator:
         event = self._event_after(connection, row["call_id"], after_event_seq)
         if event is not None:
             return self._decode(event["result"])
-        if row["state"] in {"declined", "not_accepted"}:
+        if row["state"] in {"declined", "not_accepted", "disconnected"}:
             return self._current_result(connection, row)
         return self._envelope(
             status="heartbeat",
@@ -503,6 +570,7 @@ class CallCoordinator:
             event_seq=after_event_seq,
             owner_device_id=row["owner_device_id"],
             owner_session_id=row["owner_session_id"],
+            version=row["version"],
             ring_deadline=row["ring_deadline"],
         )
 
@@ -559,7 +627,8 @@ class CallCoordinator:
                 interaction_id TEXT NOT NULL, message TEXT NOT NULL, state TEXT NOT NULL,
                 created_at TEXT NOT NULL, ring_deadline TEXT NOT NULL, version INTEGER NOT NULL,
                 owner_device_id TEXT, owner_session_id TEXT, handled_on TEXT,
-                terminal_platform TEXT, desktop_route_device_id TEXT
+                terminal_platform TEXT, desktop_route_device_id TEXT,
+                terminal_last_seen_at TEXT, terminal_disconnect_deadline TEXT
             );
             CREATE TABLE IF NOT EXISTS create_operations (
                 caller_id TEXT NOT NULL, request_id TEXT NOT NULL, payload TEXT NOT NULL,
@@ -583,6 +652,10 @@ class CallCoordinator:
         }
         if "desktop_route_device_id" not in columns:
             self._connection.execute("ALTER TABLE calls ADD COLUMN desktop_route_device_id TEXT")
+        if "terminal_last_seen_at" not in columns:
+            self._connection.execute("ALTER TABLE calls ADD COLUMN terminal_last_seen_at TEXT")
+        if "terminal_disconnect_deadline" not in columns:
+            self._connection.execute("ALTER TABLE calls ADD COLUMN terminal_disconnect_deadline TEXT")
         self._connection.commit()
 
     def _write_transaction(self) -> "_Transaction":
@@ -610,6 +683,10 @@ class CallCoordinator:
     @staticmethod
     def _conflict() -> dict[str, Any]:
         return {"success": False, "status": "request_conflict", "needs_continuation": False}
+
+    @staticmethod
+    def _ownership_conflict() -> dict[str, Any]:
+        return {"success": False, "status": "ownership_conflict", "needs_continuation": False}
 
     @staticmethod
     def _invalid_cursor() -> dict[str, Any]:
@@ -642,6 +719,7 @@ class CallCoordinator:
         event_seq: int | None = None,
         owner_device_id: str | None = None,
         owner_session_id: str | None = None,
+        version: int | None = None,
         ring_deadline: str | None = None,
     ) -> dict[str, Any]:
         return {
@@ -661,6 +739,7 @@ class CallCoordinator:
             "message": None,
             "owner_device_id": owner_device_id,
             "owner_session_id": owner_session_id,
+            "version": version,
             "ring_deadline": ring_deadline,
         }
 
