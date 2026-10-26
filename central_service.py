@@ -407,6 +407,28 @@ class _McpGateway:
             return self._call_tool(request_id, payload.get("params"), caller_id)
         return _rpc_error(request_id, -32601, "method not found")
 
+    def may_wait_for_tool_response(self, payload: object) -> bool:
+        """Return whether this request can enter a bounded agent wait leg.
+
+        This is deliberately a pure transport hint: the normal tool handler
+        remains the authority for validation, admission, and all durable state.
+        """
+        if not isinstance(payload, dict) or payload.get("method") != "tools/call":
+            return False
+        params = payload.get("params")
+        if not isinstance(params, dict):
+            return False
+        name = params.get("name")
+        arguments = params.get("arguments")
+        if not isinstance(name, str) or not isinstance(arguments, dict):
+            return False
+        spec = _find_tool_spec(name)
+        return (
+            spec is not None
+            and spec.name not in {"read_interaction_result", "read_interaction_attachment", "cancel_interaction"}
+            and _valid_client_timeout(arguments.get("client_timeout_seconds"))
+        )
+
     def _call_tool(
         self, rpc_id: object, params: object, caller_id: str
     ) -> dict[str, object]:
@@ -906,6 +928,7 @@ class _TerminalGateway:
 
 class _PublicHandler(BaseHTTPRequestHandler):
     server_version = "HITLCentralService/0.1"
+    protocol_version = "HTTP/1.1"
 
     def do_GET(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path
@@ -968,6 +991,13 @@ class _PublicHandler(BaseHTTPRequestHandler):
                 HTTPStatus.BAD_REQUEST, _rpc_error(None, -32700, "parse error")
             )
             return
+        if gateway.may_wait_for_tool_response(payload):
+            # A bounded wait result can take a full safe leg.  Commit the HTTP
+            # response start first, then deliver the ordinary JSON-RPC result
+            # as a chunk when the coordinator resolves that leg.
+            self._start_chunked_json(HTTPStatus.OK)
+            self._write_chunked_json(gateway.handle(payload, caller_id))
+            return
         self._send_json(HTTPStatus.OK, gateway.handle(payload, caller_id))
 
     def do_PUT(self) -> None:  # noqa: N802
@@ -993,6 +1023,20 @@ class _PublicHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
+
+    def _start_chunked_json(self, status: HTTPStatus) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        self.wfile.flush()
+
+    def _write_chunked_json(self, payload: dict[str, object]) -> None:
+        encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        self.wfile.write(f"{len(encoded):X}\r\n".encode("ascii"))
+        self.wfile.write(encoded)
+        self.wfile.write(b"\r\n0\r\n\r\n")
+        self.wfile.flush()
 
     def _terminal_gateway(self) -> _TerminalGateway | None:
         terminal = getattr(self.server, "terminal_gateway", None)
