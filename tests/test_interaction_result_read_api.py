@@ -223,6 +223,33 @@ def test_tls_result_reader_pages_unicode_with_budget_and_keeps_archive_immutable
             cursor = page["next_cursor"]
 
         assert "".join(parts) == body  # Joined pages prove no Unicode character was split.
+        # A different valid budget may change page boundaries, never the logical answer.
+        wide_budget = _MIN_RESULT_BUDGET * 2
+        wide_cursor: int | None = None
+        wide_parts: list[str] = []
+        while True:
+            wide_page = _read_result(
+                port,
+                certificate,
+                "test-token-alpha",
+                created["interaction_id"],
+                result_id,
+                wide_cursor,
+                wide_budget,
+            )
+            assert wide_page["success"] is True
+            assert wide_page["result_id"] == result_id
+            assert wide_page["full_length"] == len(body)
+            assert len(json.dumps(wide_page, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= wide_budget
+            wide_parts.append(wide_page["body"])
+            if wide_page["complete"]:
+                assert wide_page["next_cursor"] is None
+                break
+            assert isinstance(wide_page["next_cursor"], int)
+            assert wide_page["next_cursor"] > (wide_cursor or 0)
+            wide_cursor = wide_page["next_cursor"]
+
+        assert "".join(wide_parts) == body
         assert page["attachments"] == [
             {
                 "attachment_id": uploaded["attachment"]["attachment_id"],
