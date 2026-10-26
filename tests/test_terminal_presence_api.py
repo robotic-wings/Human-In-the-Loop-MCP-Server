@@ -155,13 +155,19 @@ def test_device_presence_is_durable_and_never_refreshes_accepted_call_liveness(
 
     reopened = CallCoordinator(database, clock=clock)
     restored = reopened.terminal_presence("desktop-registered")
-    clock.advance(21)
+    # The successful heartbeat at t+10 established its own t+40 presence
+    # deadline.  Presence remains live before that deadline and expires only
+    # after it; neither observation can change the accepted call liveness.
+    clock.advance(29)
+    still_online = reopened.terminal_presence("desktop-registered")
+    clock.advance(2)
     expired = reopened.terminal_presence("desktop-registered")
     final_call = persisted_call(database, call_id)
     reopened.close()
 
     assert restored["instance_id"] == "instance-a"
     assert restored["online"] is True
+    assert still_online["online"] is True
     assert expired["online"] is False
     assert final_call["state"] == "accepted"
     assert final_call["terminal_disconnect_deadline"] == accepted["terminal_disconnect_deadline"]
