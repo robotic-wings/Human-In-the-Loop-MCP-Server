@@ -17,7 +17,7 @@ from pathlib import Path
 from threading import Barrier, Thread
 from typing import Any
 
-from call_coordinator import AcceptCall, CallCoordinator, CreateCall
+from call_coordinator import AcceptCall, CallCoordinator, CreateCall, DeclineCall
 from test_central_mcp_gateway import (
     _call,
     _free_port,
@@ -425,7 +425,84 @@ def test_terminal_action_id_replays_exactly_and_changed_request_conflicts_withou
     assert event == first
 
 
-def test_terminal_actions_settle_expiry_before_accept_decline_race_without_revival(
+def test_expiry_settlement_precedes_concurrent_terminal_actions_without_revival(
+    tmp_path: Path,
+) -> None:
+    """Terminal actions cannot beat a deadline merely because scheduling is late."""
+    clock = _MutableClock(datetime(2020, 1, 1, tzinfo=UTC))
+    database = tmp_path / "expiry-actions.sqlite3"
+    coordinator = CallCoordinator(database, clock=clock)
+    created = coordinator.create_call(
+        CreateCall("operator-default", "agent-alpha", "expiry-actions", "create", "old", 1)
+    )
+    clock.advance(seconds=1)
+    barrier = Barrier(3)
+    outcomes: list[dict[str, Any]] = []
+
+    def accept() -> None:
+        barrier.wait()
+        outcomes.append(
+            coordinator.accept_call(
+                AcceptCall(
+                    call_id=created["call_id"],
+                    action_id="late-accept",
+                    device_id="desktop-registered",
+                    session_id="late-session",
+                    handled_on="desktop",
+                    terminal_platform="windows",
+                )
+            )
+        )
+
+    def decline() -> None:
+        barrier.wait()
+        outcomes.append(
+            coordinator.decline_call(
+                DeclineCall(
+                    call_id=created["call_id"],
+                    action_id="late-decline",
+                    actor_id="desktop-registered",
+                )
+            )
+        )
+
+    first, second = Thread(target=accept), Thread(target=decline)
+    first.start()
+    second.start()
+    barrier.wait()
+    first.join()
+    second.join()
+    final = coordinator.get_call(created["call_id"])
+    events = coordinator.events_for(created["call_id"])
+    coordinator.close()
+
+    assert len(outcomes) == 2
+    assert all(result["status"] == "not_accepted" for result in outcomes)
+    assert final["call_state"] == "not_accepted"
+    assert final["owner_device_id"] is None
+    assert final["owner_session_id"] is None
+    assert len(events) == 1
+    assert events[0]["status"] == "not_accepted"
+    assert events[0]["reason"] == "ring_timeout"
+    assert events[0]["event_seq"] == 1
+
+    reopened = CallCoordinator(database, clock=clock)
+    late_accept = reopened.accept_call(
+        AcceptCall(
+            call_id=created["call_id"],
+            action_id="late-accept-after-restart",
+            device_id="desktop-registered",
+            session_id="restart-session",
+            handled_on="desktop",
+            terminal_platform="windows",
+        )
+    )
+    assert late_accept["status"] == "not_accepted"
+    assert reopened.events_for(created["call_id"]) == events
+    reopened.close()
+
+
+def test_terminal_endpoint_actions_settle_expiry_before_accept_decline_race_without_revival(
     tmp_path: Path,
 ) -> None:
     """The HTTP actions must share the coordinator's transactional expiry rule."""
