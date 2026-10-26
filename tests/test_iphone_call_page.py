@@ -55,9 +55,13 @@ def test_tls_call_page_routes_anonymous_to_content_free_login_and_escapes_author
     assert "private page detail" not in str(anonymous[2])
     assert authorized[0] == 200
     assert authorized[1]["content-type"].startswith("text/html")
+    assert "&lt;script&gt;alert" in str(authorized[2])
     assert "<script>alert" not in str(authorized[2])
     assert "private page detail" not in str(authorized[2])
     assert f"/api/calls/{call_id}" in str(authorized[2])
+    assert f"/api/calls/{call_id}/accept" in str(authorized[2])
+    assert f"/api/calls/{call_id}/decline" in str(authorized[2])
+    assert "X-CSRF-Token" in str(authorized[2])
     assert "https://" not in str(authorized[2])
     assert "http://" not in str(authorized[2])
 
