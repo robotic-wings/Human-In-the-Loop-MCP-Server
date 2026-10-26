@@ -76,23 +76,23 @@ def test_tls_owner_text_submission_persists_final_answer_releases_busy_and_mcp_r
         submission = _submit(
             port, certificate, call_id, "desktop-token", "owner-text", "text-1", "final text"
         )
-        assert submission == (
-            200,
-            {
-                "success": True,
-                "status": "answered",
-                "call_state": "answered",
-                "reason": None,
-                "human_action": True,
-                "needs_continuation": False,
-                "interaction_id": created["interaction_id"],
-                "call_id": call_id,
-                "event_seq": 2,
-                "handled_on": "desktop",
-                "terminal_platform": "windows",
-                "user_input": "final text",
-            },
-        )
+        assert submission[0] == 200
+        assert {key: value for key, value in submission[1].items() if key != "result_id"} == {
+            "success": True,
+            "status": "answered",
+            "call_state": "answered",
+            "reason": None,
+            "human_action": True,
+            "needs_continuation": False,
+            "interaction_id": created["interaction_id"],
+            "call_id": call_id,
+            "event_seq": 2,
+            "handled_on": "desktop",
+            "terminal_platform": "windows",
+            "user_input": "final text",
+        }
+        assert isinstance(submission[1]["result_id"], str)
+        assert submission[1]["result_id"]
         busy_released = _create_ringing_call(port, certificate, "submission-next")
         _, continuation_response, _ = _post(
             port,
