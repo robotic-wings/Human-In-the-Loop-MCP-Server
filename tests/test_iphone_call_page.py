@@ -117,6 +117,7 @@ def test_tls_call_page_offers_plain_text_only_to_current_iphone_owner_and_is_dis
         assert isinstance(call_id, str)
         owner_cookie, owner_csrf = _login(port, certificate)
         other_cookie, _ = _login(port, certificate)
+        ringing_page = _html_get(port, certificate, f"/calls/{call_id}", owner_cookie)
         accepted = _accept(
             port, certificate, call_id, "browser-page-accept", _headers(owner_cookie, owner_csrf, port)
         )
@@ -130,6 +131,12 @@ def test_tls_call_page_offers_plain_text_only_to_current_iphone_owner_and_is_dis
     finally:
         _stop(process)
 
+    assert ringing_page[0] == 200
+    assert ringing_page[1]["content-type"].startswith("text/html")
+    assert f"/api/calls/{call_id}/accept" in str(ringing_page[2])
+    assert f"/api/calls/{call_id}/decline" in str(ringing_page[2])
+    assert "<textarea" not in str(ringing_page[2])
+    assert f"/api/calls/{call_id}/submissions" not in str(ringing_page[2])
     assert accepted[0] == 200
     assert submitted[0] == 200
     assert owner_page[0] == other_page[0] == 200
