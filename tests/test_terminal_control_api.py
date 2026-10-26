@@ -94,7 +94,7 @@ def _wait_for_tls_gateway(process: Any, port: int, certificate: Path) -> None:
         if process.poll() is not None:
             raise AssertionError("central service stopped before its TLS gateway was ready")
         try:
-            status, _, _ = _post(
+            status, response, _ = _post(
                 port,
                 certificate,
                 _rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}}),
@@ -103,8 +103,17 @@ def _wait_for_tls_gateway(process: Any, port: int, certificate: Path) -> None:
         except OSError:
             time.sleep(0.03)
             continue
+        # A listener can transiently accept TCP while its application layer is
+        # still unavailable.  Retry only that explicit readiness condition;
+        # endpoint, authentication, and other contract responses must remain
+        # visible to the test.
+        if status == 503:
+            time.sleep(0.03)
+            continue
         if status != 200:
             raise AssertionError(f"central service rejected authenticated TLS readiness: {status}")
+        if "error" in response or "result" not in response:
+            raise AssertionError("central service returned malformed authenticated TLS readiness")
         return
     raise AssertionError("central service did not accept a TLS request after restart")
 
