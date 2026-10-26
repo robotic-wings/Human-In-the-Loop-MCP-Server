@@ -439,6 +439,8 @@ class CallCoordinator:
         task_version: int = 0,
         attachment_ids: list[str] | None = None,
         legacy_route_device_id: str | None = None,
+        *,
+        operator_owner: bool = False,
     ) -> dict[str, Any] | None:
         """Persist one final simple-text answer from the accepted owner session.
 
@@ -474,11 +476,17 @@ class CallCoordinator:
             }
         )
         with self._write_transaction() as connection:
-            row = self._routed_terminal_call(
-                connection, device_id, call_id, legacy_route_device_id=legacy_route_device_id
-            )
-            if row is None:
-                return None
+            if operator_owner:
+                try:
+                    row = self._call_or_raise(connection, call_id)
+                except KeyError:
+                    return None
+            else:
+                row = self._routed_terminal_call(
+                    connection, device_id, call_id, legacy_route_device_id=legacy_route_device_id
+                )
+                if row is None:
+                    return None
             if row["owner_device_id"] != device_id or row["owner_session_id"] != owner_session_id:
                 return None
             replay = connection.execute(
@@ -1322,10 +1330,17 @@ class CallCoordinator:
             owner_session_id=row["owner_session_id"],
             ring_deadline=row["ring_deadline"],
         )
-        connection.execute(
-            "UPDATE calls SET state = 'disconnected', version = version + 1 WHERE call_id = ?",
-            (row["call_id"],),
-        )
+        if row["handled_on"] == "iphone_web":
+            connection.execute(
+                "UPDATE calls SET state = 'disconnected', owner_session_id = NULL, "
+                "version = version + 1 WHERE call_id = ?",
+                (row["call_id"],),
+            )
+        else:
+            connection.execute(
+                "UPDATE calls SET state = 'disconnected', version = version + 1 WHERE call_id = ?",
+                (row["call_id"],),
+            )
         self._add_event(connection, row["call_id"], result)
         return result
 
