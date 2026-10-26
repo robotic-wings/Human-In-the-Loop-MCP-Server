@@ -246,6 +246,35 @@ def test_continuation_rejects_over_max_cursor_and_wrong_caller_without_leakage(
     assert wrong == unknown
 
 
+def test_identical_continuation_replay_keeps_persisted_ringing_deadline(
+    tmp_path: Path,
+) -> None:
+    clock = _clock()
+    database = tmp_path / "calls.sqlite3"
+    service = CallCoordinator(database, clock=clock)
+    created = service.create_call(_create())
+    call_id = created["call_id"]
+    original_deadline = service.get_call(call_id)["ring_deadline"]
+
+    first = service.continue_call(
+        "agent-alpha", "replay", "interaction-alpha", call_id, 0, "{}"
+    )
+    clock.advance(1)
+    replay = service.continue_call(
+        "agent-alpha", "replay", "interaction-alpha", call_id, 0, "{}"
+    )
+    assert replay == first
+    assert service.get_call(call_id)["ring_deadline"] == original_deadline
+    service.close()
+
+    reopened = CallCoordinator(database, clock=clock)
+    durable_replay = reopened.continue_call(
+        "agent-alpha", "replay", "interaction-alpha", call_id, 0, "{}"
+    )
+    assert durable_replay == first
+    assert reopened.get_call(call_id)["ring_deadline"] == original_deadline
+
+
 def test_manual_scheduler_settles_absolute_ringing_deadline_without_mcp_request(
     tmp_path: Path,
 ) -> None:
