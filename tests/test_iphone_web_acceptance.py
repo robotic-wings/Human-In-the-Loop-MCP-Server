@@ -125,6 +125,20 @@ def test_tls_operator_login_is_opaque_and_call_link_is_not_authority(tmp_path: P
         assert isinstance(call_id, str)
         anonymous = _request(port, certificate, "GET", f"/calls/{call_id}")
         unknown = _request(port, certificate, "GET", "/calls/not-a-real-call")
+        wrong_login = _request(
+            port,
+            certificate,
+            "POST",
+            "/api/operator/login",
+            body={"password": "wrong horse battery staple"},
+        )
+        rejected_read = _request(
+            port,
+            certificate,
+            "GET",
+            f"/api/calls/{call_id}",
+            headers={"Cookie": wrong_login[1].get("set-cookie", "no-session=1")},
+        )
         cookie, _ = _login(port, certificate)
         readable = _request(
             port, certificate, "GET", f"/calls/{call_id}", headers={"Cookie": cookie}
@@ -134,6 +148,9 @@ def test_tls_operator_login_is_opaque_and_call_link_is_not_authority(tmp_path: P
 
     assert anonymous[0] == unknown[0]
     assert anonymous[2] == unknown[2]
+    assert wrong_login[0] in {400, 401, 403}
+    assert "set-cookie" not in wrong_login[1]
+    assert rejected_read[0] in {401, 403, 404}
     assert readable[0] == 200
     assert "private page detail" not in str(readable[2])
 
