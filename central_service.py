@@ -323,6 +323,11 @@ class _TerminalIdentity:
     terminal_platform: str
 
 
+@dataclass(frozen=True)
+class _OversizedTerminalAttachment:
+    owner_session_id: str
+
+
 def _load_terminal_credentials(path: Path | None) -> dict[str, _TerminalIdentity]:
     if path is None:
         return {}
@@ -720,6 +725,25 @@ class _TerminalGateway:
             }
         return HTTPStatus.OK, result
 
+    def reject_attachment_submission_limit(
+        self, identity: _TerminalIdentity, call_id: str, owner_session_id: str
+    ) -> tuple[HTTPStatus, dict[str, object]]:
+        result = self._coordinator.reject_terminal_attachment_submission_limit(
+            call_id,
+            identity.device_id,
+            owner_session_id,
+            self._legacy_route_device_id,
+        )
+        if result is None:
+            return HTTPStatus.NOT_FOUND, {"error": "not found"}
+        if result["status"] == "attachment_rejected":
+            return HTTPStatus.REQUEST_ENTITY_TOO_LARGE, result
+        return HTTPStatus.CONFLICT, {
+            "success": False,
+            "status": result["status"],
+            "reason": result.get("reason"),
+        }
+
     def read_draft(
         self, identity: _TerminalIdentity, call_id: str, owner_session_id: str | None
     ) -> tuple[HTTPStatus, dict[str, object]]:
@@ -926,7 +950,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
 
     def _terminal_attachment_body(
         self,
-    ) -> tuple[bool, tuple[str, str, str, bytes] | None]:
+    ) -> tuple[bool, tuple[str, str, str, bytes] | _OversizedTerminalAttachment | None]:
         """Decode the one-file multipart shape supported by this small slice."""
         content_type = self.headers.get("Content-Type", "")
         marker = "boundary="
@@ -942,8 +966,14 @@ class _PublicHandler(BaseHTTPRequestHandler):
                 if terminal is not None
                 else _DEFAULT_ATTACHMENT_MAX_SUBMISSION_BYTES + _MULTIPART_OVERHEAD_BYTES
             )
-            if not boundary or content_length < 0 or content_length > max_body_bytes:
+            if not boundary or content_length < 0:
                 raise ValueError
+            if content_length > max_body_bytes:
+                prefix = self.rfile.read(min(content_length, _MULTIPART_OVERHEAD_BYTES))
+                owner_session_id = self._multipart_owner_session(prefix, boundary)
+                if owner_session_id is None:
+                    raise ValueError
+                return True, _OversizedTerminalAttachment(owner_session_id)
             raw = self.rfile.read(content_length)
             fields: dict[str, str] = {}
             file_part: tuple[str, str, bytes] | None = None
@@ -978,6 +1008,27 @@ class _PublicHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid request"})
             return False, None
 
+    @staticmethod
+    def _multipart_owner_session(raw: bytes, boundary: str) -> str | None:
+        delimiter = b"--" + boundary.encode("ascii")
+        for part in raw.split(delimiter)[1:]:
+            part = part.strip(b"\r\n")
+            if not part or part == b"--" or b"\r\n\r\n" not in part:
+                continue
+            headers, body = part.split(b"\r\n\r\n", 1)
+            disposition = next(
+                (line for line in headers.split(b"\r\n") if line.lower().startswith(b"content-disposition:")),
+                b"",
+            )
+            if b'name="owner_session_id"' not in disposition:
+                continue
+            try:
+                value = body.rstrip(b"\r\n").decode("utf-8")
+            except UnicodeDecodeError:
+                return None
+            return value or None
+        return None
+
     def _terminal_post(self, path: str) -> None:
         authenticated = self._terminal_request_identity()
         if authenticated is None:
@@ -997,6 +1048,12 @@ class _PublicHandler(BaseHTTPRequestHandler):
         if attachment_call_id is not None:
             body_ok, attachment = self._terminal_attachment_body()
             if not body_ok or attachment is None:
+                return
+            if isinstance(attachment, _OversizedTerminalAttachment):
+                status, response = terminal.reject_attachment_submission_limit(
+                    identity, attachment_call_id, attachment.owner_session_id
+                )
+                self._send_json(status, response)
                 return
             owner_session_id, original_name, media_type, content = attachment
             status, response = terminal.upload_attachment(
