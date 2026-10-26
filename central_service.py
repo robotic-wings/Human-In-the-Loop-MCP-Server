@@ -1317,8 +1317,17 @@ class _PublicHandler(BaseHTTPRequestHandler):
         return (
             "<!doctype html><meta charset=utf-8><title>Operator call</title><main>"
             f"<p>{message}</p><p data-state=\"{escaped_state}\">{escaped_state}</p>{controls}"
-            f"<script>const csrf=document.currentScript.dataset.csrf;</script>"
             f"<meta name=\"X-CSRF-Token\" content=\"{csrf_value}\">"
+            "<script>"
+            "const csrf=document.querySelector('meta[name=\"X-CSRF-Token\"]').content;"
+            "document.querySelectorAll('button[data-action]').forEach((button)=>"
+            "button.addEventListener('click',async()=>{"
+            "const response=await fetch(button.dataset.endpoint,{method:'POST',credentials:'same-origin',"
+            "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},"
+            "body:JSON.stringify({action_id:crypto.randomUUID()})});"
+            "if(response.ok)location.reload();"
+            "}));"
+            "</script>"
             f"<a href=\"{endpoint}\">Refresh</a></main>"
         )
     def _start_chunked_json(self, status: HTTPStatus) -> None:
