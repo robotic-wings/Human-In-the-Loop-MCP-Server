@@ -252,6 +252,14 @@ _TOOL_SPECS = (
         },
         ("request_id",),
     ),
+    _tool_spec(
+        "cancel_interaction",
+        {
+            "interaction_id": {"type": "string"},
+            "request_id": {"type": "string"},
+        },
+        ("interaction_id", "call_id", "request_id"),
+    ),
 )
 
 
@@ -364,6 +372,10 @@ class _McpGateway:
             for field, _ in spec.properties
             if field in arguments
         }
+        if spec.name == "cancel_interaction":
+            return self._cancel_interaction_tool(
+                rpc_id, safe_arguments, caller_id, request_id
+            )
         interaction_key = "task_id" if spec.name == "assign_task_to_human" else "interaction_id"
         call_id = safe_arguments.get("call_id")
         after_event_seq = safe_arguments.get("after_event_seq")
@@ -396,6 +408,30 @@ class _McpGateway:
                 desktop_route_device_id=self._desktop_route_device_id,
             )
         )
+        return _rpc_result(rpc_id, {"content": [], "structuredContent": envelope})
+
+    def _cancel_interaction_tool(
+        self,
+        rpc_id: object,
+        arguments: dict[str, object],
+        caller_id: str,
+        request_id: str,
+    ) -> dict[str, object]:
+        interaction_id = arguments.get("interaction_id")
+        call_id = arguments.get("call_id")
+        if (
+            not isinstance(interaction_id, str)
+            or not interaction_id
+            or not isinstance(call_id, str)
+            or not call_id
+        ):
+            return _rpc_error(rpc_id, -32602, "invalid params")
+        envelope = self._coordinator.cancel_interaction(
+            caller_id, interaction_id, call_id, request_id
+        )
+        if envelope["status"] == "session_not_found":
+            # Unknown and foreign calls must remain indistinguishable.
+            return _rpc_error(rpc_id, -32602, "invalid params")
         return _rpc_result(rpc_id, {"content": [], "structuredContent": envelope})
 
     def _continue_tool_call(

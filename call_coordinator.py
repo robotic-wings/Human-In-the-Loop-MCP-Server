@@ -501,6 +501,46 @@ class CallCoordinator:
             )
             return result
 
+    def cancel_interaction(
+        self, caller_id: str, interaction_id: str, call_id: str, request_id: str
+    ) -> dict[str, Any]:
+        """End one active call on behalf of its original authenticated caller.
+
+        The caller-scoped operation snapshot is deliberately separate from
+        terminal action replay records: an agent request id must be durable
+        across restarts without granting any terminal-style ownership.
+        """
+        operation_payload = self._canonical(
+            {"interaction_id": interaction_id, "call_id": call_id}
+        )
+        with self._write_transaction() as connection:
+            replay = connection.execute(
+                "SELECT payload, result FROM cancel_operations "
+                "WHERE caller_id = ? AND request_id = ?",
+                (caller_id, request_id),
+            ).fetchone()
+            if replay is not None:
+                if replay["payload"] == operation_payload:
+                    return self._decode(replay["result"])
+                return self._conflict()
+            row = self._owned_call(connection, caller_id, interaction_id, call_id)
+            if row is None:
+                return self._session_not_found()
+
+            self._settle_if_expired(connection, row)
+            row = self._call_or_raise(connection, call_id)
+            result = (
+                self._agent_cancel(connection, row)
+                if row["state"] in {"ringing", "accepted"}
+                else self._current_result(connection, row)
+            )
+            connection.execute(
+                "INSERT INTO cancel_operations (caller_id, request_id, payload, result) "
+                "VALUES (?, ?, ?, ?)",
+                (caller_id, request_id, operation_payload, self._canonical(result)),
+            )
+            return result
+
     def get_call(self, call_id: str) -> dict[str, Any]:
         with self._write_transaction() as connection:
             row = self._call_or_raise(connection, call_id)
@@ -613,6 +653,29 @@ class CallCoordinator:
             handled_on=row["handled_on"],
             terminal_platform=row["terminal_platform"],
             event_seq=(self._event_seq(connection, row["call_id"]) or 0) + 1,
+            owner_device_id=row["owner_device_id"],
+            owner_session_id=row["owner_session_id"],
+            ring_deadline=row["ring_deadline"],
+        )
+        connection.execute(
+            "UPDATE calls SET state = 'cancelled', version = version + 1 WHERE call_id = ?",
+            (row["call_id"],),
+        )
+        self._add_event(connection, row["call_id"], result)
+        return result
+
+    def _agent_cancel(
+        self, connection: sqlite3.Connection, row: sqlite3.Row
+    ) -> dict[str, Any]:
+        result = self._envelope(
+            status="cancelled",
+            call_state="cancelled",
+            interaction_id=row["interaction_id"],
+            call_id=row["call_id"],
+            reason="agent_cancelled",
+            event_seq=(self._event_seq(connection, row["call_id"]) or 0) + 1,
+            handled_on=row["handled_on"],
+            terminal_platform=row["terminal_platform"],
             owner_device_id=row["owner_device_id"],
             owner_session_id=row["owner_session_id"],
             ring_deadline=row["ring_deadline"],
@@ -767,7 +830,7 @@ class CallCoordinator:
         event = self._event_after(connection, row["call_id"], after_event_seq)
         if event is not None:
             return self._decode(event["result"])
-        if row["state"] in {"declined", "not_accepted", "disconnected"}:
+        if row["state"] in {"declined", "not_accepted", "disconnected", "cancelled"}:
             return self._current_result(connection, row)
         return self._envelope(
             status="heartbeat",
@@ -853,6 +916,10 @@ class CallCoordinator:
                 PRIMARY KEY (call_id, event_seq), FOREIGN KEY (call_id) REFERENCES calls(call_id)
             );
             CREATE TABLE IF NOT EXISTS continuation_operations (
+                caller_id TEXT NOT NULL, request_id TEXT NOT NULL, payload TEXT NOT NULL,
+                result TEXT NOT NULL, PRIMARY KEY (caller_id, request_id)
+            );
+            CREATE TABLE IF NOT EXISTS cancel_operations (
                 caller_id TEXT NOT NULL, request_id TEXT NOT NULL, payload TEXT NOT NULL,
                 result TEXT NOT NULL, PRIMARY KEY (caller_id, request_id)
             );
