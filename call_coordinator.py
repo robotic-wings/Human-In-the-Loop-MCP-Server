@@ -443,10 +443,10 @@ class CallCoordinator:
                 "handled_on": row["handled_on"],
                 "terminal_platform": row["terminal_platform"],
                 "user_input": user_input,
+                "result_id": str(uuid.uuid4()),
             }
             if has_attachment_ids:
                 result["attachment_ids"] = attachment_ids
-                result["result_id"] = str(uuid.uuid4())
             connection.execute(
                 "UPDATE calls SET state = 'answered', version = version + 1 WHERE call_id = ?",
                 (call_id,),
