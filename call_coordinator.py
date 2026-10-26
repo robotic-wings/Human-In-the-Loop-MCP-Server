@@ -193,13 +193,7 @@ class CallCoordinator:
             row = self._call_or_raise(connection, call_id)
             if row["state"] != "accepted":
                 return self._current_result(connection, row)
-            now = self._now()
-            disconnect_deadline = now + timedelta(seconds=self._terminal_disconnect_seconds)
-            connection.execute(
-                "UPDATE calls SET terminal_last_seen_at = ?, terminal_disconnect_deadline = ? "
-                "WHERE call_id = ?",
-                (self._stamp(now), self._stamp(disconnect_deadline), call_id),
-            )
+            self._refresh_terminal_liveness(connection, call_id)
             return self._current_result(connection, self._call_or_raise(connection, call_id))
 
     def _routed_terminal_call(
@@ -401,22 +395,20 @@ class CallCoordinator:
             owner_session_id=action["session_id"],
         )
         now = self._now()
-        disconnect_deadline = now + timedelta(seconds=self._terminal_disconnect_seconds)
         connection.execute(
             "UPDATE calls SET state = 'accepted', owner_device_id = ?, "
             "owner_session_id = ?, handled_on = ?, terminal_platform = ?, "
-            "terminal_last_seen_at = ?, terminal_disconnect_deadline = ?, version = version + 1 "
+            "version = version + 1 "
             "WHERE call_id = ?",
             (
                 action["device_id"],
                 action["session_id"],
                 action["handled_on"],
                 action["terminal_platform"],
-                self._stamp(now),
-                self._stamp(disconnect_deadline),
                 row["call_id"],
             ),
         )
+        self._refresh_terminal_liveness(connection, row["call_id"], now=now)
         self._add_event(connection, row["call_id"], result)
         return result
 
@@ -452,25 +444,37 @@ class CallCoordinator:
         self, connection: sqlite3.Connection, row: sqlite3.Row
     ) -> dict[str, Any] | None:
         if row["state"] == "ringing":
-            if self._now() < self._parse_stamp(row["ring_deadline"]):
-                return None
-            result = self._envelope(
-                status="not_accepted",
-                call_state="not_accepted",
-                interaction_id=row["interaction_id"],
-                call_id=row["call_id"],
-                reason="ring_timeout",
-                retryable=True,
-                retry_after_seconds=60,
-                event_seq=1,
-            )
-            connection.execute(
-                "UPDATE calls SET state = 'not_accepted', version = version + 1 WHERE call_id = ?",
-                (row["call_id"],),
-            )
-            self._add_event(connection, row["call_id"], result)
-            return result
-        if row["state"] != "accepted" or row["terminal_disconnect_deadline"] is None:
+            return self._settle_ringing_timeout(connection, row)
+        if row["state"] == "accepted":
+            return self._settle_terminal_disconnect(connection, row)
+        return None
+
+    def _settle_ringing_timeout(
+        self, connection: sqlite3.Connection, row: sqlite3.Row
+    ) -> dict[str, Any] | None:
+        if self._now() < self._parse_stamp(row["ring_deadline"]):
+            return None
+        result = self._envelope(
+            status="not_accepted",
+            call_state="not_accepted",
+            interaction_id=row["interaction_id"],
+            call_id=row["call_id"],
+            reason="ring_timeout",
+            retryable=True,
+            retry_after_seconds=60,
+            event_seq=1,
+        )
+        connection.execute(
+            "UPDATE calls SET state = 'not_accepted', version = version + 1 WHERE call_id = ?",
+            (row["call_id"],),
+        )
+        self._add_event(connection, row["call_id"], result)
+        return result
+
+    def _settle_terminal_disconnect(
+        self, connection: sqlite3.Connection, row: sqlite3.Row
+    ) -> dict[str, Any] | None:
+        if row["terminal_disconnect_deadline"] is None:
             return None
         if self._now() < self._parse_stamp(row["terminal_disconnect_deadline"]):
             return None
@@ -493,6 +497,17 @@ class CallCoordinator:
         )
         self._add_event(connection, row["call_id"], result)
         return result
+
+    def _refresh_terminal_liveness(
+        self, connection: sqlite3.Connection, call_id: str, *, now: datetime | None = None
+    ) -> None:
+        now = now or self._now()
+        disconnect_deadline = now + timedelta(seconds=self._terminal_disconnect_seconds)
+        connection.execute(
+            "UPDATE calls SET terminal_last_seen_at = ?, terminal_disconnect_deadline = ? "
+            "WHERE call_id = ?",
+            (self._stamp(now), self._stamp(disconnect_deadline), call_id),
+        )
 
     def _current_result(
         self, connection: sqlite3.Connection, row: sqlite3.Row
