@@ -287,7 +287,6 @@ class CallCoordinator:
                 row["state"] != "accepted"
                 or row["owner_device_id"] != device_id
                 or row["owner_session_id"] != owner_session_id
-                or row["draft_body"] is None
             ):
                 return None
             return {"body": row["draft_body"], "draft_version": row["draft_version"]}
