@@ -1052,6 +1052,27 @@ class _OperatorGateway:
             return HTTPStatus.CONFLICT, {"status": result["status"]}
         return HTTPStatus.OK, result
 
+    def decline(
+        self, session: str | None, csrf: str | None, origin: str | None, host: str | None,
+        call_id: str, action_id: object,
+    ) -> tuple[HTTPStatus, dict[str, object]]:
+        if (
+            not self._session_matches(session, csrf)
+            or origin != f"https://{self._expected_host}"
+            or host != self._expected_host
+            or not isinstance(action_id, str)
+            or not action_id
+        ):
+            return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+        result = self._coordinator.decline_iphone_call(call_id, session or "", action_id)
+        if result is None:
+            return HTTPStatus.CONFLICT, {"error": "cannot decline"}
+        if result["status"] == "request_conflict":
+            return HTTPStatus.CONFLICT, result
+        if result["status"] != "declined":
+            return HTTPStatus.CONFLICT, result
+        return HTTPStatus.OK, result
+
     def _session_exists(self, session: str | None) -> bool:
         with self._lock:
             return isinstance(session, str) and session in self._sessions
@@ -1159,6 +1180,18 @@ class _PublicHandler(BaseHTTPRequestHandler):
             status, response = operator.accept(
                 self._operator_session(), self.headers.get("X-CSRF-Token"), self.headers.get("Origin"),
                 self.headers.get("Host"), web_accept_id, action_id,
+            )
+            self._send_json(status, response)
+            return
+        web_decline_id = self._web_decline_call_id(path)
+        if operator is not None and web_decline_id is not None:
+            body_ok, payload = self._terminal_request_body()
+            if not body_ok:
+                return
+            action_id = payload.get("action_id") if isinstance(payload, dict) else None
+            status, response = operator.decline(
+                self._operator_session(), self.headers.get("X-CSRF-Token"), self.headers.get("Origin"),
+                self.headers.get("Host"), web_decline_id, action_id,
             )
             self._send_json(status, response)
             return
@@ -1279,6 +1312,13 @@ class _PublicHandler(BaseHTTPRequestHandler):
     def _web_submission_call_id(path: str) -> str | None:
         parts = path.split("/")
         if len(parts) == 5 and parts[:3] == ["", "api", "calls"] and parts[3] and parts[4] == "submissions":
+            return parts[3]
+        return None
+
+    @staticmethod
+    def _web_decline_call_id(path: str) -> str | None:
+        parts = path.split("/")
+        if len(parts) == 5 and parts[:3] == ["", "api", "calls"] and parts[3] and parts[4] == "decline":
             return parts[3]
         return None
 
