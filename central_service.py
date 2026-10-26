@@ -10,6 +10,7 @@ import argparse
 import json
 import ssl
 import sys
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -126,6 +127,11 @@ def _thaw_schema(value: object) -> object:
 def _tool_spec(
     name: str, properties: dict[str, dict[str, object]], required: tuple[str, ...]
 ) -> ToolSpec:
+    properties = {
+        **properties,
+        "call_id": {"type": "string"},
+        "after_event_seq": {"type": "integer", "minimum": 0},
+    }
     return ToolSpec(
         name,
         tuple(
@@ -306,6 +312,37 @@ class _McpGateway:
             if field in arguments
         }
         interaction_key = "task_id" if spec.name == "assign_task_to_human" else "interaction_id"
+        call_id = safe_arguments.get("call_id")
+        after_event_seq = safe_arguments.get("after_event_seq")
+        if call_id is not None or after_event_seq is not None:
+            interaction_id = safe_arguments.get(interaction_key)
+            if (
+                not isinstance(interaction_id, str)
+                or not interaction_id
+                or not isinstance(call_id, str)
+                or not call_id
+                or not isinstance(after_event_seq, int)
+                or isinstance(after_event_seq, bool)
+                or after_event_seq < 0
+            ):
+                return _rpc_error(rpc_id, -32602, "invalid params")
+            continuation_payload = json.dumps(
+                {"tool": spec.name, "arguments": safe_arguments},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            envelope = self._coordinator.continue_call(
+                caller_id,
+                request_id,
+                interaction_id,
+                call_id,
+                after_event_seq,
+                continuation_payload,
+            )
+            if not envelope["success"]:
+                return _rpc_error(rpc_id, -32602, "invalid params")
+            return _rpc_result(rpc_id, {"content": [], "structuredContent": envelope})
         interaction_id = safe_arguments.get(interaction_key)
         if not isinstance(interaction_id, str) or not interaction_id:
             interaction_id = request_id
@@ -401,6 +438,45 @@ def _unauthorized_response() -> dict[str, object]:
     return _rpc_error(None, -32001, "unauthorized")
 
 
+class RingingDeadlineScheduler:
+    """Bounded polling worker that settles persisted ringing deadlines."""
+
+    def __init__(
+        self,
+        coordinator: CallCoordinator,
+        clock: object,
+        *,
+        poll_interval_seconds: float = 0.25,
+    ) -> None:
+        self._coordinator = coordinator
+        self._clock = clock
+        self._poll_interval_seconds = poll_interval_seconds
+        self._stopped = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def tick(self) -> list[dict[str, Any]]:
+        return self._coordinator.recover_and_settle()
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run, name="ringing-deadline-scheduler", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stopped.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self._poll_interval_seconds + 1)
+            self._thread = None
+
+    def _run(self) -> None:
+        while not self._stopped.is_set():
+            self.tick()
+            self._stopped.wait(self._poll_interval_seconds)
+
+
 def _build_tls_context(config: ServiceConfig) -> ssl.SSLContext:
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(certfile=config.certfile, keyfile=config.keyfile)
@@ -426,8 +502,10 @@ def _serve(config: ServiceConfig) -> None:
     credentials = _load_agent_credentials(config.agent_credentials_file)
     config.data_dir.mkdir(parents=True, exist_ok=True)
     coordinator = CallCoordinator(config.data_dir / "calls.sqlite3", clock=_SystemClock())
+    scheduler = RingingDeadlineScheduler(coordinator, _SystemClock())
     try:
         coordinator.recover_and_settle()
+        scheduler.start()
         gateway = _McpGateway(coordinator, credentials)
         server = _create_secure_server(config, context, gateway)
         try:
@@ -435,6 +513,7 @@ def _serve(config: ServiceConfig) -> None:
         finally:
             server.server_close()
     finally:
+        scheduler.stop()
         coordinator.close()
 
 
