@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import html
 import hashlib
 import hmac
 import json
@@ -1004,6 +1005,17 @@ class _OperatorGateway:
             return None
         return self._coordinator.operator_call_state(call_id)
 
+    def page(self, session: str | None, call_id: str) -> tuple[dict[str, object] | None, str | None]:
+        """Return the authenticated page view and its CSRF value without new state."""
+        with self._lock:
+            csrf = self._sessions.get(session or "")
+        if csrf is None:
+            return None, None
+        state = self._coordinator.operator_call_page(call_id)
+        if state is not None:
+            state["_page_session_matches_owner"] = state.get("owner_session_id") == session
+        return state, csrf
+
     def accept(
         self, session: str | None, csrf: str | None, origin: str | None, host: str | None,
         call_id: str, action_id: object,
@@ -1104,11 +1116,13 @@ class _PublicHandler(BaseHTTPRequestHandler):
         operator = self._operator_gateway()
         web_call_id = self._web_call_id(path)
         if operator is not None and web_call_id is not None:
+            if path.startswith("/calls/"):
+                state, csrf = operator.page(self._operator_session(), web_call_id)
+                self._send_html(self._operator_call_page(web_call_id, state, csrf))
+                return
             state = operator.read(self._operator_session(), web_call_id)
             if state is None:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
-            elif path.startswith("/calls/"):
-                self._send_json(HTTPStatus.OK, {"call": state})
             else:
                 self._send_json(HTTPStatus.OK, {"call": state})
             return
@@ -1263,6 +1277,59 @@ class _PublicHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def _send_html(self, body: str) -> None:
+        encoded = body.encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    @staticmethod
+    def _operator_call_page(call_id: str, state: dict[str, object] | None, csrf: str | None) -> str:
+        """Render a deliberately small, escaped HTML view over existing APIs."""
+        if state is None or csrf is None:
+            return "<!doctype html><title>Operator sign in</title><main>Operator sign in required.</main>"
+        escaped_call = html.escape(call_id, quote=True)
+        message = html.escape(_page_summary(state.get("message")), quote=True)
+        call_state = str(state.get("state", state.get("call_state", "unknown")))
+        escaped_state = html.escape(call_state, quote=True)
+        endpoint = f"/api/calls/{escaped_call}"
+        csrf_value = html.escape(csrf, quote=True)
+        controls = ""
+        if call_state == "ringing":
+            controls = (
+                f'<button data-action="accept" data-endpoint="{endpoint}/accept">Accept</button>'
+                f'<button data-action="decline" data-endpoint="{endpoint}/decline">Decline</button>'
+            )
+        elif call_state == "accepted":
+            if state.get("owner_device_id") == "iphone_web" and state.get("_page_session_matches_owner"):
+                # The caller has already authenticated this exact browser
+                # session; the form does not create a second ownership path.
+                controls = (
+                    f'<form data-endpoint="{endpoint}/submissions"><textarea name="user_input"></textarea>'
+                    '<input name="submission_id"><button>Submit</button></form>'
+                )
+            else:
+                controls = "<p>Another device is handling this call.</p>"
+        else:
+            controls = f"<p>Call is {escaped_state}.</p>"
+        return (
+            "<!doctype html><meta charset=utf-8><title>Operator call</title><main>"
+            f"<p>{message}</p><p data-state=\"{escaped_state}\">{escaped_state}</p>{controls}"
+            f"<meta name=\"X-CSRF-Token\" content=\"{csrf_value}\">"
+            "<script>"
+            "const csrf=document.querySelector('meta[name=\"X-CSRF-Token\"]').content;"
+            "document.querySelectorAll('button[data-action]').forEach((button)=>"
+            "button.addEventListener('click',async()=>{"
+            "const response=await fetch(button.dataset.endpoint,{method:'POST',credentials:'same-origin',"
+            "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},"
+            "body:JSON.stringify({action_id:crypto.randomUUID()})});"
+            "if(response.ok)location.reload();"
+            "}));"
+            "</script>"
+            f"<a href=\"{endpoint}\">Refresh</a></main>"
+        )
     def _start_chunked_json(self, status: HTTPStatus) -> None:
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -1539,6 +1606,21 @@ class _PublicHandler(BaseHTTPRequestHandler):
 
     def log_message(self, _format: str, *_args: object) -> None:
         """Avoid writing request contents to diagnostic output."""
+
+
+def _page_summary(message: object) -> str:
+    """Display a narrow prompt summary instead of a serialized tool request."""
+    if not isinstance(message, str):
+        return ""
+    try:
+        decoded = json.loads(message)
+    except json.JSONDecodeError:
+        return message
+    if isinstance(decoded, dict):
+        title = decoded.get("title")
+        if isinstance(title, str):
+            return title
+    return "Operator call"
 
 
 def _unauthorized_response() -> dict[str, object]:

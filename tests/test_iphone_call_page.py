@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from pathlib import Path
 
@@ -101,6 +102,50 @@ def test_tls_call_page_get_refresh_is_side_effect_free_and_keeps_json_polling(tm
     assert isinstance(polling[2], dict) and polling[2]["call"]["state"] == "ringing"
     assert before == after
     assert event_count_before == event_count_after
+
+
+def test_tls_call_page_controls_drive_existing_protected_actions(tmp_path: Path) -> None:
+    """Exercise the endpoint and CSRF token actually rendered for each button."""
+    port = _free_port()
+    config, certificate = _write_operator_config(tmp_path, port)
+    _configure_phone_route(config)
+    process = _start(config)
+    _wait_for_listener(process, port)
+    try:
+        cookie, _ = _login(port, certificate)
+        declined_call = _create_call(port, certificate, "browser-page-rendered-decline")
+        declined_id = declined_call["call_id"]
+        assert isinstance(declined_id, str)
+        decline_page = _html_get(port, certificate, f"/calls/{declined_id}", cookie)
+        decline_html = str(decline_page[2])
+        decline_csrf = re.search(r'<meta name="X-CSRF-Token" content="([^"]+)">', decline_html)
+        decline_endpoint = re.search(r'<button data-action="decline" data-endpoint="([^"]+)">', decline_html)
+        assert decline_csrf is not None and decline_endpoint is not None
+        declined = _request(
+            port, certificate, "POST", decline_endpoint.group(1),
+            headers=_headers(cookie, decline_csrf.group(1), port), body={"action_id": "page-decline"},
+        )
+        accepted_call = _create_call(port, certificate, "browser-page-rendered-accept")
+        accepted_id = accepted_call["call_id"]
+        assert isinstance(accepted_id, str)
+        accept_page = _html_get(port, certificate, f"/calls/{accepted_id}", cookie)
+        accept_html = str(accept_page[2])
+        csrf = re.search(r'<meta name="X-CSRF-Token" content="([^"]+)">', accept_html)
+        accept_endpoint = re.search(r'<button data-action="accept" data-endpoint="([^"]+)">', accept_html)
+        assert csrf is not None and accept_endpoint is not None
+        accepted = _request(
+            port, certificate, "POST", accept_endpoint.group(1),
+            headers=_headers(cookie, csrf.group(1), port), body={"action_id": "page-accept"},
+        )
+    finally:
+        _stop(process)
+
+    assert decline_page[0] == 200
+    assert declined[0] == 200 and declined[2]["call_state"] == "declined"
+    assert accept_page[0] == 200
+    assert "fetch(button.dataset.endpoint" in accept_html
+    assert "X-CSRF-Token':csrf" in accept_html
+    assert accepted[0] == 200 and accepted[2]["call_state"] == "accepted"
 
 
 def test_tls_call_page_offers_plain_text_only_to_current_iphone_owner_and_is_display_only_otherwise(
