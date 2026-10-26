@@ -64,6 +64,9 @@ class CallCoordinator:
     def __init__(
         self, database_path: Path, *, clock: Clock, terminal_disconnect_seconds: int = 180,
         terminal_presence_seconds: int = 30,
+        attachment_max_file_bytes: int = 20 * 1024 * 1024,
+        attachment_max_submission_bytes: int = 50 * 1024 * 1024,
+        attachment_max_archive_bytes: int = 1024 * 1024 * 1024,
     ) -> None:
         self._clock = clock
         self._terminal_disconnect_seconds = terminal_disconnect_seconds
@@ -74,6 +77,9 @@ class CallCoordinator:
         self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.execute("PRAGMA foreign_keys=ON")
         self._attachment_directory = database_path.parent / "attachments"
+        self._attachment_max_file_bytes = attachment_max_file_bytes
+        self._attachment_max_submission_bytes = attachment_max_submission_bytes
+        self._attachment_max_archive_bytes = attachment_max_archive_bytes
         self._initialize()
 
     def close(self) -> None:
@@ -446,6 +452,18 @@ class CallCoordinator:
             if row["state"] != "accepted":
                 return self._current_result(connection, row)
 
+            byte_count = len(content)
+            if byte_count > self._attachment_max_file_bytes:
+                return self._attachment_rejected("file_limit_exceeded")
+            if byte_count > self._attachment_max_submission_bytes:
+                return self._attachment_rejected("submission_limit_exceeded")
+            archived_bytes = connection.execute(
+                "SELECT COALESCE(SUM(byte_count), 0) FROM attachments"
+            ).fetchone()[0]
+            occupied_bytes = max(archived_bytes, self._attachment_bytes_on_disk())
+            if occupied_bytes + byte_count > self._attachment_max_archive_bytes:
+                return self._attachment_rejected("archive_capacity_exceeded")
+
             attachment_id = str(uuid.uuid4())
             digest = hashlib.sha256(content).hexdigest()
             self._attachment_directory.mkdir(parents=True, exist_ok=True)
@@ -460,7 +478,7 @@ class CallCoordinator:
                     call_id,
                     original_name,
                     media_type,
-                    len(content),
+                    byte_count,
                     digest,
                     str(storage_path),
                 ),
@@ -473,10 +491,23 @@ class CallCoordinator:
                     "attachment_id": attachment_id,
                     "name": original_name,
                     "media_type": media_type,
-                    "byte_count": len(content),
+                    "byte_count": byte_count,
                     "sha256": digest,
                 },
             }
+
+    @staticmethod
+    def _attachment_rejected(reason: str) -> dict[str, Any]:
+        return {"success": False, "status": "attachment_rejected", "reason": reason}
+
+    def _attachment_bytes_on_disk(self) -> int:
+        if not self._attachment_directory.exists():
+            return 0
+        return sum(
+            path.stat().st_size
+            for path in self._attachment_directory.rglob("*")
+            if path.is_file()
+        )
 
     def _routed_terminal_call(
         self,

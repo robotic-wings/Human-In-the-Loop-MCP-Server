@@ -39,6 +39,15 @@ class ServiceConfig:
     agent_credentials_file: Path | None
     terminal_credentials_file: Path | None
     eligible_desktop_device_ids: tuple[str, ...]
+    attachment_max_file_bytes: int
+    attachment_max_submission_bytes: int
+    attachment_max_archive_bytes: int
+
+
+_DEFAULT_ATTACHMENT_MAX_FILE_BYTES = 20 * 1024 * 1024
+_DEFAULT_ATTACHMENT_MAX_SUBMISSION_BYTES = 50 * 1024 * 1024
+_DEFAULT_ATTACHMENT_MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024
+_MULTIPART_OVERHEAD_BYTES = 64 * 1024
 
 
 def _required_string(config: dict[str, object], name: str) -> str:
@@ -46,6 +55,13 @@ def _required_string(config: dict[str, object], name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ConfigurationError(f"config requires a non-empty {name}")
     return value.strip()
+
+
+def _positive_integer(config: dict[str, object], name: str, default: int) -> int:
+    value = config.get(name, default)
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ConfigurationError(f"config {name} must be a positive integer")
+    return value
 
 
 def _load_config(config_path: Path) -> ServiceConfig:
@@ -94,6 +110,15 @@ def _load_config(config_path: Path) -> ServiceConfig:
         raise ConfigurationError("config web_base_url must be an HTTPS URL")
     if not certfile.is_file() or not keyfile.is_file():
         raise ConfigurationError("config HTTPS certificate and key files must exist")
+    attachment_max_file_bytes = _positive_integer(
+        raw, "attachment_max_file_bytes", _DEFAULT_ATTACHMENT_MAX_FILE_BYTES
+    )
+    attachment_max_submission_bytes = _positive_integer(
+        raw, "attachment_max_submission_bytes", _DEFAULT_ATTACHMENT_MAX_SUBMISSION_BYTES
+    )
+    attachment_max_archive_bytes = _positive_integer(
+        raw, "attachment_max_archive_bytes", _DEFAULT_ATTACHMENT_MAX_ARCHIVE_BYTES
+    )
     return ServiceConfig(
         host,
         port,
@@ -104,6 +129,9 @@ def _load_config(config_path: Path) -> ServiceConfig:
         credentials_file,
         terminal_credentials_file,
         tuple(eligible),
+        attachment_max_file_bytes,
+        attachment_max_submission_bytes,
+        attachment_max_archive_bytes,
     )
 
 
@@ -506,10 +534,13 @@ class _TerminalGateway:
         coordinator: CallCoordinator,
         credentials: dict[str, _TerminalIdentity],
         legacy_route_device_id: str | None = None,
+        *,
+        attachment_max_submission_bytes: int = _DEFAULT_ATTACHMENT_MAX_SUBMISSION_BYTES,
     ) -> None:
         self._coordinator = coordinator
         self._credentials = credentials
         self._legacy_route_device_id = legacy_route_device_id
+        self.attachment_max_submission_bytes = attachment_max_submission_bytes
 
     def identity_for(self, authorization: str | None) -> _TerminalIdentity | None:
         if not isinstance(authorization, str) or not authorization.startswith("Bearer "):
@@ -679,6 +710,8 @@ class _TerminalGateway:
             return HTTPStatus.NOT_FOUND, {"error": "not found"}
         if result["status"] == "invalid_attachment":
             return HTTPStatus.BAD_REQUEST, result
+        if result["status"] == "attachment_rejected":
+            return HTTPStatus.REQUEST_ENTITY_TOO_LARGE, result
         if result["status"] != "uploaded":
             return HTTPStatus.CONFLICT, {
                 "success": False,
@@ -903,7 +936,13 @@ class _PublicHandler(BaseHTTPRequestHandler):
         boundary = content_type.split(marker, 1)[1].strip().strip('"')
         try:
             content_length = int(self.headers.get("Content-Length", ""))
-            if not boundary or content_length < 0 or content_length > 1_000_000:
+            terminal = self._terminal_gateway()
+            max_body_bytes = (
+                terminal.attachment_max_submission_bytes + _MULTIPART_OVERHEAD_BYTES
+                if terminal is not None
+                else _DEFAULT_ATTACHMENT_MAX_SUBMISSION_BYTES + _MULTIPART_OVERHEAD_BYTES
+            )
+            if not boundary or content_length < 0 or content_length > max_body_bytes:
                 raise ValueError
             raw = self.rfile.read(content_length)
             fields: dict[str, str] = {}
@@ -1070,7 +1109,13 @@ def _serve(config: ServiceConfig) -> None:
     terminal_credentials = _load_terminal_credentials(config.terminal_credentials_file)
     config.data_dir.mkdir(parents=True, exist_ok=True)
     clock = _SystemClock()
-    coordinator = CallCoordinator(config.data_dir / "calls.sqlite3", clock=clock)
+    coordinator = CallCoordinator(
+        config.data_dir / "calls.sqlite3",
+        clock=clock,
+        attachment_max_file_bytes=config.attachment_max_file_bytes,
+        attachment_max_submission_bytes=config.attachment_max_submission_bytes,
+        attachment_max_archive_bytes=config.attachment_max_archive_bytes,
+    )
     scheduler = RingingDeadlineScheduler(coordinator, clock)
     try:
         coordinator.recover_and_settle()
@@ -1080,7 +1125,10 @@ def _serve(config: ServiceConfig) -> None:
         )
         gateway = _McpGateway(coordinator, credentials, configured_desktop_route_device_id)
         terminal_gateway = _TerminalGateway(
-            coordinator, terminal_credentials, configured_desktop_route_device_id
+            coordinator,
+            terminal_credentials,
+            configured_desktop_route_device_id,
+            attachment_max_submission_bytes=config.attachment_max_submission_bytes,
         )
         server = _create_secure_server(config, context, gateway, terminal_gateway)
         try:
