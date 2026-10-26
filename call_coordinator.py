@@ -219,6 +219,45 @@ class CallCoordinator:
     def decline_call(self, request: DeclineCall) -> dict[str, Any]:
         return self._act("decline", request.call_id, request.action_id, asdict(request))
 
+    def decline_iphone_call(
+        self, call_id: str, session_id: str, action_id: str
+    ) -> dict[str, Any] | None:
+        """Decline a persisted phone-routed ringing call from its browser session.
+
+        Phone route authority is durable call state (the one-shot Bark intent),
+        not merely the presence of a valid operator login.  Authorization is
+        deliberately checked before replay lookup so a phone-excluded call
+        cannot reveal or reserve an action identity.
+        """
+        scoped_action_id = f"iphone:{session_id}:{call_id}:{action_id}"
+        action = asdict(DeclineCall(call_id, scoped_action_id, "iphone_web"))
+        payload = self._canonical(action)
+        with self._write_transaction() as connection:
+            try:
+                row = self._call_or_raise(connection, call_id)
+            except KeyError:
+                return None
+            routed = connection.execute(
+                "SELECT 1 FROM bark_deliveries WHERE call_id = ?", (call_id,)
+            ).fetchone()
+            if routed is None:
+                return None
+            replay = self._action_replay(connection, scoped_action_id, payload)
+            if replay is not None:
+                return replay
+            self._settle_if_expired(connection, row)
+            row = self._call_or_raise(connection, call_id)
+            if row["state"] != "ringing":
+                if row["state"] in {"accepted", "declined"}:
+                    return self._conflict()
+                return self._current_result(connection, row)
+            result = self._decline(connection, row, acted_on="iphone_web")
+            connection.execute(
+                "INSERT INTO action_operations (action_id, payload, result) VALUES (?, ?, ?)",
+                (scoped_action_id, payload, self._canonical(result)),
+            )
+            return result
+
     def terminal_state(self, device_id: str, call_id: str | None = None) -> dict[str, Any] | None:
         with self._write_transaction() as connection:
             row = self._routed_terminal_call(connection, device_id, call_id)
@@ -1202,7 +1241,9 @@ class CallCoordinator:
         self._add_event(connection, row["call_id"], result)
         return result
 
-    def _decline(self, connection: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+    def _decline(
+        self, connection: sqlite3.Connection, row: sqlite3.Row, *, acted_on: str | None = None
+    ) -> dict[str, Any]:
         result = self._envelope(
             status="declined",
             call_state="declined",
@@ -1213,9 +1254,10 @@ class CallCoordinator:
             event_seq=1,
         )
         connection.execute(
-            "UPDATE calls SET state = 'declined', version = version + 1 WHERE call_id = ?",
-            (row["call_id"],),
+            "UPDATE calls SET state = 'declined', acted_on = ?, version = version + 1 WHERE call_id = ?",
+            (acted_on, row["call_id"]),
         )
+        result["acted_on"] = acted_on
         self._add_event(connection, row["call_id"], result)
         return result
 
@@ -1570,6 +1612,7 @@ class CallCoordinator:
                 created_at TEXT NOT NULL, ring_deadline TEXT NOT NULL, version INTEGER NOT NULL,
                 owner_device_id TEXT, owner_session_id TEXT, handled_on TEXT,
                 terminal_platform TEXT, desktop_route_device_id TEXT,
+                acted_on TEXT,
                 terminal_last_seen_at TEXT, terminal_disconnect_deadline TEXT,
                 agent_reconnect_deadline TEXT,
                 wait_leg_deadline TEXT, wait_request_id TEXT,
@@ -1622,6 +1665,8 @@ class CallCoordinator:
         }
         if "desktop_route_device_id" not in columns:
             self._connection.execute("ALTER TABLE calls ADD COLUMN desktop_route_device_id TEXT")
+        if "acted_on" not in columns:
+            self._connection.execute("ALTER TABLE calls ADD COLUMN acted_on TEXT")
         if "terminal_last_seen_at" not in columns:
             self._connection.execute("ALTER TABLE calls ADD COLUMN terminal_last_seen_at TEXT")
         if "terminal_disconnect_deadline" not in columns:
