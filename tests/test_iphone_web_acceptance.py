@@ -184,6 +184,23 @@ def test_tls_call_read_is_side_effect_free_and_accept_requires_same_origin_csrf(
             body={"action_id": "foreign-origin"},
             headers={"Cookie": cookie, "X-CSRF-Token": csrf, "Origin": "https://evil.example"},
         )
+        forged_host = _request(
+            port,
+            certificate,
+            "POST",
+            f"/api/calls/{call_id}/accept",
+            body={"action_id": "forged-host"},
+            headers={
+                "Cookie": cookie,
+                "X-CSRF-Token": csrf,
+                "Origin": f"https://127.0.0.1:{port}",
+                "Host": "evil.example",
+            },
+        )
+        with sqlite3.connect(tmp_path / "data" / "calls.sqlite3") as connection:
+            state_after_forged_host = connection.execute(
+                "SELECT state FROM calls WHERE call_id = ?", (call_id,)
+            ).fetchone()[0]
         accepted = _request(
             port,
             certificate,
@@ -212,6 +229,8 @@ def test_tls_call_read_is_side_effect_free_and_accept_requires_same_origin_csrf(
     assert summary[2]["call"]["state"] == "ringing"
     assert missing_csrf[0] in {400, 403}
     assert foreign_origin[0] in {400, 403}
+    assert forged_host[0] in {400, 403}
+    assert state_after_forged_host == "ringing"
     assert accepted[0] == 200
     assert state_before == "accepted"
     assert owner[0] == "iphone_web"
