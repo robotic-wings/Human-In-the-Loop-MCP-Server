@@ -504,6 +504,22 @@ class _TerminalGateway:
         )
         return self._action_response(result)
 
+    def heartbeat(
+        self, identity: _TerminalIdentity, call_id: str, payload: object
+    ) -> tuple[HTTPStatus, dict[str, object]]:
+        if not isinstance(payload, dict):
+            return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
+        owner_session_id = payload.get("owner_session_id")
+        if not isinstance(owner_session_id, str) or not owner_session_id:
+            return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
+        result = self._coordinator.terminal_heartbeat(
+            call_id,
+            identity.device_id,
+            owner_session_id,
+            self._legacy_route_device_id,
+        )
+        return self._action_response(result)
+
     @staticmethod
     def _action_request(kind: str, payload: object) -> tuple[str, str | None] | None:
         if not isinstance(payload, dict):
@@ -606,7 +622,11 @@ class _PublicHandler(BaseHTTPRequestHandler):
     @staticmethod
     def _terminal_action_route(path: str) -> tuple[str, str] | None:
         parts = path.split("/")
-        if len(parts) != 5 or parts[:3] != ["", "api", "calls"] or parts[4] not in {"accept", "decline"}:
+        if (
+            len(parts) != 5
+            or parts[:3] != ["", "api", "calls"]
+            or parts[4] not in {"accept", "decline", "heartbeat"}
+        ):
             return None
         return parts[3], parts[4]
 
@@ -633,7 +653,10 @@ class _PublicHandler(BaseHTTPRequestHandler):
         if not body_ok:
             return
         call_id, kind = route
-        status, response = terminal.action(identity, kind, call_id, payload)
+        if kind == "heartbeat":
+            status, response = terminal.heartbeat(identity, call_id, payload)
+        else:
+            status, response = terminal.action(identity, kind, call_id, payload)
         self._send_json(status, response)
 
     def log_message(self, _format: str, *_args: object) -> None:
