@@ -10,11 +10,14 @@ import json
 import sqlite3
 import threading
 import time
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
+from call_coordinator import CallCoordinator, CreateCall, DeclineCall
+from central_service import BarkDeliveryScheduler
 from test_central_mcp_gateway import (
     _free_port,
     _post,
@@ -99,6 +102,32 @@ def _stop_receiver(receiver: ThreadingHTTPServer, thread: threading.Thread) -> N
     receiver.shutdown()
     receiver.server_close()
     thread.join(timeout=3)
+
+
+class _WallClock:
+    def now_utc(self) -> datetime:
+        return datetime.now(UTC)
+
+
+class _EndCallAfterBarkClaimCoordinator(CallCoordinator):
+    """Make the persisted post-claim/pre-send window deterministic for this contract."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.call_ended_after_claim = threading.Event()
+
+    def claim_next_bark_delivery(self) -> dict[str, str] | None:
+        delivery = super().claim_next_bark_delivery()
+        if delivery is not None:
+            self.decline_call(
+                DeclineCall(
+                    call_id=delivery["call_id"],
+                    action_id="end-after-bark-claim",
+                    actor_id="operator-default",
+                )
+            )
+            self.call_ended_after_claim.set()
+        return delivery
 
 
 def test_tls_phone_call_persists_one_bark_intent_then_success_without_sensitive_payload(
@@ -210,3 +239,47 @@ def test_bark_business_failure_is_not_recorded_as_success(tmp_path: Path) -> Non
     assert attempts == 1
     assert call_state == "ringing"
     assert terminal_events == 0
+
+
+def test_post_claim_ended_call_suppresses_bark_before_external_request(tmp_path: Path) -> None:
+    """A call that ends after claim cannot begin its already-persisted Bark send."""
+    receiver, receiver_thread, bark_url = _start_receiver()
+    database = tmp_path / "calls.sqlite3"
+    coordinator = _EndCallAfterBarkClaimCoordinator(database, clock=_WallClock())
+    created = coordinator.create_call(
+        CreateCall(
+            operator_id="operator-default",
+            caller_id="agent-alpha",
+            interaction_id="post-claim-end",
+            request_id="post-claim-end-create",
+            message=json.dumps({"arguments": {"title": "Do not deliver"}}),
+            ring_timeout_seconds=60,
+            bark_enabled=True,
+        )
+    )
+    scheduler = BarkDeliveryScheduler(
+        coordinator,
+        bark_url=bark_url,
+        web_base_url="https://central.example.test",
+    )
+    scheduler.start()
+    try:
+        assert coordinator.call_ended_after_claim.wait(timeout=2)
+        # A receiver start proves the scheduler crossed the final pre-send boundary.
+        assert not _BarkReceiver.started.wait(timeout=0.4)
+        with sqlite3.connect(database) as connection:
+            call_state = connection.execute(
+                "SELECT state FROM calls WHERE call_id = ?", (created["call_id"],)
+            ).fetchone()[0]
+            delivery_state = connection.execute(
+                "SELECT state, attempt_count FROM bark_deliveries WHERE call_id = ?",
+                (created["call_id"],),
+            ).fetchone()
+    finally:
+        scheduler.stop()
+        coordinator.close()
+        _stop_receiver(receiver, receiver_thread)
+
+    assert _BarkReceiver.deliveries == []
+    assert call_state == "declined"
+    assert delivery_state == ("suppressed", 1)
