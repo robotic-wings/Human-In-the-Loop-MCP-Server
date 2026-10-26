@@ -340,7 +340,8 @@ class _McpGateway:
                 after_event_seq,
                 continuation_payload,
             )
-            if not envelope["success"]:
+            if envelope["status"] == "session_not_found":
+                # Keep unknown and unauthorized calls indistinguishable.
                 return _rpc_error(rpc_id, -32602, "invalid params")
             return _rpc_result(rpc_id, {"content": [], "structuredContent": envelope})
         interaction_id = safe_arguments.get(interaction_key)
