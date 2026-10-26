@@ -24,6 +24,7 @@ class CreateCall:
     request_id: str
     message: str
     ring_timeout_seconds: int
+    desktop_route_device_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -92,7 +93,8 @@ class CallCoordinator:
                 connection.execute(
                     "INSERT INTO calls "
                     "(call_id, operator_id, caller_id, interaction_id, message, state, "
-                    "created_at, ring_deadline, version) VALUES (?, ?, ?, ?, ?, 'ringing', ?, ?, 1)",
+                    "created_at, ring_deadline, version, desktop_route_device_id) "
+                    "VALUES (?, ?, ?, ?, ?, 'ringing', ?, ?, 1, ?)",
                     (
                         call_id,
                         request.operator_id,
@@ -101,6 +103,7 @@ class CallCoordinator:
                         request.message,
                         self._stamp(now),
                         self._stamp(deadline),
+                        request.desktop_route_device_id,
                     ),
                 )
                 result = self._envelope(
@@ -122,6 +125,91 @@ class CallCoordinator:
 
     def decline_call(self, request: DeclineCall) -> dict[str, Any]:
         return self._act("decline", request.call_id, request.action_id, asdict(request))
+
+    def terminal_state(self, device_id: str, call_id: str | None = None) -> dict[str, Any] | None:
+        with self._write_transaction() as connection:
+            if call_id is None:
+                row = connection.execute(
+                    "SELECT * FROM calls WHERE desktop_route_device_id = ? "
+                    "AND state IN ('ringing', 'accepted') ORDER BY created_at LIMIT 1",
+                    (device_id,),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT * FROM calls WHERE call_id = ? AND desktop_route_device_id = ?",
+                    (call_id, device_id),
+                ).fetchone()
+            if row is None:
+                return None
+            self._settle_if_expired(connection, row)
+            row = self._call_or_raise(connection, row["call_id"])
+            result: dict[str, Any] = {
+                "call_id": row["call_id"],
+                "call_state": row["state"],
+                "version": row["version"],
+                "ring_deadline": row["ring_deadline"],
+            }
+            if row["owner_device_id"] is not None:
+                result["owner_device_id"] = row["owner_device_id"]
+                result["owner_session_id"] = row["owner_session_id"]
+            return result
+
+    def terminal_action(
+        self,
+        kind: str,
+        call_id: str,
+        device_id: str,
+        action_id: str,
+        session_id: str | None,
+        terminal_platform: str,
+    ) -> dict[str, Any] | None:
+        """Perform a routed terminal action without allowing an outsider to reserve an ID."""
+        if kind not in {"accept", "decline"}:
+            raise ValueError(kind)
+        scoped_action_id = f"terminal:{device_id}:{call_id}:{action_id}"
+        action: dict[str, Any]
+        if kind == "accept":
+            action = asdict(
+                AcceptCall(call_id, scoped_action_id, device_id, session_id or "", "desktop", terminal_platform)
+            )
+        else:
+            action = asdict(DeclineCall(call_id, scoped_action_id, device_id))
+        payload = self._canonical(action)
+        with self._write_transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM calls WHERE call_id = ? AND "
+                "(desktop_route_device_id = ? OR desktop_route_device_id IS NULL)",
+                (call_id, device_id),
+            ).fetchone()
+            if row is None:
+                existing = connection.execute(
+                    "SELECT state FROM calls WHERE call_id = ?", (call_id,)
+                ).fetchone()
+                if existing is not None and existing["state"] == "accepted":
+                    return {
+                        "success": False,
+                        "status": "ownership_conflict",
+                        "needs_continuation": False,
+                    }
+                return None
+            replay = connection.execute(
+                "SELECT payload, result FROM action_operations WHERE action_id = ?",
+                (scoped_action_id,),
+            ).fetchone()
+            if replay is not None:
+                if replay["payload"] == payload:
+                    return self._decode(replay["result"])
+                return self._conflict()
+            self._settle_if_expired(connection, row)
+            row = self._call_or_raise(connection, call_id)
+            if row["state"] != "ringing":
+                return self._current_result(connection, row)
+            result = self._accept(connection, row, action) if kind == "accept" else self._decline(connection, row)
+            connection.execute(
+                "INSERT INTO action_operations (action_id, payload, result) VALUES (?, ?, ?)",
+                (scoped_action_id, payload, self._canonical(result)),
+            )
+            return result
 
     def continue_call(
         self,
@@ -425,7 +513,7 @@ class CallCoordinator:
                 interaction_id TEXT NOT NULL, message TEXT NOT NULL, state TEXT NOT NULL,
                 created_at TEXT NOT NULL, ring_deadline TEXT NOT NULL, version INTEGER NOT NULL,
                 owner_device_id TEXT, owner_session_id TEXT, handled_on TEXT,
-                terminal_platform TEXT
+                terminal_platform TEXT, desktop_route_device_id TEXT
             );
             CREATE TABLE IF NOT EXISTS create_operations (
                 caller_id TEXT NOT NULL, request_id TEXT NOT NULL, payload TEXT NOT NULL,
@@ -444,6 +532,11 @@ class CallCoordinator:
             );
             """
         )
+        columns = {
+            row["name"] for row in self._connection.execute("PRAGMA table_info(calls)")
+        }
+        if "desktop_route_device_id" not in columns:
+            self._connection.execute("ALTER TABLE calls ADD COLUMN desktop_route_device_id TEXT")
         self._connection.commit()
 
     def _write_transaction(self) -> "_Transaction":

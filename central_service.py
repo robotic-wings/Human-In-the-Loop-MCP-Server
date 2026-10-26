@@ -37,6 +37,8 @@ class ServiceConfig:
     certfile: Path
     keyfile: Path
     agent_credentials_file: Path | None
+    terminal_credentials_file: Path | None
+    eligible_desktop_device_ids: tuple[str, ...]
 
 
 def _required_string(config: dict[str, object], name: str) -> str:
@@ -70,6 +72,20 @@ def _load_config(config_path: Path) -> ServiceConfig:
             raise ConfigurationError("config agent credentials file must exist")
     else:
         raise ConfigurationError("config agent_credentials_file must be a non-empty path")
+    terminal_credentials_value = raw.get("terminal_credentials_file")
+    if terminal_credentials_value is None:
+        terminal_credentials_file = None
+    elif isinstance(terminal_credentials_value, str) and terminal_credentials_value.strip():
+        terminal_credentials_file = Path(terminal_credentials_value.strip())
+        if not terminal_credentials_file.is_file():
+            raise ConfigurationError("config terminal credentials file must exist")
+    else:
+        raise ConfigurationError("config terminal_credentials_file must be a non-empty path")
+    eligible = raw.get("eligible_desktop_device_ids", [])
+    if not isinstance(eligible, list) or any(
+        not isinstance(device_id, str) or not device_id for device_id in eligible
+    ):
+        raise ConfigurationError("config eligible_desktop_device_ids must be a string list")
     port = raw.get("listen_port")
     if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
         raise ConfigurationError("config listen_port must be an integer from 1 to 65535")
@@ -79,7 +95,15 @@ def _load_config(config_path: Path) -> ServiceConfig:
     if not certfile.is_file() or not keyfile.is_file():
         raise ConfigurationError("config HTTPS certificate and key files must exist")
     return ServiceConfig(
-        host, port, base_url, data_dir, certfile, keyfile, credentials_file
+        host,
+        port,
+        base_url,
+        data_dir,
+        certfile,
+        keyfile,
+        credentials_file,
+        terminal_credentials_file,
+        tuple(eligible),
     )
 
 
@@ -257,10 +281,39 @@ def _load_agent_credentials(path: Path | None) -> dict[str, str]:
     return credentials
 
 
+@dataclass(frozen=True)
+class _TerminalIdentity:
+    device_id: str
+    terminal_platform: str
+
+
+def _load_terminal_credentials(path: Path | None) -> dict[str, _TerminalIdentity]:
+    if path is None:
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ConfigurationError("config terminal credentials cannot be read") from error
+    if not isinstance(raw, dict):
+        raise ConfigurationError("config terminal credentials must be a JSON object")
+    credentials: dict[str, _TerminalIdentity] = {}
+    for token, value in raw.items():
+        if not isinstance(token, str) or not token or not isinstance(value, dict):
+            raise ConfigurationError("config terminal credentials contain invalid entries")
+        device_id, platform = value.get("device_id"), value.get("terminal_platform")
+        if not isinstance(device_id, str) or not device_id or not isinstance(platform, str) or not platform:
+            raise ConfigurationError("config terminal credentials contain invalid entries")
+        credentials[token] = _TerminalIdentity(device_id, platform)
+    return credentials
+
+
 class _McpGateway:
-    def __init__(self, coordinator: CallCoordinator, credentials: dict[str, str]) -> None:
+    def __init__(
+        self, coordinator: CallCoordinator, credentials: dict[str, str], desktop_route_device_id: str | None = None
+    ) -> None:
         self._coordinator = coordinator
         self._credentials = credentials
+        self._desktop_route_device_id = desktop_route_device_id
 
     def caller_for(self, authorization: str | None) -> str | None:
         if not isinstance(authorization, str) or not authorization.startswith("Bearer "):
@@ -340,6 +393,7 @@ class _McpGateway:
                 request_id=request_id,
                 message=message,
                 ring_timeout_seconds=60,
+                desktop_route_device_id=self._desktop_route_device_id,
             )
         )
         return _rpc_result(rpc_id, {"content": [], "structuredContent": envelope})
@@ -410,18 +464,78 @@ def _rpc_error(request_id: object, code: int, message: str) -> dict[str, object]
     }
 
 
+class _TerminalGateway:
+    def __init__(self, coordinator: CallCoordinator, credentials: dict[str, _TerminalIdentity]) -> None:
+        self._coordinator = coordinator
+        self._credentials = credentials
+
+    def identity_for(self, authorization: str | None) -> _TerminalIdentity | None:
+        if not isinstance(authorization, str) or not authorization.startswith("Bearer "):
+            return None
+        token = authorization.removeprefix("Bearer ")
+        if not token or token.strip() != token:
+            return None
+        return self._credentials.get(token)
+
+    def state(self, identity: _TerminalIdentity, call_id: str | None = None) -> dict[str, object]:
+        return {"call": self._coordinator.terminal_state(identity.device_id, call_id)}
+
+    def action(
+        self, identity: _TerminalIdentity, kind: str, call_id: str, payload: object
+    ) -> tuple[HTTPStatus, dict[str, object]]:
+        if not isinstance(payload, dict):
+            return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
+        action_id = payload.get("action_id")
+        session_id = payload.get("owner_session_id")
+        if not isinstance(action_id, str) or not action_id:
+            return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
+        if kind == "accept" and (not isinstance(session_id, str) or not session_id):
+            return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
+        result = self._coordinator.terminal_action(
+            kind,
+            call_id,
+            identity.device_id,
+            action_id,
+            session_id if isinstance(session_id, str) else None,
+            identity.terminal_platform,
+        )
+        if result is None:
+            return HTTPStatus.NOT_FOUND, {"error": "not found"}
+        if result["status"] in {"request_conflict", "ownership_conflict"}:
+            return HTTPStatus.CONFLICT, result
+        return HTTPStatus.OK, result
+
+
 class _PublicHandler(BaseHTTPRequestHandler):
     server_version = "HITLCentralService/0.1"
 
     def do_GET(self) -> None:  # noqa: N802
-        if urlsplit(self.path).path.startswith("/calls/"):
-            self.send_error(HTTPStatus.NOT_FOUND, "call not found")
+        path = urlsplit(self.path).path
+        terminal = self._terminal_gateway()
+        if terminal is None:
+            self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
             return
-        self.send_error(HTTPStatus.NOT_FOUND, "route not found")
+        identity = terminal.identity_for(self.headers.get("Authorization"))
+        if identity is None:
+            self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+            return
+        if path == "/api/terminals/state":
+            self._send_json(HTTPStatus.OK, terminal.state(identity))
+            return
+        parts = path.split("/")
+        if len(parts) == 4 and parts[:3] == ["", "api", "calls"] and parts[3]:
+            state = terminal.state(identity, parts[3])
+            if state["call"] is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+            else:
+                self._send_json(HTTPStatus.OK, state)
+            return
+        self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
-        if urlsplit(self.path).path != "/mcp":
-            self.send_error(HTTPStatus.NOT_FOUND, "route not found")
+        path = urlsplit(self.path).path
+        if path != "/mcp":
+            self._terminal_post(path)
             return
         gateway = getattr(self.server, "mcp_gateway", None)
         if not isinstance(gateway, _McpGateway):
@@ -451,6 +565,34 @@ class _PublicHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
+
+    def _terminal_gateway(self) -> _TerminalGateway | None:
+        terminal = getattr(self.server, "terminal_gateway", None)
+        return terminal if isinstance(terminal, _TerminalGateway) else None
+
+    def _terminal_post(self, path: str) -> None:
+        terminal = self._terminal_gateway()
+        if terminal is None:
+            self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+            return
+        identity = terminal.identity_for(self.headers.get("Authorization"))
+        if identity is None:
+            self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+            return
+        parts = path.split("/")
+        if len(parts) != 5 or parts[:3] != ["", "api", "calls"] or parts[4] not in {"accept", "decline"}:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+            return
+        try:
+            content_length = int(self.headers.get("Content-Length", ""))
+            if content_length < 0 or content_length > 1_000_000:
+                raise ValueError
+            payload = json.loads(self.rfile.read(content_length).decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid request"})
+            return
+        status, response = terminal.action(identity, parts[4], parts[3], payload)
+        self._send_json(status, response)
 
     def log_message(self, _format: str, *_args: object) -> None:
         """Avoid writing request contents to diagnostic output."""
@@ -506,7 +648,10 @@ def _build_tls_context(config: ServiceConfig) -> ssl.SSLContext:
 
 
 def _create_secure_server(
-    config: ServiceConfig, context: ssl.SSLContext, gateway: _McpGateway | None = None
+    config: ServiceConfig,
+    context: ssl.SSLContext,
+    gateway: _McpGateway | None = None,
+    terminal_gateway: _TerminalGateway | None = None,
 ) -> ThreadingHTTPServer:
     server = ThreadingHTTPServer((config.listen_host, config.listen_port), _PublicHandler)
     try:
@@ -516,12 +661,15 @@ def _create_secure_server(
         raise
     if gateway is not None:
         server.mcp_gateway = gateway  # type: ignore[attr-defined]
+    if terminal_gateway is not None:
+        server.terminal_gateway = terminal_gateway  # type: ignore[attr-defined]
     return server
 
 
 def _serve(config: ServiceConfig) -> None:
     context = _build_tls_context(config)
     credentials = _load_agent_credentials(config.agent_credentials_file)
+    terminal_credentials = _load_terminal_credentials(config.terminal_credentials_file)
     config.data_dir.mkdir(parents=True, exist_ok=True)
     clock = _SystemClock()
     coordinator = CallCoordinator(config.data_dir / "calls.sqlite3", clock=clock)
@@ -529,8 +677,10 @@ def _serve(config: ServiceConfig) -> None:
     try:
         coordinator.recover_and_settle()
         scheduler.start()
-        gateway = _McpGateway(coordinator, credentials)
-        server = _create_secure_server(config, context, gateway)
+        route_device_id = config.eligible_desktop_device_ids[0] if config.eligible_desktop_device_ids else None
+        gateway = _McpGateway(coordinator, credentials, route_device_id)
+        terminal_gateway = _TerminalGateway(coordinator, terminal_credentials)
+        server = _create_secure_server(config, context, gateway, terminal_gateway)
         try:
             server.serve_forever()
         finally:
