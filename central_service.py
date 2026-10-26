@@ -7,7 +7,11 @@ listener.  Call coordination and terminal workflows belong to later slices.
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
+import hmac
 import json
+import secrets
 import ssl
 import sys
 import threading
@@ -24,7 +28,7 @@ from urllib.error import URLError
 from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlsplit, urlunsplit
 from urllib.request import urlopen
 
-from call_coordinator import CallCoordinator, CreateCall
+from call_coordinator import AcceptCall, CallCoordinator, CreateCall
 
 
 class ConfigurationError(ValueError):
@@ -47,6 +51,7 @@ class ServiceConfig:
     attachment_max_archive_bytes: int
     bark_enabled: bool
     bark_url: str | None
+    operator_credentials_file: Path | None
 
 
 _DEFAULT_ATTACHMENT_MAX_FILE_BYTES = 20 * 1024 * 1024
@@ -102,6 +107,15 @@ def _load_config(config_path: Path) -> ServiceConfig:
             raise ConfigurationError("config terminal credentials file must exist")
     else:
         raise ConfigurationError("config terminal_credentials_file must be a non-empty path")
+    operator_credentials_value = raw.get("operator_credentials_file")
+    if operator_credentials_value is None:
+        operator_credentials_file = None
+    elif isinstance(operator_credentials_value, str) and operator_credentials_value.strip():
+        operator_credentials_file = Path(operator_credentials_value.strip())
+        if not operator_credentials_file.is_file():
+            raise ConfigurationError("config operator credentials file must exist")
+    else:
+        raise ConfigurationError("config operator_credentials_file must be a non-empty path")
     eligible = raw.get("eligible_desktop_device_ids", [])
     if not isinstance(eligible, list) or any(
         not isinstance(device_id, str) or not device_id for device_id in eligible
@@ -151,6 +165,7 @@ def _load_config(config_path: Path) -> ServiceConfig:
         attachment_max_archive_bytes,
         bark_enabled,
         bark_url,
+        operator_credentials_file,
     )
 
 
@@ -385,6 +400,23 @@ def _load_terminal_credentials(path: Path | None) -> dict[str, _TerminalIdentity
             raise ConfigurationError("config terminal credentials contain invalid entries")
         credentials[token] = _TerminalIdentity(device_id, platform)
     return credentials
+
+
+def _load_operator_credentials(path: Path | None) -> dict[str, object] | None:
+    if path is None:
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ConfigurationError("operator credentials cannot be read") from error
+    if not isinstance(value, dict) or not isinstance(value.get("operator_id"), str):
+        raise ConfigurationError("operator credentials are invalid")
+    record = value.get("password_hash")
+    if not isinstance(record, dict) or record.get("algorithm") != "scrypt":
+        raise ConfigurationError("operator credentials are invalid")
+    if any(name not in record for name in ("salt", "digest", "n", "r", "p")):
+        raise ConfigurationError("operator credentials are invalid")
+    return record
 
 
 class _McpGateway:
@@ -947,12 +979,89 @@ class _TerminalGateway:
         return HTTPStatus.OK, result
 
 
+class _OperatorGateway:
+    """Small server-side operator session boundary for the phone call page."""
+
+    def __init__(self, coordinator: CallCoordinator, record: dict[str, object], expected_host: str) -> None:
+        self._coordinator = coordinator
+        self._record = record
+        self._expected_host = expected_host
+        self._sessions: dict[str, str] = {}
+        self._lock = threading.RLock()
+
+    def login(self, payload: object) -> tuple[HTTPStatus, dict[str, object], str | None]:
+        password = payload.get("password") if isinstance(payload, dict) else None
+        if not isinstance(password, str) or not self._password_matches(password):
+            return HTTPStatus.UNAUTHORIZED, {"error": "invalid credentials"}, None
+        session = secrets.token_urlsafe(32)
+        csrf = secrets.token_urlsafe(32)
+        with self._lock:
+            self._sessions[session] = csrf
+        return HTTPStatus.OK, {"csrf_token": csrf}, session
+
+    def read(self, session: str | None, call_id: str) -> dict[str, object] | None:
+        if not self._session_exists(session):
+            return None
+        return self._coordinator.operator_call_state(call_id)
+
+    def accept(
+        self, session: str | None, csrf: str | None, origin: str | None, host: str | None,
+        call_id: str, action_id: object,
+    ) -> tuple[HTTPStatus, dict[str, object]]:
+        if (
+            not self._session_matches(session, csrf)
+            or origin != f"https://{self._expected_host}"
+            or host != self._expected_host
+            or not isinstance(action_id, str)
+            or not action_id
+        ):
+            return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+        result = self._coordinator.accept_call(
+            AcceptCall(call_id, f"iphone:{session}:{call_id}:{action_id}", "iphone_web", session or "", "iphone_web", "ios")
+        )
+        if result["status"] != "opened":
+            return HTTPStatus.CONFLICT, result
+        return HTTPStatus.OK, result
+
+    def _session_exists(self, session: str | None) -> bool:
+        with self._lock:
+            return isinstance(session, str) and session in self._sessions
+
+    def _session_matches(self, session: str | None, csrf: str | None) -> bool:
+        with self._lock:
+            expected = self._sessions.get(session or "")
+        return isinstance(csrf, str) and expected is not None and hmac.compare_digest(expected, csrf)
+
+    def _password_matches(self, password: str) -> bool:
+        try:
+            salt = base64.b64decode(self._record["salt"], validate=True)
+            expected = base64.b64decode(self._record["digest"], validate=True)
+            actual = hashlib.scrypt(
+                password.encode("utf-8"), salt=salt, n=int(self._record["n"]),
+                r=int(self._record["r"]), p=int(self._record["p"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
+        return hmac.compare_digest(actual, expected)
+
+
 class _PublicHandler(BaseHTTPRequestHandler):
     server_version = "HITLCentralService/0.1"
     protocol_version = "HTTP/1.1"
 
     def do_GET(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path
+        operator = self._operator_gateway()
+        web_call_id = self._web_call_id(path)
+        if operator is not None and web_call_id is not None:
+            state = operator.read(self._operator_session(), web_call_id)
+            if state is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+            elif path.startswith("/calls/"):
+                self._send_json(HTTPStatus.OK, {"call": state})
+            else:
+                self._send_json(HTTPStatus.OK, {"call": state})
+            return
         draft_call_id = self._terminal_draft_call_id(path)
         if draft_call_id is not None:
             terminal = self._terminal_gateway()
@@ -990,6 +1099,32 @@ class _PublicHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path
+        operator = self._operator_gateway()
+        if operator is not None and path == "/api/operator/login":
+            body_ok, payload = self._terminal_request_body()
+            if not body_ok:
+                return
+            status, response, session = operator.login(payload)
+            if session is not None:
+                self._send_json(
+                    status, response,
+                    cookie=f"operator_session={session}; Secure; HttpOnly; SameSite=Strict; Path=/",
+                )
+            else:
+                self._send_json(status, response)
+            return
+        web_accept_id = self._web_accept_call_id(path)
+        if operator is not None and web_accept_id is not None:
+            body_ok, payload = self._terminal_request_body()
+            if not body_ok:
+                return
+            action_id = payload.get("action_id") if isinstance(payload, dict) else None
+            status, response = operator.accept(
+                self._operator_session(), self.headers.get("X-CSRF-Token"), self.headers.get("Origin"),
+                self.headers.get("Host"), web_accept_id, action_id,
+            )
+            self._send_json(status, response)
+            return
         if path != "/mcp":
             self._terminal_post(path)
             return
@@ -1037,10 +1172,12 @@ class _PublicHandler(BaseHTTPRequestHandler):
         status, response = terminal.save_draft(identity, parts[3], payload)
         self._send_json(status, response)
 
-    def _send_json(self, status: HTTPStatus, payload: dict[str, object]) -> None:
+    def _send_json(self, status: HTTPStatus, payload: dict[str, object], cookie: str | None = None) -> None:
         encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        if cookie is not None:
+            self.send_header("Set-Cookie", cookie)
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
@@ -1062,6 +1199,33 @@ class _PublicHandler(BaseHTTPRequestHandler):
     def _terminal_gateway(self) -> _TerminalGateway | None:
         terminal = getattr(self.server, "terminal_gateway", None)
         return terminal if isinstance(terminal, _TerminalGateway) else None
+
+    def _operator_gateway(self) -> _OperatorGateway | None:
+        operator = getattr(self.server, "operator_gateway", None)
+        return operator if isinstance(operator, _OperatorGateway) else None
+
+    def _operator_session(self) -> str | None:
+        for item in self.headers.get("Cookie", "").split(";"):
+            name, separator, value = item.strip().partition("=")
+            if separator and name == "operator_session" and value:
+                return value
+        return None
+
+    @staticmethod
+    def _web_call_id(path: str) -> str | None:
+        parts = path.split("/")
+        if len(parts) == 3 and parts[:2] == ["", "calls"] and parts[2]:
+            return parts[2]
+        if len(parts) == 4 and parts[:3] == ["", "api", "calls"] and parts[3]:
+            return parts[3]
+        return None
+
+    @staticmethod
+    def _web_accept_call_id(path: str) -> str | None:
+        parts = path.split("/")
+        if len(parts) == 5 and parts[:3] == ["", "api", "calls"] and parts[3] and parts[4] == "accept":
+            return parts[3]
+        return None
 
     def _terminal_request_identity(self) -> tuple[_TerminalGateway, _TerminalIdentity] | None:
         terminal = self._terminal_gateway()
@@ -1408,6 +1572,7 @@ def _create_secure_server(
     context: ssl.SSLContext,
     gateway: _McpGateway | None = None,
     terminal_gateway: _TerminalGateway | None = None,
+    operator_gateway: _OperatorGateway | None = None,
 ) -> ThreadingHTTPServer:
     server = ThreadingHTTPServer((config.listen_host, config.listen_port), _PublicHandler)
     try:
@@ -1419,6 +1584,8 @@ def _create_secure_server(
         server.mcp_gateway = gateway  # type: ignore[attr-defined]
     if terminal_gateway is not None:
         server.terminal_gateway = terminal_gateway  # type: ignore[attr-defined]
+    if operator_gateway is not None:
+        server.operator_gateway = operator_gateway  # type: ignore[attr-defined]
     return server
 
 
@@ -1426,6 +1593,7 @@ def _serve(config: ServiceConfig) -> None:
     context = _build_tls_context(config)
     credentials = _load_agent_credentials(config.agent_credentials_file)
     terminal_credentials = _load_terminal_credentials(config.terminal_credentials_file)
+    operator_record = _load_operator_credentials(config.operator_credentials_file)
     config.data_dir.mkdir(parents=True, exist_ok=True)
     clock = _SystemClock()
     coordinator = CallCoordinator(
@@ -1458,7 +1626,12 @@ def _serve(config: ServiceConfig) -> None:
             configured_desktop_route_device_id,
             attachment_max_submission_bytes=config.attachment_max_submission_bytes,
         )
-        server = _create_secure_server(config, context, gateway, terminal_gateway)
+        operator_gateway = (
+            _OperatorGateway(coordinator, operator_record, urlsplit(config.web_base_url).netloc)
+            if operator_record is not None
+            else None
+        )
+        server = _create_secure_server(config, context, gateway, terminal_gateway, operator_gateway)
         try:
             server.serve_forever()
         finally:
