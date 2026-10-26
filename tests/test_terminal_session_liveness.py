@@ -88,6 +88,75 @@ def action_rows(database: Path, call_id: str) -> list[tuple[str, str, str]]:
         ]
 
 
+def create_pre_liveness_accepted_database(database: Path, accepted_at: datetime) -> None:
+    """Create the calls table shape used before terminal liveness existed."""
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            CREATE TABLE calls (
+                call_id TEXT PRIMARY KEY, operator_id TEXT NOT NULL, caller_id TEXT NOT NULL,
+                interaction_id TEXT NOT NULL, message TEXT NOT NULL, state TEXT NOT NULL,
+                created_at TEXT NOT NULL, ring_deadline TEXT NOT NULL, version INTEGER NOT NULL,
+                owner_device_id TEXT, owner_session_id TEXT, handled_on TEXT,
+                terminal_platform TEXT, desktop_route_device_id TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO calls VALUES (?, ?, ?, ?, ?, 'accepted', ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-accepted-call",
+                "operator-1",
+                "agent-1",
+                "legacy-interaction",
+                "legacy prompt",
+                accepted_at.isoformat(),
+                (accepted_at + timedelta(seconds=60)).isoformat(),
+                2,
+                "desktop-registered",
+                "legacy-owner-session",
+                "desktop",
+                "windows",
+                "desktop-registered",
+            ),
+        )
+
+
+def test_legacy_accepted_row_gets_finite_deadline_and_settles_without_revival(
+    tmp_path: Path,
+) -> None:
+    clock = make_clock()
+    database = tmp_path / "legacy-accepted.sqlite3"
+    create_pre_liveness_accepted_database(database, clock.now_utc())
+
+    reopened = CallCoordinator(database, clock=clock)
+    migrated = persisted_call(database, "legacy-accepted-call")
+    assert migrated["terminal_last_seen_at"] == clock.now_utc().isoformat()
+    assert migrated["terminal_disconnect_deadline"] == (
+        clock.now_utc() + timedelta(seconds=180)
+    ).isoformat()
+    assert reopened.recover_and_settle() == []
+    assert create_desktop_call(reopened, request_id="legacy-still-busy")["status"] == "busy"
+
+    clock.advance(180)
+    settled = reopened.recover_and_settle()
+    repeated = reopened.recover_and_settle()
+    late_heartbeat = reopened.terminal_heartbeat(
+        "legacy-accepted-call", "desktop-registered", "legacy-owner-session"
+    )
+    next_call = create_desktop_call(reopened, request_id="legacy-after-disconnect")
+    reopened.close()
+
+    assert len(settled) == 1
+    assert settled[0]["status"] == "disconnected"
+    assert settled[0]["reason"] == "terminal_disconnected"
+    assert repeated == []
+    assert late_heartbeat == settled[0]
+    assert next_call["status"] == "ringing"
+
+
 def test_desktop_accept_persists_owner_liveness_and_survives_predeadline_recovery(
     tmp_path: Path,
 ) -> None:

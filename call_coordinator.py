@@ -671,7 +671,32 @@ class CallCoordinator:
             self._connection.execute("ALTER TABLE calls ADD COLUMN terminal_last_seen_at TEXT")
         if "terminal_disconnect_deadline" not in columns:
             self._connection.execute("ALTER TABLE calls ADD COLUMN terminal_disconnect_deadline TEXT")
+        self._backfill_legacy_accepted_liveness()
         self._connection.commit()
+
+    def _backfill_legacy_accepted_liveness(self) -> None:
+        """Give pre-liveness accepted calls a deadline without extending them at restart."""
+        rows = self._connection.execute(
+            "SELECT call_id, created_at, terminal_last_seen_at, terminal_disconnect_deadline "
+            "FROM calls WHERE state = 'accepted' "
+            "AND (terminal_last_seen_at IS NULL OR terminal_disconnect_deadline IS NULL)"
+        ).fetchall()
+        for row in rows:
+            # Older schemas did not persist accepted_at.  created_at is their
+            # only durable liveness anchor, so it is deliberately used rather
+            # than the current clock, which could revive an overdue call.
+            last_seen = row["terminal_last_seen_at"] or row["created_at"]
+            deadline = row["terminal_disconnect_deadline"]
+            if deadline is None:
+                anchor = self._parse_stamp(last_seen)
+                deadline = self._stamp(
+                    anchor + timedelta(seconds=self._terminal_disconnect_seconds)
+                )
+            self._connection.execute(
+                "UPDATE calls SET terminal_last_seen_at = ?, terminal_disconnect_deadline = ? "
+                "WHERE call_id = ?",
+                (last_seen, deadline, row["call_id"]),
+            )
 
     def _write_transaction(self) -> "_Transaction":
         return _Transaction(self._lock, self._connection)
