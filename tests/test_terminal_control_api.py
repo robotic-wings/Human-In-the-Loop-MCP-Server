@@ -324,13 +324,25 @@ def test_terminal_state_is_read_only_and_accept_derives_desktop_identity_then_pe
         state_status, state = _terminal_request(
             port, certificate, "GET", "/api/terminals/state", "desktop-token"
         )
-        takeover_status, takeover = _terminal_request(
+        takeover_payload = {"action_id": "takeover", "owner_session_id": "other-session"}
+        takeover = _terminal_request(
             port,
             certificate,
             "POST",
             f"/api/calls/{created['call_id']}/accept",
             "other-desktop-token",
-            {"action_id": "takeover", "owner_session_id": "other-session"},
+            takeover_payload,
+        )
+        unknown_takeover = _terminal_request(
+            port,
+            certificate,
+            "POST",
+            "/api/calls/no-such-call/accept",
+            "other-desktop-token",
+            takeover_payload,
+        )
+        state_after_takeover_status, state_after_takeover = _terminal_request(
+            port, certificate, "GET", "/api/terminals/state", "desktop-token"
         )
     finally:
         _stop(restarted)
@@ -343,8 +355,10 @@ def test_terminal_state_is_read_only_and_accept_derives_desktop_identity_then_pe
     assert after_opened["status"] == "heartbeat"
     assert after_opened["event_seq"] == opened["event_seq"]
     assert after_opened["call_state"] == "accepted"
-    assert takeover_status == 409
-    assert takeover["status"] == "ownership_conflict"
+    assert takeover == unknown_takeover == (404, {"error": "not found"})
+    assert state_after_takeover_status == 200
+    assert state_after_takeover["call"]["owner_device_id"] == "desktop-registered"
+    assert state_after_takeover["call"]["owner_session_id"] == "desktop-session-1"
 
 
 def test_terminal_decline_releases_busy_and_never_supplies_an_answer_value(
