@@ -39,6 +39,22 @@ def _call_row(database: Path, call_id: str) -> tuple[object, ...]:
     return row
 
 
+def _business_evidence(database: Path, call_id: str) -> tuple[object, ...]:
+    with sqlite3.connect(database) as connection:
+        events = connection.execute(
+            "SELECT event_seq, result FROM events WHERE call_id = ? ORDER BY event_seq", (call_id,)
+        ).fetchall()
+        submissions = connection.execute(
+            "SELECT submission_id, result FROM submission_operations WHERE call_id = ? ORDER BY submission_id",
+            (call_id,),
+        ).fetchall()
+        actions = connection.execute(
+            "SELECT action_id, result FROM action_operations WHERE action_id LIKE ? ORDER BY action_id",
+            (f"%:{call_id}:%",),
+        ).fetchall()
+    return tuple(events), tuple(submissions), tuple(actions)
+
+
 def test_tls_accepted_iphone_owner_heartbeat_refreshes_only_liveness(tmp_path: Path) -> None:
     port = _free_port()
     config, certificate = _write_operator_config(tmp_path, port)
@@ -63,11 +79,13 @@ def test_tls_accepted_iphone_owner_heartbeat_refreshes_only_liveness(tmp_path: P
             )
             connection.commit()
         before = _call_row(database, call_id)
+        business_before = _business_evidence(database, call_id)
         page = _request(port, certificate, "GET", f"/calls/{call_id}", headers={"Cookie": cookie})
         poll = _request(port, certificate, "GET", f"/api/calls/{call_id}", headers={"Cookie": cookie})
         after_reads = _call_row(database, call_id)
         refreshed = _heartbeat(port, certificate, call_id, _headers(cookie, csrf, port))
         after = _call_row(database, call_id)
+        business_after = _business_evidence(database, call_id)
     finally:
         _stop(process)
 
@@ -80,6 +98,7 @@ def test_tls_accepted_iphone_owner_heartbeat_refreshes_only_liveness(tmp_path: P
     assert after[3] != before[3]
     assert after[4] != before[4]
     assert after[5:] == before[5:]
+    assert business_after == business_before
 
 
 def test_tls_iphone_heartbeat_requires_current_owner_session_and_same_origin(tmp_path: Path) -> None:
