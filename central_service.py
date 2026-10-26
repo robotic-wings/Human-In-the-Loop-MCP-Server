@@ -10,11 +10,13 @@ import argparse
 import json
 import ssl
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, NoReturn
 from urllib.parse import urlparse, urlsplit
 
@@ -85,72 +87,146 @@ class _SystemClock:
         return datetime.now(UTC)
 
 
-_TOOL_PROPERTIES: dict[str, dict[str, dict[str, object]]] = {
-    "assign_task_to_human": {
-        "task_title": {"type": "string"},
-        "task_description": {"type": "string"},
-        "task_id": {"type": "string"},
-        "client_timeout_seconds": {"type": "integer"},
-        "max_result_bytes": {"type": "integer"},
-        "context_note": {"type": "string"},
-        "request_id": {"type": "string"},
-    },
-    "get_user_input": {
-        "title": {"type": "string"},
-        "prompt": {"type": "string"},
-        "default_value": {"type": "string"},
-        "input_type": {"type": "string", "enum": ["text", "integer", "float"]},
-        "client_timeout_seconds": {"type": "integer"},
-        "interaction_id": {"type": "string"},
-        "request_id": {"type": "string"},
-    },
-    "get_user_choice": {
-        "title": {"type": "string"},
-        "prompt": {"type": "string"},
-        "choices": {"type": "array", "items": {"type": "string"}},
-        "allow_multiple": {"type": "boolean"},
-        "client_timeout_seconds": {"type": "integer"},
-        "interaction_id": {"type": "string"},
-        "request_id": {"type": "string"},
-    },
-    "get_multiline_input": {
-        "title": {"type": "string"},
-        "prompt": {"type": "string"},
-        "default_value": {"type": "string"},
-        "client_timeout_seconds": {"type": "integer"},
-        "interaction_id": {"type": "string"},
-        "request_id": {"type": "string"},
-    },
-    "show_confirmation_dialog": {
-        "title": {"type": "string"},
-        "message": {"type": "string"},
-        "client_timeout_seconds": {"type": "integer"},
-        "interaction_id": {"type": "string"},
-        "request_id": {"type": "string"},
-    },
-    "show_info_message": {
-        "title": {"type": "string"},
-        "message": {"type": "string"},
-        "client_timeout_seconds": {"type": "integer"},
-        "interaction_id": {"type": "string"},
-        "request_id": {"type": "string"},
-    },
-    "get_feedback_from_user": {
-        "client_timeout_seconds": {"type": "integer"},
-        "interaction_id": {"type": "string"},
-        "request_id": {"type": "string"},
-    },
-}
+@dataclass(frozen=True)
+class ToolSpec:
+    """One immutable source for a tool's public schema and gateway validation."""
 
-_TOOL_REQUIRED: dict[str, list[str]] = {
-    "assign_task_to_human": ["task_title", "task_description", "request_id"],
-    "get_user_input": ["title", "prompt", "request_id"],
-    "get_user_choice": ["title", "prompt", "choices", "request_id"],
-    "get_multiline_input": ["title", "prompt", "request_id"],
-    "show_confirmation_dialog": ["title", "message", "request_id"],
-    "show_info_message": ["title", "message", "request_id"],
-    "get_feedback_from_user": ["request_id"],
-}
+    name: str
+    properties: tuple[tuple[str, object], ...]
+    required: tuple[str, ...]
+
+    def input_schema(self) -> dict[str, object]:
+        return {
+            "type": "object",
+            "properties": {
+                name: _thaw_schema(schema) for name, schema in self.properties
+            },
+            "required": list(self.required),
+        }
+
+
+def _freeze_schema(value: object) -> object:
+    if isinstance(value, dict):
+        return MappingProxyType(
+            {name: _freeze_schema(item) for name, item in value.items()}
+        )
+    if isinstance(value, list):
+        return tuple(_freeze_schema(item) for item in value)
+    return value
+
+
+def _thaw_schema(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {name: _thaw_schema(item) for name, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_schema(item) for item in value]
+    return value
+
+
+def _tool_spec(
+    name: str, properties: dict[str, dict[str, object]], required: tuple[str, ...]
+) -> ToolSpec:
+    return ToolSpec(
+        name,
+        tuple(
+            (property_name, _freeze_schema(schema))
+            for property_name, schema in properties.items()
+        ),
+        required,
+    )
+
+
+_TOOL_SPECS = (
+    _tool_spec(
+        "assign_task_to_human",
+        {
+            "task_title": {"type": "string"},
+            "task_description": {"type": "string"},
+            "task_id": {"type": "string"},
+            "client_timeout_seconds": {"type": "integer"},
+            "max_result_bytes": {"type": "integer"},
+            "context_note": {"type": "string"},
+            "request_id": {"type": "string"},
+        },
+        ("task_title", "task_description", "request_id"),
+    ),
+    _tool_spec(
+        "get_user_input",
+        {
+            "title": {"type": "string"},
+            "prompt": {"type": "string"},
+            "default_value": {"type": "string"},
+            "input_type": {
+                "type": "string",
+                "enum": ["text", "integer", "float"],
+            },
+            "client_timeout_seconds": {"type": "integer"},
+            "interaction_id": {"type": "string"},
+            "request_id": {"type": "string"},
+        },
+        ("title", "prompt", "request_id"),
+    ),
+    _tool_spec(
+        "get_user_choice",
+        {
+            "title": {"type": "string"},
+            "prompt": {"type": "string"},
+            "choices": {"type": "array", "items": {"type": "string"}},
+            "allow_multiple": {"type": "boolean"},
+            "client_timeout_seconds": {"type": "integer"},
+            "interaction_id": {"type": "string"},
+            "request_id": {"type": "string"},
+        },
+        ("title", "prompt", "choices", "request_id"),
+    ),
+    _tool_spec(
+        "get_multiline_input",
+        {
+            "title": {"type": "string"},
+            "prompt": {"type": "string"},
+            "default_value": {"type": "string"},
+            "client_timeout_seconds": {"type": "integer"},
+            "interaction_id": {"type": "string"},
+            "request_id": {"type": "string"},
+        },
+        ("title", "prompt", "request_id"),
+    ),
+    _tool_spec(
+        "show_confirmation_dialog",
+        {
+            "title": {"type": "string"},
+            "message": {"type": "string"},
+            "client_timeout_seconds": {"type": "integer"},
+            "interaction_id": {"type": "string"},
+            "request_id": {"type": "string"},
+        },
+        ("title", "message", "request_id"),
+    ),
+    _tool_spec(
+        "show_info_message",
+        {
+            "title": {"type": "string"},
+            "message": {"type": "string"},
+            "client_timeout_seconds": {"type": "integer"},
+            "interaction_id": {"type": "string"},
+            "request_id": {"type": "string"},
+        },
+        ("title", "message", "request_id"),
+    ),
+    _tool_spec(
+        "get_feedback_from_user",
+        {
+            "client_timeout_seconds": {"type": "integer"},
+            "interaction_id": {"type": "string"},
+            "request_id": {"type": "string"},
+        },
+        ("request_id",),
+    ),
+)
+
+
+def _find_tool_spec(name: str) -> ToolSpec | None:
+    return next((spec for spec in _TOOL_SPECS if spec.name == name), None)
 
 
 def _load_agent_credentials(path: Path | None) -> dict[str, str]:
@@ -217,23 +293,24 @@ class _McpGateway:
             return _rpc_error(rpc_id, -32602, "invalid params")
         name = params.get("name")
         arguments = params.get("arguments")
-        if not isinstance(name, str) or name not in _TOOL_PROPERTIES or not isinstance(arguments, dict):
+        spec = _find_tool_spec(name) if isinstance(name, str) else None
+        if spec is None or not isinstance(arguments, dict):
             return _rpc_error(rpc_id, -32602, "invalid params")
-        missing = [field for field in _TOOL_REQUIRED[name] if field not in arguments]
+        missing = [field for field in spec.required if field not in arguments]
         request_id = arguments.get("request_id")
         if missing or not isinstance(request_id, str) or not request_id:
             return _rpc_error(rpc_id, -32602, "invalid params")
         safe_arguments = {
             field: arguments[field]
-            for field in _TOOL_PROPERTIES[name]
+            for field, _ in spec.properties
             if field in arguments
         }
-        interaction_key = "task_id" if name == "assign_task_to_human" else "interaction_id"
+        interaction_key = "task_id" if spec.name == "assign_task_to_human" else "interaction_id"
         interaction_id = safe_arguments.get(interaction_key)
         if not isinstance(interaction_id, str) or not interaction_id:
             interaction_id = request_id
         message = json.dumps(
-            {"tool": name, "arguments": safe_arguments},
+            {"tool": spec.name, "arguments": safe_arguments},
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -254,15 +331,11 @@ class _McpGateway:
 def _tool_definitions() -> list[dict[str, object]]:
     return [
         {
-            "name": name,
+            "name": spec.name,
             "description": "Request human interaction through the central service.",
-            "inputSchema": {
-                "type": "object",
-                "properties": properties,
-                "required": _TOOL_REQUIRED[name],
-            },
+            "inputSchema": spec.input_schema(),
         }
-        for name, properties in _TOOL_PROPERTIES.items()
+        for spec in _TOOL_SPECS
     ]
 
 
@@ -350,11 +423,12 @@ def _create_secure_server(
 
 def _serve(config: ServiceConfig) -> None:
     context = _build_tls_context(config)
+    credentials = _load_agent_credentials(config.agent_credentials_file)
     config.data_dir.mkdir(parents=True, exist_ok=True)
     coordinator = CallCoordinator(config.data_dir / "calls.sqlite3", clock=_SystemClock())
     try:
         coordinator.recover_and_settle()
-        gateway = _McpGateway(coordinator, _load_agent_credentials(config.agent_credentials_file))
+        gateway = _McpGateway(coordinator, credentials)
         server = _create_secure_server(config, context, gateway)
         try:
             server.serve_forever()
