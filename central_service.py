@@ -484,7 +484,39 @@ class _TerminalGateway:
         return self._credentials.get(token)
 
     def state(self, identity: _TerminalIdentity, call_id: str | None = None) -> dict[str, object]:
-        return {"call": self._coordinator.terminal_state(identity.device_id, call_id)}
+        presence = self._coordinator.terminal_presence(identity.device_id)
+        if presence is None:
+            return {"call": self._coordinator.terminal_state(identity.device_id, call_id)}
+        return {
+            "presence": presence,
+            "call": self._coordinator.terminal_poll_snapshot(identity.device_id, call_id),
+        }
+
+    def register(self, identity: _TerminalIdentity, payload: object) -> tuple[HTTPStatus, dict[str, object]]:
+        if not isinstance(payload, dict):
+            return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
+        instance_id, gui_ready = payload.get("instance_id"), payload.get("gui_ready")
+        if not isinstance(instance_id, str) or not instance_id or not isinstance(gui_ready, bool):
+            return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
+        self._coordinator.register_terminal_presence(
+            device_id=identity.device_id,
+            terminal_platform=identity.terminal_platform,
+            route_device_id=identity.device_id,
+            callback_url=None,
+            instance_id=instance_id,
+            gui_ready=gui_ready,
+        )
+        return HTTPStatus.OK, self.state(identity)
+
+    def device_heartbeat(
+        self, identity: _TerminalIdentity, payload: object
+    ) -> tuple[HTTPStatus, dict[str, object]]:
+        if not isinstance(payload, dict) or not isinstance(payload.get("instance_id"), str) or not payload["instance_id"]:
+            return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
+        result = self._coordinator.terminal_device_heartbeat(identity.device_id, payload["instance_id"])
+        if result.get("status") == "instance_conflict":
+            return HTTPStatus.CONFLICT, result
+        return HTTPStatus.OK, self.state(identity)
 
     def action(
         self, identity: _TerminalIdentity, kind: str, call_id: str, payload: object
@@ -645,6 +677,16 @@ class _PublicHandler(BaseHTTPRequestHandler):
         if authenticated is None:
             return
         terminal, identity = authenticated
+        if path in {"/api/terminals/register", "/api/terminals/heartbeat"}:
+            body_ok, payload = self._terminal_request_body()
+            if not body_ok:
+                return
+            if path.endswith("/register"):
+                status, response = terminal.register(identity, payload)
+            else:
+                status, response = terminal.device_heartbeat(identity, payload)
+            self._send_json(status, response)
+            return
         route = self._terminal_action_route(path)
         if route is None:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
