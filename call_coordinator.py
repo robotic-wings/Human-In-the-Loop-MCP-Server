@@ -230,6 +230,19 @@ class CallCoordinator:
                 return self._current_result(connection, row)
             return self._terminal_state_result(row)
 
+    def operator_call_state(self, call_id: str) -> dict[str, Any] | None:
+        """Return the authenticated operator's content-free call view."""
+        with self._write_transaction() as connection:
+            try:
+                row = self._call_or_raise(connection, call_id)
+            except KeyError:
+                return None
+            self._settle_if_expired(connection, row)
+            row = self._call_or_raise(connection, call_id)
+            state = self._terminal_state_result(row)
+            state["state"] = row["state"]
+            return state
+
     def register_terminal_presence(
         self, *, device_id: str, terminal_platform: str, route_device_id: str,
         callback_url: str | None, instance_id: str, gui_ready: bool,
