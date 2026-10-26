@@ -336,6 +336,77 @@ class CallCoordinator:
                 "draft": {"body": body, "draft_version": draft_version},
             }
 
+    def submit_terminal_text(
+        self,
+        call_id: str,
+        device_id: str,
+        owner_session_id: str,
+        submission_id: str,
+        user_input: str,
+        legacy_route_device_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Persist one final simple-text answer from the accepted owner session.
+
+        Submission replay is deliberately checked only after route and session
+        ownership: an unrelated terminal must not learn whether a submission id
+        exists for another call.
+        """
+        if (
+            not isinstance(submission_id, str)
+            or not submission_id
+            or len(submission_id) > 128
+            or not submission_id.isascii()
+            or not isinstance(user_input, str)
+        ):
+            return {"success": False, "status": "invalid_submission"}
+        payload = self._canonical({"user_input": user_input})
+        with self._write_transaction() as connection:
+            row = self._routed_terminal_call(
+                connection, device_id, call_id, legacy_route_device_id=legacy_route_device_id
+            )
+            if row is None:
+                return None
+            if row["owner_device_id"] != device_id or row["owner_session_id"] != owner_session_id:
+                return None
+            replay = connection.execute(
+                "SELECT payload, result FROM submission_operations "
+                "WHERE call_id = ? AND submission_id = ?",
+                (call_id, submission_id),
+            ).fetchone()
+            if replay is not None:
+                if replay["payload"] == payload:
+                    return self._decode(replay["result"])
+                return self._conflict()
+            self._settle_if_expired(connection, row)
+            row = self._call_or_raise(connection, call_id)
+            if row["state"] != "accepted":
+                return self._current_result(connection, row)
+            result = {
+                "success": True,
+                "status": "answered",
+                "call_state": "answered",
+                "reason": None,
+                "human_action": True,
+                "needs_continuation": False,
+                "interaction_id": row["interaction_id"],
+                "call_id": row["call_id"],
+                "event_seq": (self._event_seq(connection, call_id) or 0) + 1,
+                "handled_on": row["handled_on"],
+                "terminal_platform": row["terminal_platform"],
+                "user_input": user_input,
+            }
+            connection.execute(
+                "UPDATE calls SET state = 'answered', version = version + 1 WHERE call_id = ?",
+                (call_id,),
+            )
+            self._add_event(connection, call_id, result)
+            connection.execute(
+                "INSERT INTO submission_operations (call_id, submission_id, payload, result) "
+                "VALUES (?, ?, ?, ?)",
+                (call_id, submission_id, payload, self._canonical(result)),
+            )
+            return result
+
     def _routed_terminal_call(
         self,
         connection: sqlite3.Connection,
@@ -770,7 +841,7 @@ class CallCoordinator:
     def _current_result(
         self, connection: sqlite3.Connection, row: sqlite3.Row
     ) -> dict[str, Any]:
-        if row["state"] in {"declined", "not_accepted", "disconnected", "cancelled"}:
+        if row["state"] in {"declined", "not_accepted", "disconnected", "cancelled", "answered"}:
             event = connection.execute(
                 "SELECT result FROM events WHERE call_id = ? ORDER BY event_seq DESC LIMIT 1",
                 (row["call_id"],),
@@ -830,7 +901,7 @@ class CallCoordinator:
         event = self._event_after(connection, row["call_id"], after_event_seq)
         if event is not None:
             return self._decode(event["result"])
-        if row["state"] in {"declined", "not_accepted", "disconnected", "cancelled"}:
+        if row["state"] in {"declined", "not_accepted", "disconnected", "cancelled", "answered"}:
             return self._current_result(connection, row)
         return self._envelope(
             status="heartbeat",
@@ -922,6 +993,11 @@ class CallCoordinator:
             CREATE TABLE IF NOT EXISTS cancel_operations (
                 caller_id TEXT NOT NULL, request_id TEXT NOT NULL, payload TEXT NOT NULL,
                 result TEXT NOT NULL, PRIMARY KEY (caller_id, request_id)
+            );
+            CREATE TABLE IF NOT EXISTS submission_operations (
+                call_id TEXT NOT NULL, submission_id TEXT NOT NULL, payload TEXT NOT NULL,
+                result TEXT NOT NULL, PRIMARY KEY (call_id, submission_id),
+                FOREIGN KEY (call_id) REFERENCES calls(call_id)
             );
             CREATE TABLE IF NOT EXISTS terminal_presence (
                 device_id TEXT PRIMARY KEY, terminal_platform TEXT NOT NULL,
