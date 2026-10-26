@@ -496,6 +496,33 @@ class CallCoordinator:
                 },
             }
 
+    def reject_terminal_attachment_submission_limit(
+        self,
+        call_id: str,
+        device_id: str,
+        owner_session_id: str,
+        legacy_route_device_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Authorize and settle an oversized multipart before rejecting it.
+
+        The HTTP layer uses this without reading the oversized file payload.
+        Keep the same routing, ownership, and expiry ordering as uploads so a
+        capacity response cannot disclose a call to another terminal.
+        """
+        with self._write_transaction() as connection:
+            row = self._routed_terminal_call(
+                connection, device_id, call_id, legacy_route_device_id=legacy_route_device_id
+            )
+            if row is None:
+                return None
+            if row["owner_device_id"] != device_id or row["owner_session_id"] != owner_session_id:
+                return None
+            self._settle_if_expired(connection, row)
+            row = self._call_or_raise(connection, call_id)
+            if row["state"] != "accepted":
+                return self._current_result(connection, row)
+            return self._attachment_rejected("submission_limit_exceeded")
+
     @staticmethod
     def _attachment_rejected(reason: str) -> dict[str, Any]:
         return {"success": False, "status": "attachment_rejected", "reason": reason}
