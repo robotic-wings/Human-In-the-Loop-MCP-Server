@@ -893,6 +893,8 @@ class CallCoordinator:
             self._settle_if_expired(connection, row)
             row = self._call_or_raise(connection, call_id)
             result = self._continuation_result(connection, row, after_event_seq)
+            if result["status"] in {"opened", "heartbeat"}:
+                self._start_agent_reconnect_grace(connection, call_id)
             self._store_continuation_snapshot(
                 connection, caller_id, request_id, operation_payload, result
             )
@@ -1099,9 +1101,13 @@ class CallCoordinator:
         self, connection: sqlite3.Connection, row: sqlite3.Row
     ) -> dict[str, Any] | None:
         if row["state"] == "ringing":
-            return self._settle_ringing_timeout(connection, row)
+            return self._settle_ringing_timeout(connection, row) or self._settle_agent_disconnect(
+                connection, row
+            )
         if row["state"] == "accepted":
-            return self._settle_terminal_disconnect(connection, row)
+            return self._settle_terminal_disconnect(connection, row) or self._settle_agent_disconnect(
+                connection, row
+            )
         return None
 
     def _settle_ringing_timeout(
@@ -1152,6 +1158,42 @@ class CallCoordinator:
         )
         self._add_event(connection, row["call_id"], result)
         return result
+
+    def _settle_agent_disconnect(
+        self, connection: sqlite3.Connection, row: sqlite3.Row
+    ) -> dict[str, Any] | None:
+        if row["agent_reconnect_deadline"] is None:
+            return None
+        if self._now() < self._parse_stamp(row["agent_reconnect_deadline"]):
+            return None
+        result = self._envelope(
+            status="disconnected",
+            call_state="disconnected",
+            interaction_id=row["interaction_id"],
+            call_id=row["call_id"],
+            reason="agent_disconnected",
+            event_seq=(self._event_seq(connection, row["call_id"]) or 0) + 1,
+            handled_on=row["handled_on"],
+            terminal_platform=row["terminal_platform"],
+            owner_device_id=row["owner_device_id"],
+            owner_session_id=row["owner_session_id"],
+            ring_deadline=row["ring_deadline"],
+        )
+        connection.execute(
+            "UPDATE calls SET state = 'disconnected', version = version + 1 WHERE call_id = ?",
+            (row["call_id"],),
+        )
+        self._add_event(connection, row["call_id"], result)
+        return result
+
+    def _start_agent_reconnect_grace(
+        self, connection: sqlite3.Connection, call_id: str
+    ) -> None:
+        deadline = self._now() + timedelta(seconds=30)
+        connection.execute(
+            "UPDATE calls SET agent_reconnect_deadline = ? WHERE call_id = ?",
+            (self._stamp(deadline), call_id),
+        )
 
     def _refresh_terminal_liveness(
         self, connection: sqlite3.Connection, call_id: str, *, now: datetime | None = None
@@ -1299,6 +1341,7 @@ class CallCoordinator:
                 owner_device_id TEXT, owner_session_id TEXT, handled_on TEXT,
                 terminal_platform TEXT, desktop_route_device_id TEXT,
                 terminal_last_seen_at TEXT, terminal_disconnect_deadline TEXT,
+                agent_reconnect_deadline TEXT,
                 draft_body TEXT, draft_version INTEGER NOT NULL DEFAULT 0,
                 task_version INTEGER NOT NULL DEFAULT 0
             );
@@ -1348,6 +1391,8 @@ class CallCoordinator:
             self._connection.execute("ALTER TABLE calls ADD COLUMN terminal_last_seen_at TEXT")
         if "terminal_disconnect_deadline" not in columns:
             self._connection.execute("ALTER TABLE calls ADD COLUMN terminal_disconnect_deadline TEXT")
+        if "agent_reconnect_deadline" not in columns:
+            self._connection.execute("ALTER TABLE calls ADD COLUMN agent_reconnect_deadline TEXT")
         if "draft_body" not in columns:
             self._connection.execute("ALTER TABLE calls ADD COLUMN draft_body TEXT")
         if "draft_version" not in columns:
