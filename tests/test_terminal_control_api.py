@@ -188,6 +188,20 @@ def _persisted_terminal_snapshot(
     return dict(call), [dict(event) for event in events]
 
 
+def _terminal_action_operations(
+    database: Path, device_id: str, call_id: str, action_id: str
+) -> list[dict[str, Any]]:
+    """Read the exact replay key derived from a terminal credential and action."""
+    scoped_action_id = f"terminal:{device_id}:{call_id}:{action_id}"
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            "SELECT action_id, payload, result FROM action_operations WHERE action_id = ?",
+            (scoped_action_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 class _WallClock:
     def now_utc(self) -> datetime:
         return datetime.now(UTC)
@@ -555,6 +569,12 @@ def test_legacy_null_desktop_route_is_nonleaking_immutable_and_does_not_reserve_
     )
     accept_before = _persisted_terminal_snapshot(database, legacy_accept["call_id"])
     decline_before = _persisted_terminal_snapshot(database, legacy_decline["call_id"])
+    accept_action_before = _terminal_action_operations(
+        database, "desktop-other", legacy_accept["call_id"], "legacy-accept"
+    )
+    decline_action_before = _terminal_action_operations(
+        database, "desktop-other", legacy_decline["call_id"], "legacy-decline"
+    )
 
     process = _start(config)
     _wait_for_tls_gateway(process, port, certificate)
@@ -593,6 +613,12 @@ def test_legacy_null_desktop_route_is_nonleaking_immutable_and_does_not_reserve_
         )
         accept_after_denial = _persisted_terminal_snapshot(database, legacy_accept["call_id"])
         decline_after_denial = _persisted_terminal_snapshot(database, legacy_decline["call_id"])
+        accept_action_after = _terminal_action_operations(
+            database, "desktop-other", legacy_accept["call_id"], "legacy-accept"
+        )
+        decline_action_after = _terminal_action_operations(
+            database, "desktop-other", legacy_decline["call_id"], "legacy-decline"
+        )
         registered_accept = _terminal_request(
             port,
             certificate,
@@ -616,6 +642,8 @@ def test_legacy_null_desktop_route_is_nonleaking_immutable_and_does_not_reserve_
     assert denied_decline == random_decline
     assert accept_after_denial == accept_before
     assert decline_after_denial == decline_before
+    assert accept_action_before == accept_action_after == []
+    assert decline_action_before == decline_action_after == []
     # The denied requests used these exact IDs first; an eligible terminal can
     # still carry out the original operation instead of seeing a replay/conflict.
     assert registered_accept[0] == 200
