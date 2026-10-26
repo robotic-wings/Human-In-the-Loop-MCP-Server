@@ -282,6 +282,20 @@ class CallCoordinator:
             state["state"] = row["state"]
             return state
 
+    def operator_call_page(self, call_id: str) -> dict[str, Any] | None:
+        """Return the minimal authenticated browser display view for one call."""
+        with self._write_transaction() as connection:
+            try:
+                row = self._call_or_raise(connection, call_id)
+            except KeyError:
+                return None
+            self._settle_if_expired(connection, row)
+            row = self._call_or_raise(connection, call_id)
+            state = self._terminal_state_result(row)
+            state["state"] = row["state"]
+            state["message"] = row["message"]
+            return state
+
     def register_terminal_presence(
         self, *, device_id: str, terminal_platform: str, route_device_id: str,
         callback_url: str | None, instance_id: str, gui_ready: bool,
