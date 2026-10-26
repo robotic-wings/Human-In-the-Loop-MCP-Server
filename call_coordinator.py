@@ -143,6 +143,7 @@ class CallCoordinator:
         action_id: str,
         session_id: str | None,
         terminal_platform: str,
+        legacy_route_device_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Perform a routed terminal action without allowing an outsider to reserve an ID."""
         if kind not in {"accept", "decline"}:
@@ -152,9 +153,11 @@ class CallCoordinator:
         )
         payload = self._canonical(action)
         with self._write_transaction() as connection:
-            row = self._routed_terminal_call(connection, device_id, call_id, allow_unrouted=True)
+            row = self._routed_terminal_call(
+                connection, device_id, call_id, legacy_route_device_id=legacy_route_device_id
+            )
             if row is None:
-                return self._terminal_route_denial(connection, call_id)
+                return None
             # Route authorization deliberately precedes replay lookup.  An
             # unauthorized credential must neither observe nor reserve an ID.
             replay = self._action_replay(connection, scoped_action_id, payload)
@@ -170,7 +173,7 @@ class CallCoordinator:
         device_id: str,
         call_id: str | None,
         *,
-        allow_unrouted: bool = False,
+        legacy_route_device_id: str | None = None,
     ) -> sqlite3.Row | None:
         """Look up only a call visible to this terminal credential."""
         if call_id is None:
@@ -179,10 +182,10 @@ class CallCoordinator:
                 "AND state IN ('ringing', 'accepted') ORDER BY created_at LIMIT 1",
                 (device_id,),
             ).fetchone()
-        route_predicate = "(desktop_route_device_id = ? OR desktop_route_device_id IS NULL)" if allow_unrouted else "desktop_route_device_id = ?"
         return connection.execute(
-            f"SELECT * FROM calls WHERE call_id = ? AND {route_predicate}",
-            (call_id, device_id),
+            "SELECT * FROM calls WHERE call_id = ? AND (desktop_route_device_id = ? "
+            "OR (desktop_route_device_id IS NULL AND ? IS NOT NULL AND ? = ?))",
+            (call_id, device_id, legacy_route_device_id, legacy_route_device_id, device_id),
         ).fetchone()
 
     @staticmethod
@@ -213,14 +216,6 @@ class CallCoordinator:
                 AcceptCall(call_id, scoped_action_id, device_id, session_id or "", "desktop", terminal_platform)
             )
         return scoped_action_id, asdict(DeclineCall(call_id, scoped_action_id, device_id))
-
-    def _terminal_route_denial(
-        self, connection: sqlite3.Connection, call_id: str
-    ) -> dict[str, Any] | None:
-        existing = connection.execute("SELECT state FROM calls WHERE call_id = ?", (call_id,)).fetchone()
-        if existing is not None and existing["state"] == "accepted":
-            return {"success": False, "status": "ownership_conflict", "needs_continuation": False}
-        return None
 
     def _action_replay(
         self, connection: sqlite3.Connection, action_id: str, payload: str
