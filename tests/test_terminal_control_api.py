@@ -11,6 +11,7 @@ from __future__ import annotations
 import http.client
 import json
 import ssl
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Barrier, Thread
@@ -85,6 +86,20 @@ def _terminal_request(
         return status, {"_non_json": raw.decode("utf-8", errors="replace")}
 
 
+def _wait_for_tls_gateway(process: Any, port: int, certificate: Path) -> None:
+    """Wait for a completed TLS request, not merely an opened TCP socket."""
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise AssertionError("central service stopped before its TLS gateway was ready")
+        try:
+            _terminal_request(port, certificate, "GET", "/__tls-ready", None)
+            return
+        except OSError:
+            time.sleep(0.03)
+    raise AssertionError("central service did not accept a TLS request after restart")
+
+
 def _create_ringing_call(port: int, certificate: Path, request_id: str) -> dict[str, Any]:
     status, response, _ = _post(port, certificate, _call(request_id), "test-token-alpha")
     assert status == 200
@@ -94,12 +109,21 @@ def _create_ringing_call(port: int, certificate: Path, request_id: str) -> dict[
 
 
 def _read_opened_event(
-    port: int, certificate: Path, created: dict[str, Any], request_id: str
+    port: int,
+    certificate: Path,
+    created: dict[str, Any],
+    request_id: str,
+    after_event_seq: int = 0,
 ) -> dict[str, Any]:
     status, response, _ = _post(
         port,
         certificate,
-        _continuation(request_id, created["interaction_id"], created["call_id"], 0),
+        _continuation(
+            request_id,
+            created["interaction_id"],
+            created["call_id"],
+            after_event_seq,
+        ),
         "test-token-alpha",
     )
     assert status == 200
@@ -193,7 +217,12 @@ def test_terminal_state_is_read_only_and_accept_derives_desktop_identity_then_pe
 
     restarted = _start(config)
     _wait_for_listener(restarted, port)
+    _wait_for_tls_gateway(restarted, port, certificate)
     try:
+        opened = _read_opened_event(port, certificate, created, "opened-after-restart")
+        after_opened = _read_opened_event(
+            port, certificate, created, "opened-after-event", opened["event_seq"]
+        )
         state_status, state = _terminal_request(
             port, certificate, "GET", "/api/terminals/state", "desktop-token"
         )
@@ -205,19 +234,17 @@ def test_terminal_state_is_read_only_and_accept_derives_desktop_identity_then_pe
             "other-desktop-token",
             {"action_id": "takeover", "owner_session_id": "other-session"},
         )
-        opened = _read_opened_event(port, certificate, created, "opened-after-restart")
     finally:
         _stop(restarted)
 
     assert state_status == 200
     assert state["call"]["owner_device_id"] == "desktop-registered"
     assert state["call"]["owner_session_id"] == "desktop-session-1"
-    assert opened["status"] == "opened"
+    assert opened == accepted
     assert opened["event_seq"] == 1
-    assert opened["owner_device_id"] == "desktop-registered"
-    assert opened["owner_session_id"] == "desktop-session-1"
-    assert opened["handled_on"] == "desktop"
-    assert opened["terminal_platform"] == "windows"
+    assert after_opened["status"] == "heartbeat"
+    assert after_opened["event_seq"] == opened["event_seq"]
+    assert after_opened["call_state"] == "accepted"
     assert takeover_status == 409
     assert takeover["status"] == "ownership_conflict"
 
@@ -244,16 +271,21 @@ def test_terminal_decline_releases_busy_and_never_supplies_an_answer_value(
 
     restarted = _start(config)
     _wait_for_listener(restarted, port)
+    _wait_for_tls_gateway(restarted, port, certificate)
     try:
         event = _read_opened_event(port, certificate, created, "decline-after-restart")
-        terminal_replay = _read_opened_event(port, certificate, created, "decline-after-event")
+        terminal_replay = _read_opened_event(
+            port, certificate, created, "decline-after-event", event["event_seq"]
+        )
         next_call = _create_ringing_call(port, certificate, "after-decline")
     finally:
         _stop(restarted)
 
     assert declined_status == 200
-    assert declined["status"] == event["status"] == "declined"
+    assert event == declined
+    assert declined["status"] == "declined"
     assert event["event_seq"] == terminal_replay["event_seq"] == 1
+    assert terminal_replay["status"] == "declined"
     assert declined["human_action"] is True
     for value in (declined, event):
         assert "user_input" not in value
