@@ -351,6 +351,8 @@ class CallCoordinator:
         owner_session_id: str,
         submission_id: str,
         user_input: str,
+        task_version: int = 0,
+        attachment_ids: list[str] | None = None,
         legacy_route_device_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Persist one final simple-text answer from the accepted owner session.
@@ -365,9 +367,27 @@ class CallCoordinator:
             or len(submission_id) > 128
             or not submission_id.isascii()
             or not isinstance(user_input, str)
+            or not isinstance(task_version, int)
+            or isinstance(task_version, bool)
+            or task_version < 0
+            or (
+                attachment_ids is not None
+                and (
+                    not isinstance(attachment_ids, list)
+                    or any(not isinstance(attachment_id, str) or not attachment_id for attachment_id in attachment_ids)
+                )
+            )
         ):
             return {"success": False, "status": "invalid_submission"}
-        payload = self._canonical({"user_input": user_input})
+        has_attachment_ids = attachment_ids is not None
+        attachment_ids = [] if attachment_ids is None else attachment_ids
+        payload = self._canonical(
+            {
+                "user_input": user_input,
+                "task_version": task_version,
+                "attachment_ids": attachment_ids,
+            }
+        )
         with self._write_transaction() as connection:
             row = self._routed_terminal_call(
                 connection, device_id, call_id, legacy_route_device_id=legacy_route_device_id
@@ -389,6 +409,26 @@ class CallCoordinator:
             row = self._call_or_raise(connection, call_id)
             if row["state"] != "accepted":
                 return self._current_result(connection, row)
+            if row["task_version"] != task_version:
+                return {
+                    "success": False,
+                    "status": "task_version_conflict",
+                    "call_state": row["state"],
+                    "task_version": row["task_version"],
+                    "needs_continuation": False,
+                }
+            if attachment_ids:
+                found = connection.execute(
+                    "SELECT attachment_id FROM attachments WHERE call_id = ? "
+                    "AND attachment_id IN (%s)" % ", ".join("?" for _ in attachment_ids),
+                    (call_id, *attachment_ids),
+                ).fetchall()
+                if {item["attachment_id"] for item in found} != set(attachment_ids):
+                    return {
+                        "success": False,
+                        "status": "invalid_attachment_reference",
+                        "needs_continuation": False,
+                    }
             result = {
                 "success": True,
                 "status": "answered",
@@ -403,6 +443,8 @@ class CallCoordinator:
                 "terminal_platform": row["terminal_platform"],
                 "user_input": user_input,
             }
+            if has_attachment_ids:
+                result["attachment_ids"] = attachment_ids
             connection.execute(
                 "UPDATE calls SET state = 'answered', version = version + 1 WHERE call_id = ?",
                 (call_id,),
@@ -1102,7 +1144,8 @@ class CallCoordinator:
                 owner_device_id TEXT, owner_session_id TEXT, handled_on TEXT,
                 terminal_platform TEXT, desktop_route_device_id TEXT,
                 terminal_last_seen_at TEXT, terminal_disconnect_deadline TEXT,
-                draft_body TEXT, draft_version INTEGER NOT NULL DEFAULT 0
+                draft_body TEXT, draft_version INTEGER NOT NULL DEFAULT 0,
+                task_version INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS create_operations (
                 caller_id TEXT NOT NULL, request_id TEXT NOT NULL, payload TEXT NOT NULL,
@@ -1155,6 +1198,10 @@ class CallCoordinator:
         if "draft_version" not in columns:
             self._connection.execute(
                 "ALTER TABLE calls ADD COLUMN draft_version INTEGER NOT NULL DEFAULT 0"
+            )
+        if "task_version" not in columns:
+            self._connection.execute(
+                "ALTER TABLE calls ADD COLUMN task_version INTEGER NOT NULL DEFAULT 0"
             )
         self._backfill_legacy_accepted_liveness()
         self._connection.commit()

@@ -659,12 +659,17 @@ class _TerminalGateway:
         owner_session_id = payload.get("owner_session_id")
         submission_id = payload.get("submission_id")
         user_input = payload.get("user_input")
+        task_version = payload.get("task_version", 0)
+        attachment_ids = payload.get("attachment_ids")
         if (
             not isinstance(owner_session_id, str)
             or not owner_session_id
             or not isinstance(submission_id, str)
             or not submission_id
             or not isinstance(user_input, str)
+            or not isinstance(task_version, int)
+            or isinstance(task_version, bool)
+            or (attachment_ids is not None and not isinstance(attachment_ids, list))
         ):
             return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
         result = self._coordinator.submit_terminal_text(
@@ -673,6 +678,8 @@ class _TerminalGateway:
             owner_session_id,
             submission_id,
             user_input,
+            task_version,
+            attachment_ids,
             self._legacy_route_device_id,
         )
         if result is None:
@@ -681,6 +688,10 @@ class _TerminalGateway:
             return HTTPStatus.NOT_FOUND, {"error": "not found"}
         if result["status"] == "request_conflict":
             return HTTPStatus.CONFLICT, result
+        if result["status"] == "task_version_conflict":
+            return HTTPStatus.CONFLICT, result
+        if result["status"] == "invalid_attachment_reference":
+            return HTTPStatus.BAD_REQUEST, result
         if result["status"] == "invalid_submission":
             return HTTPStatus.BAD_REQUEST, result
         if result["status"] != "answered":
