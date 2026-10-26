@@ -719,9 +719,13 @@ def _serve(config: ServiceConfig) -> None:
     try:
         coordinator.recover_and_settle()
         scheduler.start()
-        route_device_id = config.eligible_desktop_device_ids[0] if config.eligible_desktop_device_ids else None
-        gateway = _McpGateway(coordinator, credentials, route_device_id)
-        terminal_gateway = _TerminalGateway(coordinator, terminal_credentials, route_device_id)
+        configured_desktop_route_device_id = (
+            config.eligible_desktop_device_ids[0] if config.eligible_desktop_device_ids else None
+        )
+        gateway = _McpGateway(coordinator, credentials, configured_desktop_route_device_id)
+        terminal_gateway = _TerminalGateway(
+            coordinator, terminal_credentials, configured_desktop_route_device_id
+        )
         server = _create_secure_server(config, context, gateway, terminal_gateway)
         try:
             server.serve_forever()

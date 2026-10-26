@@ -182,10 +182,15 @@ class CallCoordinator:
                 "AND state IN ('ringing', 'accepted') ORDER BY created_at LIMIT 1",
                 (device_id,),
             ).fetchone()
+        if legacy_route_device_id == device_id:
+            # Only the configured legacy route can recover an older NULL
+            # route. A NULL value never authorizes an arbitrary terminal.
+            route_predicate = "(desktop_route_device_id = ? OR desktop_route_device_id IS NULL)"
+        else:
+            route_predicate = "desktop_route_device_id = ?"
         return connection.execute(
-            "SELECT * FROM calls WHERE call_id = ? AND (desktop_route_device_id = ? "
-            "OR (desktop_route_device_id IS NULL AND ? IS NOT NULL AND ? = ?))",
-            (call_id, device_id, legacy_route_device_id, legacy_route_device_id, device_id),
+            f"SELECT * FROM calls WHERE call_id = ? AND {route_predicate}",
+            (call_id, device_id),
         ).fetchone()
 
     @staticmethod
