@@ -151,7 +151,19 @@ def test_configured_archive_limit_preserves_existing_archive_and_rejects_new_fil
     _wait_for_tls_gateway(process, port, certificate)
     existing_bytes = b"six!!!"
     try:
-        call_id = _accepted_call(port, certificate, "quota-archive-create", "archive-owner")
+        prior_call_id = _accepted_call(port, certificate, "quota-archive-prior", "prior-owner")
+        ended = _terminal_request(
+            port,
+            certificate,
+            "POST",
+            f"/api/calls/{prior_call_id}/cancel",
+            "desktop-token",
+            {"action_id": "quota-archive-prior-end", "owner_session_id": "prior-owner"},
+        )
+        assert ended[0] == 200
+        candidate_call_id = _accepted_call(
+            port, certificate, "quota-archive-candidate", "archive-owner"
+        )
         database = tmp_path / "data" / "calls.sqlite3"
         attachment_id = str(uuid.uuid4())
         archive_path = tmp_path / "data" / "attachments" / attachment_id
@@ -162,11 +174,24 @@ def test_configured_archive_limit_preserves_existing_archive_and_rejects_new_fil
                 "INSERT INTO attachments "
                 "(attachment_id, call_id, original_name, media_type, byte_count, sha256, storage_path) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (attachment_id, call_id, "prior.txt", "text/plain", len(existing_bytes), "prior", str(archive_path)),
+                (
+                    attachment_id,
+                    prior_call_id,
+                    "prior.txt",
+                    "text/plain",
+                    len(existing_bytes),
+                    "prior",
+                    str(archive_path),
+                ),
             )
 
         rejected = _upload(
-            port, certificate, call_id, "desktop-token", "archive-owner", content=b"three"
+            port,
+            certificate,
+            candidate_call_id,
+            "desktop-token",
+            "archive-owner",
+            content=b"three",
         )
         assert rejected == (
             413,
@@ -176,15 +201,18 @@ def test_configured_archive_limit_preserves_existing_archive_and_rejects_new_fil
                 "reason": "archive_capacity_exceeded",
             },
         )
-        rows = _attachment_rows(database, call_id)
-        assert len(rows) == 1
-        assert rows[0]["attachment_id"] == attachment_id
+        prior_rows = _attachment_rows(database, prior_call_id)
+        assert len(prior_rows) == 1
+        assert prior_rows[0]["attachment_id"] == attachment_id
+        assert _attachment_rows(database, candidate_call_id) == []
         assert archive_path.read_bytes() == existing_bytes
         assert _attachment_files(tmp_path / "data") == [archive_path]
         with sqlite3.connect(database) as connection:
-            state = connection.execute("SELECT state FROM calls WHERE call_id = ?", (call_id,)).fetchone()
-        assert state == ("accepted",)
-        assert _event_states(database, call_id) == [(1, "opened")]
+            candidate_state = connection.execute(
+                "SELECT state FROM calls WHERE call_id = ?", (candidate_call_id,)
+            ).fetchone()
+        assert candidate_state == ("accepted",)
+        assert _event_states(database, candidate_call_id) == [(1, "opened")]
     finally:
         _stop(process)
 
