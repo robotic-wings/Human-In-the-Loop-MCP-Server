@@ -465,9 +465,15 @@ def _rpc_error(request_id: object, code: int, message: str) -> dict[str, object]
 
 
 class _TerminalGateway:
-    def __init__(self, coordinator: CallCoordinator, credentials: dict[str, _TerminalIdentity]) -> None:
+    def __init__(
+        self,
+        coordinator: CallCoordinator,
+        credentials: dict[str, _TerminalIdentity],
+        legacy_route_device_id: str | None = None,
+    ) -> None:
         self._coordinator = coordinator
         self._credentials = credentials
+        self._legacy_route_device_id = legacy_route_device_id
 
     def identity_for(self, authorization: str | None) -> _TerminalIdentity | None:
         if not isinstance(authorization, str) or not authorization.startswith("Bearer "):
@@ -494,6 +500,7 @@ class _TerminalGateway:
             action_id,
             session_id if isinstance(session_id, str) else None,
             identity.terminal_platform,
+            self._legacy_route_device_id,
         )
         return self._action_response(result)
 
@@ -712,9 +719,13 @@ def _serve(config: ServiceConfig) -> None:
     try:
         coordinator.recover_and_settle()
         scheduler.start()
-        route_device_id = config.eligible_desktop_device_ids[0] if config.eligible_desktop_device_ids else None
-        gateway = _McpGateway(coordinator, credentials, route_device_id)
-        terminal_gateway = _TerminalGateway(coordinator, terminal_credentials)
+        configured_desktop_route_device_id = (
+            config.eligible_desktop_device_ids[0] if config.eligible_desktop_device_ids else None
+        )
+        gateway = _McpGateway(coordinator, credentials, configured_desktop_route_device_id)
+        terminal_gateway = _TerminalGateway(
+            coordinator, terminal_credentials, configured_desktop_route_device_id
+        )
         server = _create_secure_server(config, context, gateway, terminal_gateway)
         try:
             server.serve_forever()
