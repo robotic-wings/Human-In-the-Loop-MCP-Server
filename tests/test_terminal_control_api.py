@@ -425,7 +425,7 @@ def test_terminal_action_id_replays_exactly_and_changed_request_conflicts_withou
     assert event == first
 
 
-def test_expiry_settlement_precedes_concurrent_terminal_actions_without_revival(
+def test_terminal_actions_settle_expiry_before_accept_decline_race_without_revival(
     tmp_path: Path,
 ) -> None:
     """Terminal actions cannot beat a deadline merely because scheduling is late."""
@@ -502,7 +502,7 @@ def test_expiry_settlement_precedes_concurrent_terminal_actions_without_revival(
     reopened.close()
 
 
-def test_terminal_endpoint_actions_settle_expiry_before_accept_decline_race_without_revival(
+def test_terminal_endpoint_actions_reject_expired_accept_decline_race_without_revival(
     tmp_path: Path,
 ) -> None:
     """The HTTP actions must share the coordinator's transactional expiry rule."""
