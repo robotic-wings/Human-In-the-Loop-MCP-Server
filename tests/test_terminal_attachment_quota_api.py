@@ -7,6 +7,7 @@ multi-file workflow, retry semantics, result reads, or other attachment APIs.
 from __future__ import annotations
 
 import json
+import http.client
 import ssl
 import sqlite3
 import uuid
@@ -19,6 +20,7 @@ from test_terminal_attachment_upload_api import (
     _attachment_files,
     _attachment_rows,
     _event_states,
+    _multipart_attachment,
     _upload,
 )
 from test_terminal_control_api import (
@@ -30,6 +32,7 @@ from test_terminal_control_api import (
 
 
 MIB = 1024 * 1024
+PARSER_OVERHEAD_BYTES = 64 * 1024
 
 
 def _quota_gateway_config(
@@ -74,6 +77,29 @@ def _upload_observing_current_parser_cutoff(*args: object, **kwargs: object) -> 
         return _upload(*args, **kwargs)
     except ssl.SSLEOFError as error:
         return ("connection_eof", type(error).__name__)
+
+
+def _multipart_request(
+    port: int, certificate: Path, path: str, token: str, owner_session_id: str, content: bytes
+) -> tuple[int, object]:
+    body, content_type = _multipart_attachment(owner_session_id, content=content)
+    context = ssl.create_default_context(cafile=str(certificate))
+    connection = http.client.HTTPSConnection("127.0.0.1", port, context=context, timeout=2)
+    connection.request(
+        "POST",
+        path,
+        body=body,
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+            "Content-Type": content_type,
+        },
+    )
+    response = connection.getresponse()
+    raw = response.read()
+    status = response.status
+    connection.close()
+    return status, json.loads(raw.decode("utf-8"))
 
 
 def test_default_file_limit_rejects_twenty_mib_plus_one_before_any_mutation(tmp_path: Path) -> None:
@@ -268,6 +294,7 @@ def test_authorization_and_expiry_precede_quota_rejection_and_preserve_draft(tmp
     finally:
         _stop(process)
 
+
     database = tmp_path / "data" / "calls.sqlite3"
     with sqlite3.connect(database) as connection:
         connection.execute(
@@ -290,6 +317,104 @@ def test_authorization_and_expiry_precede_quota_rejection_and_preserve_draft(tmp
                 "SELECT state, draft_body, draft_version FROM calls WHERE call_id = ?", (expired_call_id,)
             ).fetchone()
         assert state == ("disconnected", "keep this draft", 1)
+        assert _attachment_rows(database, expired_call_id) == []
+        assert _attachment_files(tmp_path / "data") == []
+        assert _event_states(database, expired_call_id) == [(1, "opened"), (2, "disconnected")]
+    finally:
+        _stop(process)
+
+
+def test_parser_guard_uses_submission_limit_result_after_authorization_and_expiry(
+    tmp_path: Path,
+) -> None:
+    port = _free_port()
+    config, certificate = _quota_gateway_config(
+        tmp_path,
+        port,
+        file_limit=2 * PARSER_OVERHEAD_BYTES,
+        submission_limit=4,
+        archive_limit=2 * PARSER_OVERHEAD_BYTES,
+    )
+    process = _start(config)
+    _wait_for_tls_gateway(process, port, certificate)
+    payload = b"x" * PARSER_OVERHEAD_BYTES
+    try:
+        call_id = _accepted_call(port, certificate, "parser-guard-create", "guard-owner")
+        wrong_device = _upload(
+            port, certificate, call_id, "other-desktop-token", "guard-owner", content=payload
+        )
+        wrong_route = _multipart_request(
+            port,
+            certificate,
+            "/api/not-a-terminal-route",
+            "desktop-token",
+            "guard-owner",
+            payload,
+        )
+        capacity = _upload(
+            port, certificate, call_id, "desktop-token", "guard-owner", content=payload
+        )
+        _assert_unmodified_accepted_call(tmp_path, call_id)
+
+        ended = _terminal_request(
+            port,
+            certificate,
+            "POST",
+            f"/api/calls/{call_id}/cancel",
+            "desktop-token",
+            {"action_id": "parser-guard-end", "owner_session_id": "guard-owner"},
+        )
+        assert ended[0] == 200
+
+        expired_call_id = _accepted_call(port, certificate, "parser-guard-expiry", "expiry-owner")
+        saved = _terminal_request(
+            port,
+            certificate,
+            "PUT",
+            f"/api/calls/{expired_call_id}/draft",
+            "desktop-token",
+            {
+                "owner_session_id": "expiry-owner",
+                "body": "retain parser guard draft",
+                "expected_draft_version": 0,
+            },
+        )
+        assert saved[0] == 200
+    finally:
+        _stop(process)
+
+    database = tmp_path / "data" / "calls.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE calls SET terminal_disconnect_deadline = ? WHERE call_id = ?",
+            ((datetime.now(UTC) - timedelta(seconds=1)).isoformat(), expired_call_id),
+        )
+
+    process = _start(config)
+    _wait_for_tls_gateway(process, port, certificate)
+    try:
+        expired = _upload(
+            port, certificate, expired_call_id, "desktop-token", "expiry-owner", content=payload
+        )
+        assert capacity == (
+            413,
+            {
+                "success": False,
+                "status": "attachment_rejected",
+                "reason": "submission_limit_exceeded",
+            },
+        )
+        assert expired == (
+            409,
+            {"success": False, "status": "disconnected", "reason": "terminal_disconnected"},
+        )
+        assert wrong_device == (404, {"error": "not found"})
+        assert wrong_route == (404, {"error": "not found"})
+        with sqlite3.connect(database) as connection:
+            state = connection.execute(
+                "SELECT state, draft_body, draft_version FROM calls WHERE call_id = ?", (expired_call_id,)
+            ).fetchone()
+        assert state == ("disconnected", "retain parser guard draft", 1)
         assert _attachment_rows(database, expired_call_id) == []
         assert _attachment_files(tmp_path / "data") == []
         assert _event_states(database, expired_call_id) == [(1, "opened"), (2, "disconnected")]
