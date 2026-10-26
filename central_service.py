@@ -615,6 +615,46 @@ class _TerminalGateway:
             return HTTPStatus.BAD_REQUEST, result
         return HTTPStatus.OK, result
 
+    def submit_text(
+        self, identity: _TerminalIdentity, call_id: str, payload: object
+    ) -> tuple[HTTPStatus, dict[str, object]]:
+        if not isinstance(payload, dict):
+            return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
+        owner_session_id = payload.get("owner_session_id")
+        submission_id = payload.get("submission_id")
+        user_input = payload.get("user_input")
+        if (
+            not isinstance(owner_session_id, str)
+            or not owner_session_id
+            or not isinstance(submission_id, str)
+            or not submission_id
+            or not isinstance(user_input, str)
+        ):
+            return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
+        result = self._coordinator.submit_terminal_text(
+            call_id,
+            identity.device_id,
+            owner_session_id,
+            submission_id,
+            user_input,
+            self._legacy_route_device_id,
+        )
+        if result is None:
+            # Unknown calls, wrong route credentials, and wrong owner sessions
+            # intentionally have the same response.
+            return HTTPStatus.NOT_FOUND, {"error": "not found"}
+        if result["status"] == "request_conflict":
+            return HTTPStatus.CONFLICT, result
+        if result["status"] == "invalid_submission":
+            return HTTPStatus.BAD_REQUEST, result
+        if result["status"] != "answered":
+            return HTTPStatus.CONFLICT, {
+                "success": False,
+                "status": result["status"],
+                "reason": result.get("reason"),
+            }
+        return HTTPStatus.OK, result
+
     def read_draft(
         self, identity: _TerminalIdentity, call_id: str, owner_session_id: str | None
     ) -> tuple[HTTPStatus, dict[str, object]]:
@@ -785,6 +825,18 @@ class _PublicHandler(BaseHTTPRequestHandler):
             return None
         return parts[3], parts[4]
 
+    @staticmethod
+    def _terminal_submission_call_id(path: str) -> str | None:
+        parts = path.split("/")
+        if (
+            len(parts) == 5
+            and parts[:3] == ["", "api", "calls"]
+            and parts[3]
+            and parts[4] == "submissions"
+        ):
+            return parts[3]
+        return None
+
     def _terminal_request_body(self) -> tuple[bool, object]:
         try:
             content_length = int(self.headers.get("Content-Length", ""))
@@ -808,6 +860,14 @@ class _PublicHandler(BaseHTTPRequestHandler):
                 status, response = terminal.register(identity, payload)
             else:
                 status, response = terminal.device_heartbeat(identity, payload)
+            self._send_json(status, response)
+            return
+        submission_call_id = self._terminal_submission_call_id(path)
+        if submission_call_id is not None:
+            body_ok, payload = self._terminal_request_body()
+            if not body_ok:
+                return
+            status, response = terminal.submit_text(identity, submission_call_id, payload)
             self._send_json(status, response)
             return
         route = self._terminal_action_route(path)
