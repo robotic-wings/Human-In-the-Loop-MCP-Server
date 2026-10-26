@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import base64
 import sqlite3
 import threading
 import uuid
@@ -442,6 +443,7 @@ class CallCoordinator:
                 "handled_on": row["handled_on"],
                 "terminal_platform": row["terminal_platform"],
                 "user_input": user_input,
+                "result_id": str(uuid.uuid4()),
             }
             if has_attachment_ids:
                 result["attachment_ids"] = attachment_ids
@@ -456,6 +458,57 @@ class CallCoordinator:
                 (call_id, submission_id, payload, self._canonical(result)),
             )
             return result
+
+    def read_interaction_result(
+        self, caller_id: str, interaction_id: object, result_id: object,
+        cursor: object, max_result_bytes: object,
+    ) -> dict[str, Any]:
+        """Read an immutable final body page without changing durable state."""
+        if not self._valid_read_request(interaction_id, result_id, cursor, max_result_bytes):
+            return self._invalid_read_request(max_result_bytes)
+        assert isinstance(interaction_id, str) and isinstance(result_id, str)
+        assert isinstance(cursor, int) and isinstance(max_result_bytes, int)
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT call_id FROM calls WHERE interaction_id = ? AND caller_id = ?",
+                (interaction_id, caller_id),
+            ).fetchone()
+            if row is None:
+                return self._not_found_read()
+            result = self._result_for_id(row["call_id"], result_id)
+            if result is None:
+                return self._not_found_read()
+            body = result.get("user_input")
+            if not isinstance(body, str) or cursor > len(body):
+                return self._not_found_read()
+            attachments = self._result_attachments(row["call_id"], result)
+            page = self._body_page(result_id, body, cursor, max_result_bytes, attachments)
+            return page if page is not None else self._not_found_read()
+
+    def read_interaction_attachment(
+        self, caller_id: str, interaction_id: object, attachment_id: object,
+        offset_bytes: object, max_result_bytes: object,
+    ) -> dict[str, Any]:
+        """Read archive bytes by raw-byte offset without touching call state."""
+        if not self._valid_read_request(interaction_id, attachment_id, offset_bytes, max_result_bytes):
+            return self._invalid_read_request(max_result_bytes)
+        assert isinstance(interaction_id, str) and isinstance(attachment_id, str)
+        assert isinstance(offset_bytes, int) and isinstance(max_result_bytes, int)
+        with self._lock:
+            item = self._connection.execute(
+                "SELECT a.* FROM attachments a JOIN calls c ON c.call_id = a.call_id "
+                "WHERE c.interaction_id = ? AND c.caller_id = ? AND a.attachment_id = ?",
+                (interaction_id, caller_id, attachment_id),
+            ).fetchone()
+            if item is None or offset_bytes > item["byte_count"]:
+                return self._not_found_read()
+            try:
+                content = Path(item["storage_path"]).read_bytes()
+            except OSError:
+                return self._not_found_read()
+            if len(content) != item["byte_count"]:
+                return self._not_found_read()
+            return self._attachment_page(item, content, offset_bytes, max_result_bytes)
 
     def upload_terminal_attachment(
         self,
@@ -564,6 +617,108 @@ class CallCoordinator:
             if row["state"] != "accepted":
                 return self._current_result(connection, row)
             return self._attachment_rejected("submission_limit_exceeded")
+
+    @staticmethod
+    def _valid_read_request(
+        interaction_id: object, item_id: object, cursor: object, max_result_bytes: object
+    ) -> bool:
+        return (
+            isinstance(interaction_id, str) and bool(interaction_id)
+            and isinstance(item_id, str) and bool(item_id)
+            and isinstance(cursor, int) and not isinstance(cursor, bool) and cursor >= 0
+            and isinstance(max_result_bytes, int) and not isinstance(max_result_bytes, bool)
+            and max_result_bytes >= 16_384
+        )
+
+    @staticmethod
+    def _invalid_read_request(max_result_bytes: object) -> dict[str, Any]:
+        if (
+            not isinstance(max_result_bytes, int)
+            or isinstance(max_result_bytes, bool)
+            or max_result_bytes < 16_384
+        ):
+            return {
+                "success": False,
+                "status": "invalid_result_budget",
+                "needs_continuation": False,
+            }
+        return {"success": False, "status": "session_not_found", "needs_continuation": False}
+
+    @staticmethod
+    def _not_found_read() -> dict[str, Any]:
+        return {"success": False, "status": "session_not_found", "needs_continuation": False}
+
+    def _result_for_id(self, call_id: str, result_id: str) -> dict[str, Any] | None:
+        rows = self._connection.execute(
+            "SELECT result FROM submission_operations WHERE call_id = ?", (call_id,)
+        ).fetchall()
+        for row in rows:
+            result = self._decode(row["result"])
+            if result.get("result_id") == result_id:
+                return result
+        return None
+
+    def _result_attachments(self, call_id: str, result: dict[str, Any]) -> list[dict[str, Any]]:
+        attachment_ids = result.get("attachment_ids")
+        if not isinstance(attachment_ids, list):
+            return []
+        metadata: list[dict[str, Any]] = []
+        for attachment_id in attachment_ids:
+            if not isinstance(attachment_id, str):
+                continue
+            row = self._connection.execute(
+                "SELECT attachment_id, original_name, media_type, byte_count, sha256 "
+                "FROM attachments WHERE call_id = ? AND attachment_id = ?",
+                (call_id, attachment_id),
+            ).fetchone()
+            if row is not None:
+                metadata.append({
+                    "attachment_id": row["attachment_id"], "name": row["original_name"],
+                    "media_type": row["media_type"], "byte_count": row["byte_count"],
+                    "sha256": row["sha256"],
+                })
+        return metadata
+
+    def _body_page(
+        self, result_id: str, body: str, cursor: int, budget: int,
+        attachments: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        def page(end: int) -> dict[str, Any]:
+            complete = end == len(body)
+            return {
+                "success": True, "result_id": result_id, "body": body[cursor:end],
+                "full_length": len(body), "complete": complete,
+                "next_cursor": None if complete else end, "attachments": attachments,
+            }
+        return self._largest_budgeted_page(cursor, len(body), budget, page)
+
+    def _attachment_page(
+        self, item: sqlite3.Row, content: bytes, offset: int, budget: int
+    ) -> dict[str, Any]:
+        def page(end: int) -> dict[str, Any]:
+            complete = end == len(content)
+            return {
+                "success": True, "attachment_id": item["attachment_id"],
+                "data_base64": base64.b64encode(content[offset:end]).decode("ascii"),
+                "full_length": len(content), "sha256": item["sha256"], "complete": complete,
+                "next_offset_bytes": None if complete else end,
+            }
+        result = self._largest_budgeted_page(offset, len(content), budget, page)
+        return result if result is not None else self._not_found_read()
+
+    def _largest_budgeted_page(
+        self, start: int, length: int, budget: int, build: Any
+    ) -> dict[str, Any] | None:
+        if len(self._canonical(build(start)).encode("utf-8")) > budget:
+            return None
+        low, high = start, length
+        while low < high:
+            middle = (low + high + 1) // 2
+            if len(self._canonical(build(middle)).encode("utf-8")) <= budget:
+                low = middle
+            else:
+                high = middle - 1
+        return build(low)
 
     @staticmethod
     def _attachment_rejected(reason: str) -> dict[str, Any]:
