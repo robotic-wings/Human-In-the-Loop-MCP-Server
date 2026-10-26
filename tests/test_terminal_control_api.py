@@ -22,6 +22,7 @@ from test_central_mcp_gateway import (
     _call,
     _free_port,
     _post,
+    _rpc,
     _start,
     _stop,
     _structured,
@@ -87,16 +88,24 @@ def _terminal_request(
 
 
 def _wait_for_tls_gateway(process: Any, port: int, certificate: Path) -> None:
-    """Wait for a completed TLS request, not merely an opened TCP socket."""
+    """Wait for authenticated MCP/TLS readiness without masking HTTP failures."""
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise AssertionError("central service stopped before its TLS gateway was ready")
         try:
-            _terminal_request(port, certificate, "GET", "/__tls-ready", None)
-            return
+            status, _, _ = _post(
+                port,
+                certificate,
+                _rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}}),
+                "test-token-alpha",
+            )
         except OSError:
             time.sleep(0.03)
+            continue
+        if status != 200:
+            raise AssertionError(f"central service rejected authenticated TLS readiness: {status}")
+        return
     raise AssertionError("central service did not accept a TLS request after restart")
 
 
@@ -338,7 +347,10 @@ def test_deadline_settlement_races_terminal_accept_with_one_durable_winner_no_re
     events = coordinator.events_for(created["call_id"])
     coordinator.close()
 
-    assert len(outcomes) == 2
+    # Whichever transaction acquires SQLite first settles expiry.  If the
+    # terminal action wins it returns the timeout result itself, so recovery
+    # correctly has no independent result to append.
+    assert 1 <= len(outcomes) <= 2
     assert all(result["status"] == "not_accepted" for result in outcomes)
     assert final["call_state"] == "not_accepted"
     assert final["owner_device_id"] is None
