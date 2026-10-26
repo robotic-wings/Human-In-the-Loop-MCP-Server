@@ -864,6 +864,7 @@ class CallCoordinator:
         call_id: str,
         after_event_seq: int,
         payload: str,
+        client_timeout_seconds: int | None = None,
     ) -> dict[str, Any]:
         """Read one durable event, or save a nonblocking heartbeat snapshot.
 
@@ -871,13 +872,14 @@ class CallCoordinator:
         a lost HTTP response replayable without advancing either cursor or the
         call's absolute ringing deadline.
         """
-        operation_payload = self._canonical(
-            {
-                "interaction_id": interaction_id,
-                "call_id": call_id,
-                "after_event_seq": after_event_seq,
-                "payload": payload,
-            }
+        if client_timeout_seconds is not None:
+            result, waiting = self.begin_wait_leg(
+                caller_id, request_id, interaction_id, call_id, after_event_seq,
+                payload, client_timeout_seconds,
+            )
+            return result
+        operation_payload = self._continuation_payload(
+            interaction_id, call_id, after_event_seq, payload
         )
         with self._write_transaction() as connection:
             row = self._owned_call(connection, caller_id, interaction_id, call_id)
@@ -897,6 +899,90 @@ class CallCoordinator:
                 self._start_agent_reconnect_grace(connection, call_id)
             self._store_continuation_snapshot(
                 connection, caller_id, request_id, operation_payload, result
+            )
+            return result
+
+    def begin_wait_leg(
+        self,
+        caller_id: str,
+        request_id: str,
+        interaction_id: str,
+        call_id: str,
+        after_event_seq: int,
+        payload: str,
+        client_timeout_seconds: object,
+    ) -> tuple[dict[str, Any], bool]:
+        """Claim one bounded wait leg, returning a response only when it is ready."""
+        leg_seconds = self._safe_leg_seconds(client_timeout_seconds)
+        if leg_seconds is None:
+            return self._invalid_client_timeout(), False
+        operation_payload = self._continuation_payload(
+            interaction_id, call_id, after_event_seq, payload
+        )
+        with self._write_transaction() as connection:
+            row = self._owned_call(connection, caller_id, interaction_id, call_id)
+            if row is None:
+                return self._session_not_found(), False
+            replay = self._continuation_replay(
+                connection, caller_id, request_id, operation_payload
+            )
+            if replay is not None:
+                return replay, False
+            self._settle_if_expired(connection, row)
+            row = self._call_or_raise(connection, call_id)
+            result = self._continuation_result(connection, row, after_event_seq)
+            if result["status"] != "heartbeat":
+                self._finish_wait_leg(
+                    connection, caller_id, request_id, operation_payload, call_id, result
+                )
+                return result, False
+            if row["wait_request_id"] is not None:
+                if row["wait_request_id"] != request_id:
+                    return self._already_waiting(), False
+                # A duplicate HTTP delivery of the still-running operation
+                # shares its original persisted deadline; it must not restart
+                # the leg before the first response is snapshotted.
+                return result, True
+            deadline = self._now() + timedelta(seconds=leg_seconds)
+            connection.execute(
+                "UPDATE calls SET wait_leg_deadline = ?, wait_request_id = ? WHERE call_id = ?",
+                (self._stamp(deadline), request_id, call_id),
+            )
+            return result, True
+
+    def poll_wait_leg(
+        self,
+        caller_id: str,
+        request_id: str,
+        interaction_id: str,
+        call_id: str,
+        after_event_seq: int,
+        payload: str,
+    ) -> dict[str, Any] | None:
+        """Return a ready wait-leg response, or None while its persisted leg remains open."""
+        operation_payload = self._continuation_payload(
+            interaction_id, call_id, after_event_seq, payload
+        )
+        with self._write_transaction() as connection:
+            row = self._owned_call(connection, caller_id, interaction_id, call_id)
+            if row is None:
+                return self._session_not_found()
+            replay = self._continuation_replay(
+                connection, caller_id, request_id, operation_payload
+            )
+            if replay is not None:
+                return replay
+            if row["wait_request_id"] != request_id:
+                return self._already_waiting()
+            self._settle_if_expired(connection, row)
+            row = self._call_or_raise(connection, call_id)
+            result = self._continuation_result(connection, row, after_event_seq)
+            if result["status"] == "heartbeat" and self._now() < self._parse_stamp(
+                row["wait_leg_deadline"]
+            ):
+                return None
+            self._finish_wait_leg(
+                connection, caller_id, request_id, operation_payload, call_id, result
             )
             return result
 
@@ -1260,6 +1346,33 @@ class CallCoordinator:
             return self._decode(replay["result"])
         return self._conflict()
 
+    @staticmethod
+    def _continuation_payload(
+        interaction_id: str, call_id: str, after_event_seq: int, payload: str
+    ) -> str:
+        return CallCoordinator._canonical(
+            {
+                "interaction_id": interaction_id,
+                "call_id": call_id,
+                "after_event_seq": after_event_seq,
+                "payload": payload,
+            }
+        )
+
+    @staticmethod
+    def _safe_leg_seconds(client_timeout_seconds: object) -> int | None:
+        if (
+            not isinstance(client_timeout_seconds, int)
+            or isinstance(client_timeout_seconds, bool)
+            or client_timeout_seconds < 2
+        ):
+            return None
+        return max(
+            1,
+            client_timeout_seconds
+            - min(30, max(1, client_timeout_seconds // 4)),
+        )
+
     def _continuation_result(
         self, connection: sqlite3.Connection, row: sqlite3.Row, after_event_seq: int
     ) -> dict[str, Any]:
@@ -1310,6 +1423,24 @@ class CallCoordinator:
             (caller_id, request_id, operation_payload, self._canonical(result)),
         )
 
+    def _finish_wait_leg(
+        self,
+        connection: sqlite3.Connection,
+        caller_id: str,
+        request_id: str,
+        operation_payload: str,
+        call_id: str,
+        result: dict[str, Any],
+    ) -> None:
+        if result["status"] in {"opened", "heartbeat"}:
+            self._start_agent_reconnect_grace(connection, call_id)
+        self._store_continuation_snapshot(
+            connection, caller_id, request_id, operation_payload, result
+        )
+        connection.execute(
+            "UPDATE calls SET wait_request_id = NULL WHERE call_id = ?", (call_id,)
+        )
+
     def _add_event(
         self, connection: sqlite3.Connection, call_id: str, result: dict[str, Any]
     ) -> None:
@@ -1342,6 +1473,7 @@ class CallCoordinator:
                 terminal_platform TEXT, desktop_route_device_id TEXT,
                 terminal_last_seen_at TEXT, terminal_disconnect_deadline TEXT,
                 agent_reconnect_deadline TEXT,
+                wait_leg_deadline TEXT, wait_request_id TEXT,
                 draft_body TEXT, draft_version INTEGER NOT NULL DEFAULT 0,
                 task_version INTEGER NOT NULL DEFAULT 0
             );
@@ -1393,6 +1525,10 @@ class CallCoordinator:
             self._connection.execute("ALTER TABLE calls ADD COLUMN terminal_disconnect_deadline TEXT")
         if "agent_reconnect_deadline" not in columns:
             self._connection.execute("ALTER TABLE calls ADD COLUMN agent_reconnect_deadline TEXT")
+        if "wait_leg_deadline" not in columns:
+            self._connection.execute("ALTER TABLE calls ADD COLUMN wait_leg_deadline TEXT")
+        if "wait_request_id" not in columns:
+            self._connection.execute("ALTER TABLE calls ADD COLUMN wait_request_id TEXT")
         if "draft_body" not in columns:
             self._connection.execute("ALTER TABLE calls ADD COLUMN draft_body TEXT")
         if "draft_version" not in columns:
@@ -1463,6 +1599,19 @@ class CallCoordinator:
     @staticmethod
     def _invalid_cursor() -> dict[str, Any]:
         return {"success": False, "status": "invalid_cursor", "needs_continuation": False}
+
+    @staticmethod
+    def _invalid_client_timeout() -> dict[str, Any]:
+        return {"success": False, "status": "invalid_client_timeout", "needs_continuation": False}
+
+    @staticmethod
+    def _already_waiting() -> dict[str, Any]:
+        return {
+            "success": False,
+            "status": "already_waiting",
+            "needs_continuation": False,
+            "retryable": True,
+        }
 
     @staticmethod
     def _session_not_found() -> dict[str, Any]:

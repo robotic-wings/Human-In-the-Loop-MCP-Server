@@ -11,6 +11,7 @@ import json
 import ssl
 import sys
 import threading
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -406,6 +407,28 @@ class _McpGateway:
             return self._call_tool(request_id, payload.get("params"), caller_id)
         return _rpc_error(request_id, -32601, "method not found")
 
+    def may_wait_for_tool_response(self, payload: object) -> bool:
+        """Return whether this request can enter a bounded agent wait leg.
+
+        This is deliberately a pure transport hint: the normal tool handler
+        remains the authority for validation, admission, and all durable state.
+        """
+        if not isinstance(payload, dict) or payload.get("method") != "tools/call":
+            return False
+        params = payload.get("params")
+        if not isinstance(params, dict):
+            return False
+        name = params.get("name")
+        arguments = params.get("arguments")
+        if not isinstance(name, str) or not isinstance(arguments, dict):
+            return False
+        spec = _find_tool_spec(name)
+        return (
+            spec is not None
+            and spec.name not in {"read_interaction_result", "read_interaction_attachment", "cancel_interaction"}
+            and _valid_client_timeout(arguments.get("client_timeout_seconds"))
+        )
+
     def _call_tool(
         self, rpc_id: object, params: object, caller_id: str
     ) -> dict[str, object]:
@@ -436,6 +459,12 @@ class _McpGateway:
                 rpc_id, safe_arguments, caller_id, request_id
             )
         interaction_key = "task_id" if spec.name == "assign_task_to_human" else "interaction_id"
+        client_timeout_seconds = safe_arguments.get("client_timeout_seconds")
+        if client_timeout_seconds is not None and not _valid_client_timeout(client_timeout_seconds):
+            return _rpc_result(
+                rpc_id,
+                {"content": [], "structuredContent": _invalid_client_timeout()},
+            )
         call_id = safe_arguments.get("call_id")
         after_event_seq = safe_arguments.get("after_event_seq")
         if call_id is not None or after_event_seq is not None:
@@ -467,6 +496,22 @@ class _McpGateway:
                 desktop_route_device_id=self._desktop_route_device_id,
             )
         )
+        if client_timeout_seconds is not None and envelope["status"] == "ringing":
+            continuation_payload = json.dumps(
+                {"tool": spec.name, "arguments": safe_arguments},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            envelope = self._wait_for_leg(
+                caller_id,
+                request_id,
+                interaction_id,
+                envelope["call_id"],
+                0,
+                continuation_payload,
+                client_timeout_seconds,
+            )
         return _rpc_result(rpc_id, {"content": [], "structuredContent": envelope})
 
     def _read_interaction_result_tool(
@@ -530,6 +575,7 @@ class _McpGateway:
         interaction_id = safe_arguments.get(interaction_key)
         call_id = safe_arguments.get("call_id")
         after_event_seq = safe_arguments.get("after_event_seq")
+        client_timeout_seconds = safe_arguments.get("client_timeout_seconds")
         if (
             not isinstance(interaction_id, str)
             or not interaction_id
@@ -546,18 +592,46 @@ class _McpGateway:
             sort_keys=True,
             separators=(",", ":"),
         )
-        envelope = self._coordinator.continue_call(
-            caller_id,
-            request_id,
-            interaction_id,
-            call_id,
-            after_event_seq,
-            continuation_payload,
-        )
+        if client_timeout_seconds is not None:
+            if not _valid_client_timeout(client_timeout_seconds):
+                envelope = _invalid_client_timeout()
+            else:
+                envelope = self._wait_for_leg(
+                    caller_id, request_id, interaction_id, call_id, after_event_seq,
+                    continuation_payload, client_timeout_seconds,
+                )
+        else:
+            envelope = self._coordinator.continue_call(
+                caller_id, request_id, interaction_id, call_id, after_event_seq, continuation_payload
+            )
         if envelope["status"] == "session_not_found":
             # Keep unknown and unauthorized calls indistinguishable.
             return _rpc_error(rpc_id, -32602, "invalid params")
         return _rpc_result(rpc_id, {"content": [], "structuredContent": envelope})
+
+    def _wait_for_leg(
+        self,
+        caller_id: str,
+        request_id: str,
+        interaction_id: str,
+        call_id: str,
+        after_event_seq: int,
+        payload: str,
+        client_timeout_seconds: int,
+    ) -> dict[str, Any]:
+        envelope, waiting = self._coordinator.begin_wait_leg(
+            caller_id, request_id, interaction_id, call_id, after_event_seq,
+            payload, client_timeout_seconds,
+        )
+        while waiting:
+            time.sleep(0.02)
+            polled = self._coordinator.poll_wait_leg(
+                caller_id, request_id, interaction_id, call_id, after_event_seq, payload
+            )
+            if polled is not None:
+                envelope = polled
+                waiting = False
+        return envelope
 
 
 def _tool_definitions() -> list[dict[str, object]]:
@@ -573,6 +647,18 @@ def _tool_definitions() -> list[dict[str, object]]:
 
 def _rpc_result(request_id: object, result: dict[str, object]) -> dict[str, object]:
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
+
+
+def _valid_client_timeout(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 2
+
+
+def _invalid_client_timeout() -> dict[str, object]:
+    return {
+        "success": False,
+        "status": "invalid_client_timeout",
+        "needs_continuation": False,
+    }
 
 
 def _rpc_error(request_id: object, code: int, message: str) -> dict[str, object]:
@@ -842,6 +928,7 @@ class _TerminalGateway:
 
 class _PublicHandler(BaseHTTPRequestHandler):
     server_version = "HITLCentralService/0.1"
+    protocol_version = "HTTP/1.1"
 
     def do_GET(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path
@@ -904,6 +991,13 @@ class _PublicHandler(BaseHTTPRequestHandler):
                 HTTPStatus.BAD_REQUEST, _rpc_error(None, -32700, "parse error")
             )
             return
+        if gateway.may_wait_for_tool_response(payload):
+            # A bounded wait result can take a full safe leg.  Commit the HTTP
+            # response start first, then deliver the ordinary JSON-RPC result
+            # as a chunk when the coordinator resolves that leg.
+            self._start_chunked_json(HTTPStatus.OK)
+            self._write_chunked_json(gateway.handle(payload, caller_id))
+            return
         self._send_json(HTTPStatus.OK, gateway.handle(payload, caller_id))
 
     def do_PUT(self) -> None:  # noqa: N802
@@ -929,6 +1023,20 @@ class _PublicHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
+
+    def _start_chunked_json(self, status: HTTPStatus) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        self.wfile.flush()
+
+    def _write_chunked_json(self, payload: dict[str, object]) -> None:
+        encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        self.wfile.write(f"{len(encoded):X}\r\n".encode("ascii"))
+        self.wfile.write(encoded)
+        self.wfile.write(b"\r\n0\r\n\r\n")
+        self.wfile.flush()
 
     def _terminal_gateway(self) -> _TerminalGateway | None:
         terminal = getattr(self.server, "terminal_gateway", None)

@@ -7,7 +7,10 @@ liveness, routing, UI, revisions, or result reads.
 
 from __future__ import annotations
 
+import http.client
+import json
 import sqlite3
+import ssl
 import threading
 import time
 from dataclasses import dataclass
@@ -45,6 +48,32 @@ def _with_timeout(request_id: str, timeout: int) -> dict[str, Any]:
     request = _call(request_id)
     request["params"]["arguments"]["client_timeout_seconds"] = timeout
     return request
+
+
+def _post_with_separate_header_measurement(
+    port: int, certificate: Path, payload: dict[str, Any], token: str
+) -> tuple[int, dict[str, Any], float, float]:
+    """Measure header arrival separately from completion of a valid wait leg."""
+    connection = http.client.HTTPSConnection(
+        "127.0.0.1", port, context=ssl.create_default_context(cafile=str(certificate)), timeout=3
+    )
+    started = time.monotonic()
+    connection.request(
+        "POST",
+        "/mcp",
+        body=json.dumps(payload),
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+        },
+    )
+    response = connection.getresponse()
+    header_seconds = time.monotonic() - started
+    body = json.loads(response.read().decode("utf-8"))
+    result_seconds = time.monotonic() - started
+    connection.close()
+    return response.status, body, header_seconds, result_seconds
 
 
 def test_controlled_clock_persists_safe_wait_leg_from_request_receipt(tmp_path: Path) -> None:
@@ -158,6 +187,28 @@ def test_tls_wait_leg_returns_heartbeat_after_safe_interval_without_extending_ri
     assert heartbeat["needs_continuation"] is True
     assert heartbeat["ring_deadline"] == persisted_ring_deadline
     assert 0.8 <= elapsed < 2
+
+
+def test_tls_valid_wait_leg_starts_headers_before_safe_leg_result(tmp_path: Path) -> None:
+    port = _free_port()
+    config, certificate = _write_gateway_config(tmp_path, port)
+    process = _start(config)
+    _wait_for_listener(process, port)
+    try:
+        status, response, header_seconds, result_seconds = _post_with_separate_header_measurement(
+            port, certificate, _with_timeout("header-before-heartbeat", 2), "test-token-alpha"
+        )
+    finally:
+        _stop(process)
+
+    heartbeat = _structured(response)
+    assert status == 200
+    # Header receipt and final wait-leg delivery have distinct deadlines.
+    assert header_seconds < 1
+    assert heartbeat["status"] == "heartbeat"
+    assert heartbeat["needs_continuation"] is True
+    assert 0.8 <= result_seconds < 2
+    assert header_seconds < result_seconds
 
 
 def test_only_one_tls_waiter_is_outstanding_and_replay_does_not_start_another_leg(
