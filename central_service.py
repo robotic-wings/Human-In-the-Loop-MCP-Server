@@ -288,6 +288,26 @@ _TOOL_SPECS = (
         },
         ("interaction_id", "call_id", "request_id"),
     ),
+    _tool_spec(
+        "read_interaction_result",
+        {
+            "interaction_id": {"type": "string"},
+            "result_id": {"type": "string"},
+            "cursor": {"type": "integer", "minimum": 0},
+            "max_result_bytes": {"type": "integer"},
+        },
+        ("interaction_id", "result_id", "max_result_bytes"),
+    ),
+    _tool_spec(
+        "read_interaction_attachment",
+        {
+            "interaction_id": {"type": "string"},
+            "attachment_id": {"type": "string"},
+            "offset_bytes": {"type": "integer", "minimum": 0},
+            "max_result_bytes": {"type": "integer"},
+        },
+        ("interaction_id", "attachment_id", "max_result_bytes"),
+    ),
 )
 
 
@@ -398,13 +418,19 @@ class _McpGateway:
             return _rpc_error(rpc_id, -32602, "invalid params")
         missing = [field for field in spec.required if field not in arguments]
         request_id = arguments.get("request_id")
-        if missing or not isinstance(request_id, str) or not request_id:
+        if missing:
             return _rpc_error(rpc_id, -32602, "invalid params")
         safe_arguments = {
             field: arguments[field]
             for field, _ in spec.properties
             if field in arguments
         }
+        if spec.name == "read_interaction_result":
+            return self._read_interaction_result_tool(rpc_id, safe_arguments, caller_id)
+        if spec.name == "read_interaction_attachment":
+            return self._read_interaction_attachment_tool(rpc_id, safe_arguments, caller_id)
+        if not isinstance(request_id, str) or not request_id:
+            return _rpc_error(rpc_id, -32602, "invalid params")
         if spec.name == "cancel_interaction":
             return self._cancel_interaction_tool(
                 rpc_id, safe_arguments, caller_id, request_id
@@ -442,6 +468,30 @@ class _McpGateway:
             )
         )
         return _rpc_result(rpc_id, {"content": [], "structuredContent": envelope})
+
+    def _read_interaction_result_tool(
+        self, rpc_id: object, arguments: dict[str, object], caller_id: str
+    ) -> dict[str, object]:
+        result = self._coordinator.read_interaction_result(
+            caller_id,
+            arguments.get("interaction_id"),
+            arguments.get("result_id"),
+            arguments.get("cursor", 0),
+            arguments.get("max_result_bytes"),
+        )
+        return _rpc_result(rpc_id, {"content": [], "structuredContent": result})
+
+    def _read_interaction_attachment_tool(
+        self, rpc_id: object, arguments: dict[str, object], caller_id: str
+    ) -> dict[str, object]:
+        result = self._coordinator.read_interaction_attachment(
+            caller_id,
+            arguments.get("interaction_id"),
+            arguments.get("attachment_id"),
+            arguments.get("offset_bytes", 0),
+            arguments.get("max_result_bytes"),
+        )
+        return _rpc_result(rpc_id, {"content": [], "structuredContent": result})
 
     def _cancel_interaction_tool(
         self,
