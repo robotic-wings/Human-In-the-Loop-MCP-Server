@@ -1352,6 +1352,8 @@ class BarkDeliveryScheduler:
             if delivery is None:
                 self._stopped.wait(0.03)
                 continue
+            if not self._coordinator.authorize_bark_send(delivery["call_id"]):
+                continue
             self._coordinator.finish_bark_delivery(
                 delivery["call_id"], self._send(delivery["call_id"], delivery["message"])
             )

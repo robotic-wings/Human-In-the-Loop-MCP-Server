@@ -186,6 +186,26 @@ class CallCoordinator:
                 (state, call_id),
             )
 
+    def authorize_bark_send(self, call_id: str) -> bool:
+        """Recheck the durable call immediately before an external Bark request."""
+        with self._write_transaction() as connection:
+            delivery = connection.execute(
+                "SELECT state FROM bark_deliveries WHERE call_id = ?", (call_id,)
+            ).fetchone()
+            if delivery is None or delivery["state"] != "sending":
+                return False
+            call = self._call_or_raise(connection, call_id)
+            self._settle_if_expired(connection, call)
+            call = self._call_or_raise(connection, call_id)
+            if call["state"] == "ringing" and self._now() < self._parse_stamp(call["ring_deadline"]):
+                return True
+            connection.execute(
+                "UPDATE bark_deliveries SET state = 'suppressed' "
+                "WHERE call_id = ? AND state = 'sending'",
+                (call_id,),
+            )
+            return False
+
     def recover_bark_deliveries(self) -> None:
         """Never retry an external request whose prior outcome is unknown."""
         with self._write_transaction() as connection:
