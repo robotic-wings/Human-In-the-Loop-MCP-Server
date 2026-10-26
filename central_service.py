@@ -528,7 +528,7 @@ class _TerminalGateway:
         session_id = payload.get("owner_session_id")
         if not isinstance(action_id, str) or not action_id:
             return None
-        if kind == "accept" and (not isinstance(session_id, str) or not session_id):
+        if kind in {"accept", "cancel"} and (not isinstance(session_id, str) or not session_id):
             return None
         return action_id, session_id if isinstance(session_id, str) else None
 
@@ -625,7 +625,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
         if (
             len(parts) != 5
             or parts[:3] != ["", "api", "calls"]
-            or parts[4] not in {"accept", "decline", "heartbeat"}
+            or parts[4] not in {"accept", "decline", "cancel", "heartbeat"}
         ):
             return None
         return parts[3], parts[4]

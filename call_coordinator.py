@@ -44,6 +44,14 @@ class DeclineCall:
     actor_id: str
 
 
+@dataclass(frozen=True)
+class CancelCall:
+    call_id: str
+    action_id: str
+    device_id: str
+    session_id: str
+
+
 class CallCoordinator:
     """SQLite-backed admission and ringing-state coordinator.
 
@@ -149,7 +157,7 @@ class CallCoordinator:
         legacy_route_device_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Perform a routed terminal action without allowing an outsider to reserve an ID."""
-        if kind not in {"accept", "decline"}:
+        if kind not in {"accept", "decline", "cancel"}:
             raise ValueError(kind)
         scoped_action_id, action = self._terminal_action_request(
             kind, call_id, device_id, action_id, session_id, terminal_platform
@@ -163,6 +171,10 @@ class CallCoordinator:
                 return None
             # Route authorization deliberately precedes replay lookup.  An
             # unauthorized credential must neither observe nor reserve an ID.
+            if kind == "cancel" and (
+                row["owner_device_id"] != device_id or row["owner_session_id"] != session_id
+            ):
+                return self._ownership_conflict()
             replay = self._action_replay(connection, scoped_action_id, payload)
             if replay is not None:
                 return replay
@@ -249,7 +261,9 @@ class CallCoordinator:
             return scoped_action_id, asdict(
                 AcceptCall(call_id, scoped_action_id, device_id, session_id or "", "desktop", terminal_platform)
             )
-        return scoped_action_id, asdict(DeclineCall(call_id, scoped_action_id, device_id))
+        if kind == "decline":
+            return scoped_action_id, asdict(DeclineCall(call_id, scoped_action_id, device_id))
+        return scoped_action_id, asdict(CancelCall(call_id, scoped_action_id, device_id, session_id or ""))
 
     def _action_replay(
         self, connection: sqlite3.Connection, action_id: str, payload: str
@@ -276,9 +290,14 @@ class CallCoordinator:
         # Expiry settlement occurs only after authorization and replay lookup.
         self._settle_if_expired(connection, row)
         row = self._call_or_raise(connection, call_id)
-        if row["state"] != "ringing":
+        if kind == "cancel":
+            if row["state"] != "accepted":
+                return self._current_result(connection, row)
+            result = self._cancel(connection, row)
+        elif row["state"] != "ringing":
             return self._current_result(connection, row)
-        result = self._accept(connection, row, action) if kind == "accept" else self._decline(connection, row)
+        else:
+            result = self._accept(connection, row, action) if kind == "accept" else self._decline(connection, row)
         # Persist the replay snapshot only after the routed mutation succeeds.
         connection.execute(
             "INSERT INTO action_operations (action_id, payload, result) VALUES (?, ?, ?)",
@@ -429,6 +448,28 @@ class CallCoordinator:
         self._add_event(connection, row["call_id"], result)
         return result
 
+    def _cancel(self, connection: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+        result = self._envelope(
+            status="cancelled",
+            call_state="cancelled",
+            interaction_id=row["interaction_id"],
+            call_id=row["call_id"],
+            reason="human_cancelled",
+            human_action=True,
+            handled_on=row["handled_on"],
+            terminal_platform=row["terminal_platform"],
+            event_seq=(self._event_seq(connection, row["call_id"]) or 0) + 1,
+            owner_device_id=row["owner_device_id"],
+            owner_session_id=row["owner_session_id"],
+            ring_deadline=row["ring_deadline"],
+        )
+        connection.execute(
+            "UPDATE calls SET state = 'cancelled', version = version + 1 WHERE call_id = ?",
+            (row["call_id"],),
+        )
+        self._add_event(connection, row["call_id"], result)
+        return result
+
     def _settle_all_expired(self, connection: sqlite3.Connection) -> list[dict[str, Any]]:
         rows = connection.execute(
             "SELECT * FROM calls WHERE state IN ('ringing', 'accepted')"
@@ -512,7 +553,7 @@ class CallCoordinator:
     def _current_result(
         self, connection: sqlite3.Connection, row: sqlite3.Row
     ) -> dict[str, Any]:
-        if row["state"] in {"declined", "not_accepted", "disconnected"}:
+        if row["state"] in {"declined", "not_accepted", "disconnected", "cancelled"}:
             event = connection.execute(
                 "SELECT result FROM events WHERE call_id = ? ORDER BY event_seq DESC LIMIT 1",
                 (row["call_id"],),
