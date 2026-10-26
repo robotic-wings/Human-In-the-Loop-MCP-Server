@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
@@ -10,6 +11,16 @@ from pathlib import Path
 from test_central_mcp_gateway import _free_port, _post, _start, _stop, _structured, _wait_for_listener
 from test_iphone_web_acceptance import _create_call, _login, _request, _write_operator_config
 from test_mcp_continuation import _continuation
+
+
+def _configure_phone_route(config: Path) -> None:
+    raw = json.loads(config.read_text(encoding="utf-8"))
+    raw["bark_enabled"] = True
+    # The receiver is intentionally unreachable: delivery outcome is outside
+    # this decline slice, while the persisted Bark route is the phone-routing
+    # authority under test.
+    raw["bark_url"] = "http://127.0.0.1:1/phone-route"
+    config.write_text(json.dumps(raw), encoding="utf-8")
 
 
 def _headers(cookie: str, csrf: str, port: int) -> dict[str, str]:
@@ -49,6 +60,7 @@ def _accept(
 def test_tls_iphone_decline_is_explicit_idempotent_and_agent_readable(tmp_path: Path) -> None:
     port = _free_port()
     config, certificate = _write_operator_config(tmp_path, port)
+    _configure_phone_route(config)
     process = _start(config)
     _wait_for_listener(process, port)
     try:
@@ -106,6 +118,7 @@ def test_tls_iphone_decline_is_explicit_idempotent_and_agent_readable(tmp_path: 
 def test_tls_iphone_decline_requires_same_origin_and_accept_decline_has_one_winner(tmp_path: Path) -> None:
     port = _free_port()
     config, certificate = _write_operator_config(tmp_path, port)
+    _configure_phone_route(config)
     process = _start(config)
     _wait_for_listener(process, port)
     try:
@@ -164,6 +177,7 @@ def test_tls_iphone_decline_requires_same_origin_and_accept_decline_has_one_winn
 def test_tls_late_iphone_decline_settles_expiry_without_revival(tmp_path: Path) -> None:
     port = _free_port()
     config, certificate = _write_operator_config(tmp_path, port)
+    _configure_phone_route(config)
     process = _start(config)
     _wait_for_listener(process, port)
     try:
@@ -196,3 +210,34 @@ def test_tls_late_iphone_decline_settles_expiry_without_revival(tmp_path: Path) 
     assert state == ("not_accepted", None)
     assert len(events) == 1
     assert "declined" not in events[0][0]
+
+
+def test_tls_iphone_decline_is_denied_when_persisted_phone_route_is_disabled(tmp_path: Path) -> None:
+    port = _free_port()
+    config, certificate = _write_operator_config(tmp_path, port)
+    process = _start(config)
+    _wait_for_listener(process, port)
+    try:
+        created = _create_call(port, certificate, "iphone-decline-no-phone-route")
+        call_id = created["call_id"]
+        assert isinstance(call_id, str)
+        cookie, csrf = _login(port, certificate)
+        denied = _decline(port, certificate, call_id, "no-phone-route", _headers(cookie, csrf, port))
+        with sqlite3.connect(tmp_path / "data" / "calls.sqlite3") as connection:
+            state = connection.execute(
+                "SELECT state, owner_device_id, owner_session_id, handled_on FROM calls WHERE call_id = ?",
+                (call_id,),
+            ).fetchone()
+            actions = connection.execute(
+                "SELECT count(*) FROM action_operations"
+            ).fetchone()[0]
+            events = connection.execute(
+                "SELECT count(*) FROM events WHERE call_id = ?", (call_id,)
+            ).fetchone()[0]
+    finally:
+        _stop(process)
+
+    assert denied[0] in {403, 409}
+    assert state == ("ringing", None, None, None)
+    assert actions == 0
+    assert events == 0
