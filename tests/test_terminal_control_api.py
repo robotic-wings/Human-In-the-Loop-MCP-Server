@@ -26,7 +26,6 @@ from test_central_mcp_gateway import (
     _start,
     _stop,
     _structured,
-    _wait_for_listener,
     _write_gateway_config,
 )
 from test_mcp_continuation import _continuation
@@ -154,7 +153,7 @@ def test_terminal_and_agent_credentials_are_separated_before_lookup_or_mutation(
     port = _free_port()
     config, certificate = _write_terminal_gateway_config(tmp_path, port)
     process = _start(config)
-    _wait_for_listener(process, port)
+    _wait_for_tls_gateway(process, port, certificate)
     try:
         created = _create_ringing_call(port, certificate, "separation-create")
         terminal_mcp_status, _, _ = _post(
@@ -197,7 +196,7 @@ def test_terminal_state_is_read_only_and_accept_derives_desktop_identity_then_pe
     port = _free_port()
     config, certificate = _write_terminal_gateway_config(tmp_path, port)
     process = _start(config)
-    _wait_for_listener(process, port)
+    _wait_for_tls_gateway(process, port, certificate)
     try:
         created = _create_ringing_call(port, certificate, "accept-create")
         first_state_status, first_state = _terminal_request(
@@ -234,7 +233,6 @@ def test_terminal_state_is_read_only_and_accept_derives_desktop_identity_then_pe
     assert accepted["terminal_platform"] == "windows"
 
     restarted = _start(config)
-    _wait_for_listener(restarted, port)
     _wait_for_tls_gateway(restarted, port, certificate)
     try:
         opened = _read_opened_event(port, certificate, created, "opened-after-restart")
@@ -273,7 +271,7 @@ def test_terminal_decline_releases_busy_and_never_supplies_an_answer_value(
     port = _free_port()
     config, certificate = _write_terminal_gateway_config(tmp_path, port)
     process = _start(config)
-    _wait_for_listener(process, port)
+    _wait_for_tls_gateway(process, port, certificate)
     try:
         created = _create_ringing_call(port, certificate, "decline-create")
         declined_status, declined = _terminal_request(
@@ -288,7 +286,6 @@ def test_terminal_decline_releases_busy_and_never_supplies_an_answer_value(
         _stop(process)
 
     restarted = _start(config)
-    _wait_for_listener(restarted, port)
     _wait_for_tls_gateway(restarted, port, certificate)
     try:
         event = _read_opened_event(port, certificate, created, "decline-after-restart")
@@ -395,7 +392,7 @@ def test_terminal_action_id_replays_exactly_and_changed_request_conflicts_withou
     port = _free_port()
     config, certificate = _write_terminal_gateway_config(tmp_path, port)
     process = _start(config)
-    _wait_for_listener(process, port)
+    _wait_for_tls_gateway(process, port, certificate)
     try:
         created = _create_ringing_call(port, certificate, "replay-create")
         body = {"action_id": "accept-replay", "owner_session_id": "desktop-session-1"}
@@ -443,7 +440,7 @@ def test_terminal_actions_settle_expiry_before_accept_decline_race_without_reviv
     )
     seed.close()
     process = _start(config)
-    _wait_for_listener(process, port)
+    _wait_for_tls_gateway(process, port, certificate)
     barrier = Barrier(3)
     outcomes: list[tuple[int, dict[str, Any]]] = []
 
