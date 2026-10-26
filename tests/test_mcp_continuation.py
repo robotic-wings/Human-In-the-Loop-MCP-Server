@@ -170,6 +170,37 @@ def test_authenticated_continuation_heartbeat_replays_without_extending_deadline
     assert heartbeat["needs_continuation"] is True
 
 
+def test_authenticated_valid_cursor_protocol_error_is_structured_over_tls(
+    tmp_path: Path,
+) -> None:
+    port = _free_port()
+    config, certificate = _write_gateway_config(tmp_path, port)
+    process = _start(config)
+    _wait_for_listener(process, port)
+    try:
+        _, created_response, _ = _post(
+            port, certificate, _call("create"), "test-token-alpha"
+        )
+        created = _structured(created_response)
+        _, response, _ = _post(
+            port,
+            certificate,
+            _continuation(
+                "cursor-too-far", created["interaction_id"], created["call_id"], 1
+            ),
+            "test-token-alpha",
+        )
+    finally:
+        _stop(process)
+
+    protocol_error = _structured(response)
+    assert protocol_error == {
+        "success": False,
+        "status": "invalid_cursor",
+        "needs_continuation": False,
+    }
+
+
 def test_wrong_and_unknown_callers_receive_the_same_nonrevealing_continuation_error(
     tmp_path: Path,
 ) -> None:

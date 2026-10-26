@@ -123,6 +123,84 @@ class CallCoordinator:
     def decline_call(self, request: DeclineCall) -> dict[str, Any]:
         return self._act("decline", request.call_id, request.action_id, asdict(request))
 
+    def continue_call(
+        self,
+        caller_id: str,
+        request_id: str,
+        interaction_id: str,
+        call_id: str,
+        after_event_seq: int,
+        payload: str,
+    ) -> dict[str, Any]:
+        """Read one durable event, or save a nonblocking heartbeat snapshot.
+
+        A continuation is intentionally not a wait.  Its operation record makes
+        a lost HTTP response replayable without advancing either cursor or the
+        call's absolute ringing deadline.
+        """
+        operation_payload = self._canonical(
+            {
+                "interaction_id": interaction_id,
+                "call_id": call_id,
+                "after_event_seq": after_event_seq,
+                "payload": payload,
+            }
+        )
+        with self._write_transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM calls WHERE call_id = ? AND interaction_id = ? "
+                "AND caller_id = ?",
+                (call_id, interaction_id, caller_id),
+            ).fetchone()
+            if row is None:
+                return self._session_not_found()
+
+            replay = connection.execute(
+                "SELECT payload, result FROM continuation_operations "
+                "WHERE caller_id = ? AND request_id = ?",
+                (caller_id, request_id),
+            ).fetchone()
+            if replay is not None:
+                if replay["payload"] == operation_payload:
+                    return self._decode(replay["result"])
+                return self._conflict()
+
+            self._settle_if_expired(connection, row)
+            row = self._call_or_raise(connection, call_id)
+            last_event_seq = self._event_seq(connection, call_id) or 0
+            if after_event_seq > last_event_seq:
+                result = self._invalid_cursor()
+            else:
+                event = connection.execute(
+                    "SELECT result FROM events WHERE call_id = ? "
+                    "AND event_seq > ? ORDER BY event_seq LIMIT 1",
+                    (call_id, after_event_seq),
+                ).fetchone()
+                if event is not None:
+                    result = self._decode(event["result"])
+                elif row["state"] in {"declined", "not_accepted"}:
+                    result = self._current_result(connection, row)
+                else:
+                    result = self._envelope(
+                        status="heartbeat",
+                        call_state=row["state"],
+                        interaction_id=row["interaction_id"],
+                        call_id=row["call_id"],
+                        needs_continuation=True,
+                        handled_on=row["handled_on"],
+                        terminal_platform=row["terminal_platform"],
+                        event_seq=after_event_seq,
+                        owner_device_id=row["owner_device_id"],
+                        owner_session_id=row["owner_session_id"],
+                        ring_deadline=row["ring_deadline"],
+                    )
+            connection.execute(
+                "INSERT INTO continuation_operations "
+                "(caller_id, request_id, payload, result) VALUES (?, ?, ?, ?)",
+                (caller_id, request_id, operation_payload, self._canonical(result)),
+            )
+            return result
+
     def get_call(self, call_id: str) -> dict[str, Any]:
         with self._write_transaction() as connection:
             row = self._call_or_raise(connection, call_id)
@@ -278,9 +356,10 @@ class CallCoordinator:
     def _add_event(
         self, connection: sqlite3.Connection, call_id: str, result: dict[str, Any]
     ) -> None:
+        event_seq = (self._event_seq(connection, call_id) or 0) + 1
         connection.execute(
-            "INSERT INTO events (call_id, event_seq, result) VALUES (?, 1, ?)",
-            (call_id, self._canonical(result)),
+            "INSERT INTO events (call_id, event_seq, result) VALUES (?, ?, ?)",
+            (call_id, event_seq, self._canonical(result)),
         )
 
     def _event_seq(self, connection: sqlite3.Connection, call_id: str) -> int | None:
@@ -316,6 +395,10 @@ class CallCoordinator:
                 call_id TEXT NOT NULL, event_seq INTEGER NOT NULL, result TEXT NOT NULL,
                 PRIMARY KEY (call_id, event_seq), FOREIGN KEY (call_id) REFERENCES calls(call_id)
             );
+            CREATE TABLE IF NOT EXISTS continuation_operations (
+                caller_id TEXT NOT NULL, request_id TEXT NOT NULL, payload TEXT NOT NULL,
+                result TEXT NOT NULL, PRIMARY KEY (caller_id, request_id)
+            );
             """
         )
         self._connection.commit()
@@ -345,6 +428,14 @@ class CallCoordinator:
     @staticmethod
     def _conflict() -> dict[str, Any]:
         return {"success": False, "status": "request_conflict", "needs_continuation": False}
+
+    @staticmethod
+    def _invalid_cursor() -> dict[str, Any]:
+        return {"success": False, "status": "invalid_cursor", "needs_continuation": False}
+
+    @staticmethod
+    def _session_not_found() -> dict[str, Any]:
+        return {"success": False, "status": "session_not_found", "needs_continuation": False}
 
     @staticmethod
     def _busy() -> dict[str, Any]:
