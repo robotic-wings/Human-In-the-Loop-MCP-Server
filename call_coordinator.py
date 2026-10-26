@@ -273,6 +273,70 @@ class CallCoordinator:
             self._refresh_terminal_liveness(connection, call_id)
             return self._current_result(connection, self._call_or_raise(connection, call_id))
 
+    def read_terminal_draft(
+        self, call_id: str, device_id: str, owner_session_id: str
+    ) -> dict[str, Any] | None:
+        """Return a draft only to the accepted terminal session that owns it."""
+        with self._write_transaction() as connection:
+            row = self._routed_terminal_call(connection, device_id, call_id)
+            if row is None:
+                return None
+            self._settle_if_expired(connection, row)
+            row = self._call_or_raise(connection, call_id)
+            if (
+                row["state"] != "accepted"
+                or row["owner_device_id"] != device_id
+                or row["owner_session_id"] != owner_session_id
+                or row["draft_body"] is None
+            ):
+                return None
+            return {"body": row["draft_body"], "draft_version": row["draft_version"]}
+
+    def save_terminal_draft(
+        self,
+        call_id: str,
+        device_id: str,
+        owner_session_id: str,
+        body: str,
+        expected_draft_version: int,
+    ) -> dict[str, Any] | None:
+        """CAS-save one opaque draft without changing call, event, or task state."""
+        if (
+            not isinstance(body, str)
+            or not isinstance(expected_draft_version, int)
+            or isinstance(expected_draft_version, bool)
+            or expected_draft_version < 0
+            or len(body.encode("utf-8")) > 256
+        ):
+            return {"success": False, "status": "invalid_draft"}
+        with self._write_transaction() as connection:
+            row = self._routed_terminal_call(connection, device_id, call_id)
+            if row is None:
+                return None
+            self._settle_if_expired(connection, row)
+            row = self._call_or_raise(connection, call_id)
+            if row["state"] != "accepted":
+                return self._current_result(connection, row)
+            if row["owner_device_id"] != device_id or row["owner_session_id"] != owner_session_id:
+                return {"success": False, "status": "ownership_conflict"}
+            if row["draft_version"] != expected_draft_version:
+                return {
+                    "success": False,
+                    "status": "draft_version_conflict",
+                    "draft_version": row["draft_version"],
+                }
+            draft_version = expected_draft_version + 1
+            connection.execute(
+                "UPDATE calls SET draft_body = ?, draft_version = ? WHERE call_id = ?",
+                (body, draft_version, call_id),
+            )
+            self._refresh_terminal_liveness(connection, call_id)
+            return {
+                "success": True,
+                "status": "saved",
+                "draft": {"body": body, "draft_version": draft_version},
+            }
+
     def _routed_terminal_call(
         self,
         connection: sqlite3.Connection,
@@ -775,7 +839,8 @@ class CallCoordinator:
                 created_at TEXT NOT NULL, ring_deadline TEXT NOT NULL, version INTEGER NOT NULL,
                 owner_device_id TEXT, owner_session_id TEXT, handled_on TEXT,
                 terminal_platform TEXT, desktop_route_device_id TEXT,
-                terminal_last_seen_at TEXT, terminal_disconnect_deadline TEXT
+                terminal_last_seen_at TEXT, terminal_disconnect_deadline TEXT,
+                draft_body TEXT, draft_version INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS create_operations (
                 caller_id TEXT NOT NULL, request_id TEXT NOT NULL, payload TEXT NOT NULL,
@@ -808,6 +873,12 @@ class CallCoordinator:
             self._connection.execute("ALTER TABLE calls ADD COLUMN terminal_last_seen_at TEXT")
         if "terminal_disconnect_deadline" not in columns:
             self._connection.execute("ALTER TABLE calls ADD COLUMN terminal_disconnect_deadline TEXT")
+        if "draft_body" not in columns:
+            self._connection.execute("ALTER TABLE calls ADD COLUMN draft_body TEXT")
+        if "draft_version" not in columns:
+            self._connection.execute(
+                "ALTER TABLE calls ADD COLUMN draft_version INTEGER NOT NULL DEFAULT 0"
+            )
         self._backfill_legacy_accepted_liveness()
         self._connection.commit()
 

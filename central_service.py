@@ -552,6 +552,33 @@ class _TerminalGateway:
         )
         return self._action_response(result)
 
+    def save_draft(
+        self, identity: _TerminalIdentity, call_id: str, payload: object
+    ) -> tuple[HTTPStatus, dict[str, object]]:
+        if not isinstance(payload, dict):
+            return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
+        owner_session_id = payload.get("owner_session_id")
+        body = payload.get("body")
+        expected_draft_version = payload.get("expected_draft_version")
+        if (
+            not isinstance(owner_session_id, str)
+            or not owner_session_id
+            or not isinstance(body, str)
+            or not isinstance(expected_draft_version, int)
+            or isinstance(expected_draft_version, bool)
+        ):
+            return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
+        result = self._coordinator.save_terminal_draft(
+            call_id, identity.device_id, owner_session_id, body, expected_draft_version
+        )
+        if result is None:
+            return HTTPStatus.NOT_FOUND, {"error": "not found"}
+        if result["status"] in {"ownership_conflict", "draft_version_conflict"}:
+            return HTTPStatus.CONFLICT, result
+        if result["status"] == "invalid_draft":
+            return HTTPStatus.BAD_REQUEST, result
+        return HTTPStatus.OK, result
+
     @staticmethod
     def _action_request(kind: str, payload: object) -> tuple[str, str | None] | None:
         if not isinstance(payload, dict):
@@ -620,6 +647,22 @@ class _PublicHandler(BaseHTTPRequestHandler):
             )
             return
         self._send_json(HTTPStatus.OK, gateway.handle(payload, caller_id))
+
+    def do_PUT(self) -> None:  # noqa: N802
+        path = urlsplit(self.path).path
+        authenticated = self._terminal_request_identity()
+        if authenticated is None:
+            return
+        terminal, identity = authenticated
+        parts = path.split("/")
+        if len(parts) != 5 or parts[:3] != ["", "api", "calls"] or parts[4] != "draft" or not parts[3]:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+            return
+        body_ok, payload = self._terminal_request_body()
+        if not body_ok:
+            return
+        status, response = terminal.save_draft(identity, parts[3], payload)
+        self._send_json(status, response)
 
     def _send_json(self, status: HTTPStatus, payload: dict[str, object]) -> None:
         encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
