@@ -194,6 +194,17 @@ def test_only_one_tls_waiter_is_outstanding_and_replay_does_not_start_another_le
             port, certificate, competing, "test-token-alpha"
         )
         waiter.join(timeout=4)
+        with sqlite3.connect(tmp_path / "data" / "calls.sqlite3") as connection:
+            deadline_before_replay = connection.execute(
+                "SELECT wait_leg_deadline FROM calls WHERE call_id = ?", (opened["call_id"],)
+            ).fetchone()[0]
+        _, replay_response, _ = _post(
+            port, certificate, request, "test-token-alpha"
+        )
+        with sqlite3.connect(tmp_path / "data" / "calls.sqlite3") as connection:
+            deadline_after_replay = connection.execute(
+                "SELECT wait_leg_deadline FROM calls WHERE call_id = ?", (opened["call_id"],)
+            ).fetchone()[0]
     finally:
         _stop(process)
 
@@ -206,3 +217,5 @@ def test_only_one_tls_waiter_is_outstanding_and_replay_does_not_start_another_le
         "retryable": True,
     }
     assert _structured(outcome["response"])["status"] == "heartbeat"
+    assert replay_response == outcome["response"]
+    assert deadline_after_replay == deadline_before_replay
