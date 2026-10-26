@@ -31,7 +31,9 @@ from test_central_mcp_gateway import (
 from test_mcp_continuation import _continuation
 
 
-def _write_terminal_gateway_config(directory: Path, port: int) -> tuple[Path, Path]:
+def _write_terminal_gateway_config(
+    directory: Path, port: int, *, eligible_desktop_device_ids: list[str] | None = None
+) -> tuple[Path, Path]:
     config_path, certificate = _write_gateway_config(directory, port)
     terminal_credentials = directory / "terminal-credentials.json"
     terminal_credentials.write_text(
@@ -51,8 +53,17 @@ def _write_terminal_gateway_config(directory: Path, port: int) -> tuple[Path, Pa
     )
     config = json.loads(config_path.read_text(encoding="utf-8"))
     config["terminal_credentials_file"] = str(terminal_credentials)
+    config["eligible_desktop_device_ids"] = (
+        eligible_desktop_device_ids or ["desktop-registered"]
+    )
     config_path.write_text(json.dumps(config), encoding="utf-8")
     return config_path, certificate
+
+
+def _set_eligible_desktop_device_ids(config_path: Path, device_ids: list[str]) -> None:
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["eligible_desktop_device_ids"] = device_ids
+    config_path.write_text(json.dumps(config), encoding="utf-8")
 
 
 def _terminal_request(
@@ -308,6 +319,162 @@ def test_terminal_decline_releases_busy_and_never_supplies_an_answer_value(
         assert "confirmed" not in value
         assert "acknowledged" not in value
     assert next_call["status"] == "ringing"
+
+
+def test_persisted_desktop_route_denies_other_device_without_leaking_or_mutating_call(
+    tmp_path: Path,
+) -> None:
+    """A call's eligible desktop is fixed at creation, not inferred from a token."""
+    port = _free_port()
+    config, certificate = _write_terminal_gateway_config(
+        tmp_path, port, eligible_desktop_device_ids=["desktop-registered"]
+    )
+    process = _start(config)
+    _wait_for_tls_gateway(process, port, certificate)
+    try:
+        created = _create_ringing_call(port, certificate, "persisted-route-create")
+    finally:
+        _stop(process)
+
+    restarted = _start(config)
+    _wait_for_tls_gateway(restarted, port, certificate)
+    try:
+        other_state = _terminal_request(
+            port, certificate, "GET", f"/api/calls/{created['call_id']}", "other-desktop-token"
+        )
+        random_state = _terminal_request(
+            port, certificate, "GET", "/api/calls/not-a-real-call", "other-desktop-token"
+        )
+        other_accept = _terminal_request(
+            port,
+            certificate,
+            "POST",
+            f"/api/calls/{created['call_id']}/accept",
+            "other-desktop-token",
+            {"action_id": "other-accept", "owner_session_id": "other-session"},
+        )
+        random_accept = _terminal_request(
+            port,
+            certificate,
+            "POST",
+            "/api/calls/not-a-real-call/accept",
+            "other-desktop-token",
+            {"action_id": "other-accept-random", "owner_session_id": "other-session"},
+        )
+        other_decline = _terminal_request(
+            port,
+            certificate,
+            "POST",
+            f"/api/calls/{created['call_id']}/decline",
+            "other-desktop-token",
+            {"action_id": "other-decline"},
+        )
+        random_decline = _terminal_request(
+            port,
+            certificate,
+            "POST",
+            "/api/calls/not-a-real-call/decline",
+            "other-desktop-token",
+            {"action_id": "other-decline-random"},
+        )
+        registered_before_status, registered_before = _terminal_request(
+            port, certificate, "GET", "/api/terminals/state", "desktop-token"
+        )
+        after_denials = _read_opened_event(
+            port, certificate, created, "route-denials-leave-no-event"
+        )
+        registered_accept_status, registered_accept = _terminal_request(
+            port,
+            certificate,
+            "POST",
+            f"/api/calls/{created['call_id']}/accept",
+            "desktop-token",
+            {"action_id": "registered-accept", "owner_session_id": "registered-session"},
+        )
+    finally:
+        _stop(restarted)
+
+    assert other_state == random_state
+    assert other_accept == random_accept
+    assert other_decline == random_decline
+    assert registered_before_status == 200
+    assert registered_before["call"] == {
+        "call_id": created["call_id"],
+        "call_state": "ringing",
+        "version": 1,
+        "ring_deadline": registered_before["call"]["ring_deadline"],
+    }
+    assert after_denials["status"] == "heartbeat"
+    assert after_denials["call_state"] == "ringing"
+    assert after_denials["event_seq"] == 0
+    assert registered_accept_status == 200
+    assert registered_accept["status"] == "opened"
+    assert registered_accept["owner_device_id"] == "desktop-registered"
+
+
+def test_action_id_is_scoped_to_credential_device_and_routed_call(
+    tmp_path: Path,
+) -> None:
+    """An unauthorized action cannot reserve an ID or collide across devices."""
+    port = _free_port()
+    config, certificate = _write_terminal_gateway_config(
+        tmp_path, port, eligible_desktop_device_ids=["desktop-registered"]
+    )
+    process = _start(config)
+    _wait_for_tls_gateway(process, port, certificate)
+    try:
+        first = _create_ringing_call(port, certificate, "first-routed-call")
+        denied_first = _terminal_request(
+            port,
+            certificate,
+            "POST",
+            f"/api/calls/{first['call_id']}/decline",
+            "other-desktop-token",
+            {"action_id": "shared-decline"},
+        )
+        denied_random = _terminal_request(
+            port,
+            certificate,
+            "POST",
+            "/api/calls/not-a-real-call/decline",
+            "other-desktop-token",
+            {"action_id": "shared-decline"},
+        )
+        first_decline_status, first_decline = _terminal_request(
+            port,
+            certificate,
+            "POST",
+            f"/api/calls/{first['call_id']}/decline",
+            "desktop-token",
+            {"action_id": "shared-decline"},
+        )
+    finally:
+        _stop(process)
+
+    assert denied_first == denied_random
+    assert first_decline_status == 200
+    assert first_decline["status"] == "declined"
+    assert first_decline["call_id"] == first["call_id"]
+
+    _set_eligible_desktop_device_ids(config, ["desktop-other"])
+    restarted = _start(config)
+    _wait_for_tls_gateway(restarted, port, certificate)
+    try:
+        second = _create_ringing_call(port, certificate, "second-routed-call")
+        second_decline_status, second_decline = _terminal_request(
+            port,
+            certificate,
+            "POST",
+            f"/api/calls/{second['call_id']}/decline",
+            "other-desktop-token",
+            {"action_id": "shared-decline"},
+        )
+    finally:
+        _stop(restarted)
+
+    assert second_decline_status == 200
+    assert second_decline["status"] == "declined"
+    assert second_decline["call_id"] == second["call_id"]
 
 
 def test_deadline_settlement_races_terminal_accept_with_one_durable_winner_no_revival(
