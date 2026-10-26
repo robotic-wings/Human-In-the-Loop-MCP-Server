@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import sqlite3
 import ssl
 import time
 from datetime import UTC, datetime, timedelta
@@ -134,6 +135,62 @@ def _create_ringing_call(port: int, certificate: Path, request_id: str) -> dict[
     created = _structured(response)
     assert created["status"] == "ringing"
     return created
+
+
+def _seed_legacy_ringing_call(
+    database: Path,
+    *,
+    operator_id: str,
+    interaction_id: str,
+    request_id: str,
+    legacy_null_route: bool = True,
+) -> dict[str, Any]:
+    """Persist a routed active row, optionally with its migration-era NULL route."""
+    database.parent.mkdir(parents=True, exist_ok=True)
+    coordinator = CallCoordinator(database, clock=_WallClock())
+    try:
+        created = coordinator.create_call(
+            CreateCall(
+                operator_id,
+                "agent-alpha",
+                interaction_id,
+                request_id,
+                "legacy prompt",
+                60,
+                desktop_route_device_id="desktop-registered",
+            )
+        )
+    finally:
+        coordinator.close()
+    if legacy_null_route:
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "UPDATE calls SET desktop_route_device_id = NULL WHERE call_id = ?",
+                (created["call_id"],),
+            )
+    return created
+
+
+def _persisted_terminal_snapshot(
+    database: Path, call_id: str
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Read durable call and event state independently of the endpoint response."""
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        call = connection.execute(
+            "SELECT * FROM calls WHERE call_id = ?", (call_id,)
+        ).fetchone()
+        events = connection.execute(
+            "SELECT event_seq, result FROM events WHERE call_id = ? ORDER BY event_seq",
+            (call_id,),
+        ).fetchall()
+    assert call is not None
+    return dict(call), [dict(event) for event in events]
+
+
+class _WallClock:
+    def now_utc(self) -> datetime:
+        return datetime.now(UTC)
 
 
 def _read_opened_event(
@@ -475,6 +532,172 @@ def test_action_id_is_scoped_to_credential_device_and_routed_call(
     assert second_decline_status == 200
     assert second_decline["status"] == "declined"
     assert second_decline["call_id"] == second["call_id"]
+
+
+def test_legacy_null_desktop_route_is_nonleaking_immutable_and_does_not_reserve_actions(
+    tmp_path: Path,
+) -> None:
+    """A migration-era NULL route must not grant another terminal an action lease."""
+    port = _free_port()
+    config, certificate = _write_terminal_gateway_config(tmp_path, port)
+    database = tmp_path / "data" / "calls.sqlite3"
+    legacy_accept = _seed_legacy_ringing_call(
+        database,
+        operator_id="legacy-accept-operator",
+        interaction_id="legacy-accept-interaction",
+        request_id="legacy-accept-create",
+    )
+    legacy_decline = _seed_legacy_ringing_call(
+        database,
+        operator_id="legacy-decline-operator",
+        interaction_id="legacy-decline-interaction",
+        request_id="legacy-decline-create",
+    )
+    accept_before = _persisted_terminal_snapshot(database, legacy_accept["call_id"])
+    decline_before = _persisted_terminal_snapshot(database, legacy_decline["call_id"])
+
+    process = _start(config)
+    _wait_for_tls_gateway(process, port, certificate)
+    try:
+        denied_accept = _terminal_request(
+            port,
+            certificate,
+            "POST",
+            f"/api/calls/{legacy_accept['call_id']}/accept",
+            "other-desktop-token",
+            {"action_id": "legacy-accept", "owner_session_id": "other-session"},
+        )
+        random_accept = _terminal_request(
+            port,
+            certificate,
+            "POST",
+            "/api/calls/no-such-legacy-accept/accept",
+            "other-desktop-token",
+            {"action_id": "legacy-accept", "owner_session_id": "other-session"},
+        )
+        denied_decline = _terminal_request(
+            port,
+            certificate,
+            "POST",
+            f"/api/calls/{legacy_decline['call_id']}/decline",
+            "other-desktop-token",
+            {"action_id": "legacy-decline"},
+        )
+        random_decline = _terminal_request(
+            port,
+            certificate,
+            "POST",
+            "/api/calls/no-such-legacy-decline/decline",
+            "other-desktop-token",
+            {"action_id": "legacy-decline"},
+        )
+        accept_after_denial = _persisted_terminal_snapshot(database, legacy_accept["call_id"])
+        decline_after_denial = _persisted_terminal_snapshot(database, legacy_decline["call_id"])
+        registered_accept = _terminal_request(
+            port,
+            certificate,
+            "POST",
+            f"/api/calls/{legacy_accept['call_id']}/accept",
+            "desktop-token",
+            {"action_id": "legacy-accept", "owner_session_id": "registered-session"},
+        )
+        registered_decline = _terminal_request(
+            port,
+            certificate,
+            "POST",
+            f"/api/calls/{legacy_decline['call_id']}/decline",
+            "desktop-token",
+            {"action_id": "legacy-decline"},
+        )
+    finally:
+        _stop(process)
+
+    assert denied_accept == random_accept
+    assert denied_decline == random_decline
+    assert accept_after_denial == accept_before
+    assert decline_after_denial == decline_before
+    # The denied requests used these exact IDs first; an eligible terminal can
+    # still carry out the original operation instead of seeing a replay/conflict.
+    assert registered_accept[0] == 200
+    assert registered_accept[1]["status"] == "opened"
+    assert registered_decline[0] == 200
+    assert registered_decline[1]["status"] == "declined"
+
+
+def test_wrongly_routed_terminal_cannot_distinguish_unknown_ringing_or_accepted_calls(
+    tmp_path: Path,
+) -> None:
+    """State and actions conceal every call state from a different terminal."""
+    port = _free_port()
+    config, certificate = _write_terminal_gateway_config(tmp_path, port)
+    database = tmp_path / "data" / "calls.sqlite3"
+    ringing = _seed_legacy_ringing_call(
+        database,
+        operator_id="routed-ringing-operator",
+        interaction_id="routed-ringing-interaction",
+        request_id="routed-ringing-create",
+        legacy_null_route=False,
+    )
+    accepted = _seed_legacy_ringing_call(
+        database,
+        operator_id="routed-accepted-operator",
+        interaction_id="routed-accepted-interaction",
+        request_id="routed-accepted-create",
+        legacy_null_route=False,
+    )
+
+    process = _start(config)
+    _wait_for_tls_gateway(process, port, certificate)
+    try:
+        accepted_by_registered = _terminal_request(
+            port,
+            certificate,
+            "POST",
+            f"/api/calls/{accepted['call_id']}/accept",
+            "desktop-token",
+            {"action_id": "accept-fixture", "owner_session_id": "registered-session"},
+        )
+        state_unknown = _terminal_request(
+            port, certificate, "GET", "/api/calls/no-such-call", "other-desktop-token"
+        )
+        state_ringing = _terminal_request(
+            port,
+            certificate,
+            "GET",
+            f"/api/calls/{ringing['call_id']}",
+            "other-desktop-token",
+        )
+        state_accepted = _terminal_request(
+            port,
+            certificate,
+            "GET",
+            f"/api/calls/{accepted['call_id']}",
+            "other-desktop-token",
+        )
+        action_responses: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+        for action in ("accept", "decline"):
+            body: dict[str, object] = {"action_id": f"hidden-{action}"}
+            if action == "accept":
+                body["owner_session_id"] = "other-session"
+            action_responses[action] = [
+                _terminal_request(
+                    port,
+                    certificate,
+                    "POST",
+                    f"/api/calls/{call_id}/{action}",
+                    "other-desktop-token",
+                    body,
+                )
+                for call_id in ("no-such-call", ringing["call_id"], accepted["call_id"])
+            ]
+    finally:
+        _stop(process)
+
+    assert accepted_by_registered[0] == 200
+    assert accepted_by_registered[1]["status"] == "opened"
+    assert state_unknown == state_ringing == state_accepted
+    for responses in action_responses.values():
+        assert responses[0] == responses[1] == responses[2]
 
 
 def test_deadline_settlement_races_terminal_accept_with_one_durable_winner_no_revival(
