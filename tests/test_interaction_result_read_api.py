@@ -180,6 +180,57 @@ def test_tls_persisted_terminal_answer_fixture_control_is_real_and_durable(tmp_p
         _stop(process)
 
 
+def test_tls_attachment_free_terminal_result_has_stable_id_and_is_readable(tmp_path: Path) -> None:
+    """A final text answer is readable even when it has no attachment list."""
+    port = _free_port()
+    config, certificate = _write_terminal_gateway_config(tmp_path, port)
+    process = _start(config)
+    _wait_for_tls_gateway(process, port, certificate)
+    try:
+        created = _create_ringing_call(port, certificate, "text-result-read")
+        call_id = created["call_id"]
+        _accept(port, certificate, call_id, "text-reader-owner")
+        status, submitted = _terminal_request(
+            port,
+            certificate,
+            "POST",
+            f"/api/calls/{call_id}/submissions",
+            "desktop-token",
+            {
+                "owner_session_id": "text-reader-owner",
+                "submission_id": "text-result-submit",
+                "task_version": 0,
+                "user_input": "attachment-free final answer",
+            },
+        )
+        assert status == 200
+        assert submitted["status"] == "answered"
+        result_id = submitted["result_id"]
+        before = _persisted_snapshot(tmp_path / "data", call_id)
+
+        page = _read_result(
+            port,
+            certificate,
+            "test-token-alpha",
+            created["interaction_id"],
+            result_id,
+            None,
+            _MIN_RESULT_BUDGET,
+        )
+        assert page == {
+            "success": True,
+            "result_id": result_id,
+            "body": "attachment-free final answer",
+            "full_length": len("attachment-free final answer"),
+            "complete": True,
+            "next_cursor": None,
+            "attachments": [],
+        }
+        assert _persisted_snapshot(tmp_path / "data", call_id) == before
+    finally:
+        _stop(process)
+
+
 def test_tls_result_reader_pages_unicode_with_budget_and_keeps_archive_immutable(tmp_path: Path) -> None:
     body = "汉😀é" * 7_000
     attachment = (b"\x00\xffresult-attachment\n" * 1_300) + b"tail"
