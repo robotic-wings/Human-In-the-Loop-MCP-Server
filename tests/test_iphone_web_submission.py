@@ -150,6 +150,33 @@ def test_tls_iphone_submission_rejects_competing_and_cross_site_requests_without
         first_cookie, first_csrf = _login(port, certificate)
         second_cookie, second_csrf = _login(port, certificate)
         assert _accept(port, certificate, call_id, first_cookie, first_csrf)[0] == 200
+        invalid_non_ascii = _submit(
+            port,
+            certificate,
+            call_id,
+            "phone-\u2603",
+            "non-ascii body must not persist",
+            _headers(first_cookie, first_csrf, port),
+        )
+        invalid_too_long = _submit(
+            port,
+            certificate,
+            call_id,
+            "a" * 129,
+            "overlong body must not persist",
+            _headers(first_cookie, first_csrf, port),
+        )
+        with sqlite3.connect(tmp_path / "data" / "calls.sqlite3") as connection:
+            invalid_state = connection.execute(
+                "SELECT state, owner_device_id, handled_on, terminal_platform FROM calls WHERE call_id = ?",
+                (call_id,),
+            ).fetchone()
+            invalid_result_count = connection.execute(
+                "SELECT count(*) FROM submission_operations WHERE call_id = ?", (call_id,)
+            ).fetchone()[0]
+            invalid_events = connection.execute(
+                "SELECT count(*) FROM events WHERE call_id = ?", (call_id,)
+            ).fetchone()[0]
         competing = _submit(
             port, certificate, call_id, "competing", "private answer", _headers(second_cookie, second_csrf, port)
         )
@@ -182,6 +209,17 @@ def test_tls_iphone_submission_rejects_competing_and_cross_site_requests_without
     finally:
         _stop(process)
 
+    assert invalid_non_ascii[0] == invalid_too_long[0] == 400
+    assert all(
+        body not in str(response[2])
+        for body, response in (
+            ("non-ascii body must not persist", invalid_non_ascii),
+            ("overlong body must not persist", invalid_too_long),
+        )
+    )
+    assert invalid_state == ("accepted", "iphone_web", "iphone_web", "ios")
+    assert invalid_result_count == 0
+    assert invalid_events == 1
     assert competing[0] in {401, 403, 404, 409}
     assert wrong_session[0] in {401, 403, 404}
     assert missing_csrf[0] in {400, 403}
