@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import threading
 import uuid
@@ -72,6 +73,7 @@ class CallCoordinator:
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.execute("PRAGMA foreign_keys=ON")
+        self._attachment_directory = database_path.parent / "attachments"
         self._initialize()
 
     def close(self) -> None:
@@ -406,6 +408,75 @@ class CallCoordinator:
                 (call_id, submission_id, payload, self._canonical(result)),
             )
             return result
+
+    def upload_terminal_attachment(
+        self,
+        call_id: str,
+        device_id: str,
+        owner_session_id: str,
+        original_name: str,
+        media_type: str,
+        content: bytes,
+        legacy_route_device_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Archive one attachment without completing the accepted call.
+
+        The gateway has already decoded the sole multipart entity.  This
+        transaction deliberately authorizes and settles expiry before any
+        archive directory is made or bytes are written.
+        """
+        if (
+            not isinstance(original_name, str)
+            or not original_name
+            or not isinstance(media_type, str)
+            or not media_type
+            or not isinstance(content, bytes)
+        ):
+            return {"success": False, "status": "invalid_attachment"}
+        with self._write_transaction() as connection:
+            row = self._routed_terminal_call(
+                connection, device_id, call_id, legacy_route_device_id=legacy_route_device_id
+            )
+            if row is None:
+                return None
+            if row["owner_device_id"] != device_id or row["owner_session_id"] != owner_session_id:
+                return None
+            self._settle_if_expired(connection, row)
+            row = self._call_or_raise(connection, call_id)
+            if row["state"] != "accepted":
+                return self._current_result(connection, row)
+
+            attachment_id = str(uuid.uuid4())
+            digest = hashlib.sha256(content).hexdigest()
+            self._attachment_directory.mkdir(parents=True, exist_ok=True)
+            storage_path = self._attachment_directory / attachment_id
+            storage_path.write_bytes(content)
+            connection.execute(
+                "INSERT INTO attachments "
+                "(attachment_id, call_id, original_name, media_type, byte_count, sha256, storage_path) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    attachment_id,
+                    call_id,
+                    original_name,
+                    media_type,
+                    len(content),
+                    digest,
+                    str(storage_path),
+                ),
+            )
+            self._refresh_terminal_liveness(connection, call_id)
+            return {
+                "success": True,
+                "status": "uploaded",
+                "attachment": {
+                    "attachment_id": attachment_id,
+                    "name": original_name,
+                    "media_type": media_type,
+                    "byte_count": len(content),
+                    "sha256": digest,
+                },
+            }
 
     def _routed_terminal_call(
         self,
@@ -997,6 +1068,12 @@ class CallCoordinator:
             CREATE TABLE IF NOT EXISTS submission_operations (
                 call_id TEXT NOT NULL, submission_id TEXT NOT NULL, payload TEXT NOT NULL,
                 result TEXT NOT NULL, PRIMARY KEY (call_id, submission_id),
+                FOREIGN KEY (call_id) REFERENCES calls(call_id)
+            );
+            CREATE TABLE IF NOT EXISTS attachments (
+                attachment_id TEXT PRIMARY KEY, call_id TEXT NOT NULL,
+                original_name TEXT NOT NULL, media_type TEXT NOT NULL,
+                byte_count INTEGER NOT NULL, sha256 TEXT NOT NULL, storage_path TEXT NOT NULL,
                 FOREIGN KEY (call_id) REFERENCES calls(call_id)
             );
             CREATE TABLE IF NOT EXISTS terminal_presence (

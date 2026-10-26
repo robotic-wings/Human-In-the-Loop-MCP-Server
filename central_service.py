@@ -655,6 +655,38 @@ class _TerminalGateway:
             }
         return HTTPStatus.OK, result
 
+    def upload_attachment(
+        self,
+        identity: _TerminalIdentity,
+        call_id: str,
+        owner_session_id: str,
+        original_name: str,
+        media_type: str,
+        content: bytes,
+    ) -> tuple[HTTPStatus, dict[str, object]]:
+        result = self._coordinator.upload_terminal_attachment(
+            call_id,
+            identity.device_id,
+            owner_session_id,
+            original_name,
+            media_type,
+            content,
+            self._legacy_route_device_id,
+        )
+        if result is None:
+            # Do not disclose whether the call exists or belongs to a different
+            # desktop/session.
+            return HTTPStatus.NOT_FOUND, {"error": "not found"}
+        if result["status"] == "invalid_attachment":
+            return HTTPStatus.BAD_REQUEST, result
+        if result["status"] != "uploaded":
+            return HTTPStatus.CONFLICT, {
+                "success": False,
+                "status": result["status"],
+                "reason": result.get("reason"),
+            }
+        return HTTPStatus.OK, result
+
     def read_draft(
         self, identity: _TerminalIdentity, call_id: str, owner_session_id: str | None
     ) -> tuple[HTTPStatus, dict[str, object]]:
@@ -837,6 +869,18 @@ class _PublicHandler(BaseHTTPRequestHandler):
             return parts[3]
         return None
 
+    @staticmethod
+    def _terminal_attachment_call_id(path: str) -> str | None:
+        parts = path.split("/")
+        if (
+            len(parts) == 5
+            and parts[:3] == ["", "api", "calls"]
+            and parts[3]
+            and parts[4] == "attachments"
+        ):
+            return parts[3]
+        return None
+
     def _terminal_request_body(self) -> tuple[bool, object]:
         try:
             content_length = int(self.headers.get("Content-Length", ""))
@@ -844,6 +888,54 @@ class _PublicHandler(BaseHTTPRequestHandler):
                 raise ValueError
             return True, json.loads(self.rfile.read(content_length).decode("utf-8"))
         except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid request"})
+            return False, None
+
+    def _terminal_attachment_body(
+        self,
+    ) -> tuple[bool, tuple[str, str, str, bytes] | None]:
+        """Decode the one-file multipart shape supported by this small slice."""
+        content_type = self.headers.get("Content-Type", "")
+        marker = "boundary="
+        if not content_type.startswith("multipart/form-data;") or marker not in content_type:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid request"})
+            return False, None
+        boundary = content_type.split(marker, 1)[1].strip().strip('"')
+        try:
+            content_length = int(self.headers.get("Content-Length", ""))
+            if not boundary or content_length < 0 or content_length > 1_000_000:
+                raise ValueError
+            raw = self.rfile.read(content_length)
+            fields: dict[str, str] = {}
+            file_part: tuple[str, str, bytes] | None = None
+            delimiter = b"--" + boundary.encode("ascii")
+            for part in raw.split(delimiter)[1:]:
+                if part in {b"", b"--\r\n", b"--"}:
+                    continue
+                if not part.startswith(b"\r\n"):
+                    raise ValueError
+                header_bytes, body = part[2:].split(b"\r\n\r\n", 1)
+                body = body.removesuffix(b"\r\n")
+                headers = header_bytes.decode("utf-8").split("\r\n")
+                disposition = next((line for line in headers if line.lower().startswith("content-disposition:")), "")
+                if 'name="owner_session_id"' in disposition and 'filename=' not in disposition:
+                    fields["owner_session_id"] = body.decode("utf-8")
+                    continue
+                if 'name="file"' not in disposition or 'filename="' not in disposition or file_part is not None:
+                    raise ValueError
+                filename = disposition.split('filename="', 1)[1].split('"', 1)[0]
+                media_type = next(
+                    (line.split(":", 1)[1].strip() for line in headers if line.lower().startswith("content-type:")),
+                    "application/octet-stream",
+                )
+                file_part = (filename, media_type, body)
+            if set(fields) != {"owner_session_id"} or file_part is None or not fields["owner_session_id"]:
+                raise ValueError
+            filename, media_type, content = file_part
+            if not filename or not media_type:
+                raise ValueError
+            return True, (fields["owner_session_id"], filename, media_type, content)
+        except (UnicodeDecodeError, UnicodeEncodeError, ValueError):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid request"})
             return False, None
 
@@ -860,6 +952,22 @@ class _PublicHandler(BaseHTTPRequestHandler):
                 status, response = terminal.register(identity, payload)
             else:
                 status, response = terminal.device_heartbeat(identity, payload)
+            self._send_json(status, response)
+            return
+        attachment_call_id = self._terminal_attachment_call_id(path)
+        if attachment_call_id is not None:
+            body_ok, attachment = self._terminal_attachment_body()
+            if not body_ok or attachment is None:
+                return
+            owner_session_id, original_name, media_type, content = attachment
+            status, response = terminal.upload_attachment(
+                identity,
+                attachment_call_id,
+                owner_session_id,
+                original_name,
+                media_type,
+                content,
+            )
             self._send_json(status, response)
             return
         submission_call_id = self._terminal_submission_call_id(path)
