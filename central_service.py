@@ -315,35 +315,14 @@ class _McpGateway:
         call_id = safe_arguments.get("call_id")
         after_event_seq = safe_arguments.get("after_event_seq")
         if call_id is not None or after_event_seq is not None:
-            interaction_id = safe_arguments.get(interaction_key)
-            if (
-                not isinstance(interaction_id, str)
-                or not interaction_id
-                or not isinstance(call_id, str)
-                or not call_id
-                or not isinstance(after_event_seq, int)
-                or isinstance(after_event_seq, bool)
-                or after_event_seq < 0
-            ):
-                return _rpc_error(rpc_id, -32602, "invalid params")
-            continuation_payload = json.dumps(
-                {"tool": spec.name, "arguments": safe_arguments},
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            envelope = self._coordinator.continue_call(
+            return self._continue_tool_call(
+                rpc_id,
+                spec,
+                safe_arguments,
+                interaction_key,
                 caller_id,
                 request_id,
-                interaction_id,
-                call_id,
-                after_event_seq,
-                continuation_payload,
             )
-            if envelope["status"] == "session_not_found":
-                # Keep unknown and unauthorized calls indistinguishable.
-                return _rpc_error(rpc_id, -32602, "invalid params")
-            return _rpc_result(rpc_id, {"content": [], "structuredContent": envelope})
         interaction_id = safe_arguments.get(interaction_key)
         if not isinstance(interaction_id, str) or not interaction_id:
             interaction_id = request_id
@@ -363,6 +342,48 @@ class _McpGateway:
                 ring_timeout_seconds=60,
             )
         )
+        return _rpc_result(rpc_id, {"content": [], "structuredContent": envelope})
+
+    def _continue_tool_call(
+        self,
+        rpc_id: object,
+        spec: ToolSpec,
+        safe_arguments: dict[str, object],
+        interaction_key: str,
+        caller_id: str,
+        request_id: str,
+    ) -> dict[str, object]:
+        """Validate transport arguments, then preserve coordinator envelopes verbatim."""
+        interaction_id = safe_arguments.get(interaction_key)
+        call_id = safe_arguments.get("call_id")
+        after_event_seq = safe_arguments.get("after_event_seq")
+        if (
+            not isinstance(interaction_id, str)
+            or not interaction_id
+            or not isinstance(call_id, str)
+            or not call_id
+            or not isinstance(after_event_seq, int)
+            or isinstance(after_event_seq, bool)
+            or after_event_seq < 0
+        ):
+            return _rpc_error(rpc_id, -32602, "invalid params")
+        continuation_payload = json.dumps(
+            {"tool": spec.name, "arguments": safe_arguments},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        envelope = self._coordinator.continue_call(
+            caller_id,
+            request_id,
+            interaction_id,
+            call_id,
+            after_event_seq,
+            continuation_payload,
+        )
+        if envelope["status"] == "session_not_found":
+            # Keep unknown and unauthorized calls indistinguishable.
+            return _rpc_error(rpc_id, -32602, "invalid params")
         return _rpc_result(rpc_id, {"content": [], "structuredContent": envelope})
 
 
@@ -502,8 +523,9 @@ def _serve(config: ServiceConfig) -> None:
     context = _build_tls_context(config)
     credentials = _load_agent_credentials(config.agent_credentials_file)
     config.data_dir.mkdir(parents=True, exist_ok=True)
-    coordinator = CallCoordinator(config.data_dir / "calls.sqlite3", clock=_SystemClock())
-    scheduler = RingingDeadlineScheduler(coordinator, _SystemClock())
+    clock = _SystemClock()
+    coordinator = CallCoordinator(config.data_dir / "calls.sqlite3", clock=clock)
+    scheduler = RingingDeadlineScheduler(coordinator, clock)
     try:
         coordinator.recover_and_settle()
         scheduler.start()
