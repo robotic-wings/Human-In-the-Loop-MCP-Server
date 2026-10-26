@@ -20,7 +20,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, NoReturn
-from urllib.parse import urlparse, urlsplit
+from urllib.error import URLError
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlsplit, urlunsplit
+from urllib.request import urlopen
 
 from call_coordinator import CallCoordinator, CreateCall
 
@@ -43,6 +45,8 @@ class ServiceConfig:
     attachment_max_file_bytes: int
     attachment_max_submission_bytes: int
     attachment_max_archive_bytes: int
+    bark_enabled: bool
+    bark_url: str | None
 
 
 _DEFAULT_ATTACHMENT_MAX_FILE_BYTES = 20 * 1024 * 1024
@@ -120,6 +124,18 @@ def _load_config(config_path: Path) -> ServiceConfig:
     attachment_max_archive_bytes = _positive_integer(
         raw, "attachment_max_archive_bytes", _DEFAULT_ATTACHMENT_MAX_ARCHIVE_BYTES
     )
+    bark_enabled = raw.get("bark_enabled", False)
+    if not isinstance(bark_enabled, bool):
+        raise ConfigurationError("config bark_enabled must be a boolean")
+    bark_url_value = raw.get("bark_url")
+    if bark_enabled:
+        if not isinstance(bark_url_value, str) or not bark_url_value.strip():
+            raise ConfigurationError("config bark_url is required when bark_enabled")
+        bark_url = bark_url_value.strip()
+        if urlparse(bark_url).scheme not in {"http", "https"}:
+            raise ConfigurationError("config bark_url must be an HTTP(S) URL")
+    else:
+        bark_url = None
     return ServiceConfig(
         host,
         port,
@@ -133,6 +149,8 @@ def _load_config(config_path: Path) -> ServiceConfig:
         attachment_max_file_bytes,
         attachment_max_submission_bytes,
         attachment_max_archive_bytes,
+        bark_enabled,
+        bark_url,
     )
 
 
@@ -371,11 +389,13 @@ def _load_terminal_credentials(path: Path | None) -> dict[str, _TerminalIdentity
 
 class _McpGateway:
     def __init__(
-        self, coordinator: CallCoordinator, credentials: dict[str, str], desktop_route_device_id: str | None = None
+        self, coordinator: CallCoordinator, credentials: dict[str, str], desktop_route_device_id: str | None = None,
+        bark_enabled: bool = False,
     ) -> None:
         self._coordinator = coordinator
         self._credentials = credentials
         self._desktop_route_device_id = desktop_route_device_id
+        self._bark_enabled = bark_enabled
 
     def caller_for(self, authorization: str | None) -> str | None:
         if not isinstance(authorization, str) or not authorization.startswith("Bearer "):
@@ -494,6 +514,7 @@ class _McpGateway:
                 message=message,
                 ring_timeout_seconds=60,
                 desktop_route_device_id=self._desktop_route_device_id,
+                bark_enabled=self._bark_enabled,
             )
         )
         if client_timeout_seconds is not None and envelope["status"] == "ringing":
@@ -1304,6 +1325,78 @@ class RingingDeadlineScheduler:
             self._stopped.wait(self._poll_interval_seconds)
 
 
+class BarkDeliveryScheduler:
+    """One-shot persisted Bark sender kept outside the MCP request path."""
+
+    def __init__(self, coordinator: CallCoordinator, bark_url: str, web_base_url: str) -> None:
+        self._coordinator = coordinator
+        self._bark_url = bark_url
+        self._web_base_url = web_base_url.rstrip("/")
+        self._stopped = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self._coordinator.recover_bark_deliveries()
+        self._thread = threading.Thread(target=self._run, name="bark-delivery-scheduler", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stopped.set()
+        if self._thread is not None:
+            self._thread.join(timeout=3)
+            self._thread = None
+
+    def _run(self) -> None:
+        while not self._stopped.is_set():
+            delivery = self._coordinator.claim_next_bark_delivery()
+            if delivery is None:
+                self._stopped.wait(0.03)
+                continue
+            if not self._coordinator.authorize_bark_send(delivery["call_id"]):
+                continue
+            self._coordinator.finish_bark_delivery(
+                delivery["call_id"], self._send(delivery["call_id"], delivery["message"])
+            )
+
+    def _send(self, call_id: str, message: str) -> str:
+        title = _bark_title(message)
+        parsed = urlsplit(self._bark_url)
+        query = parse_qsl(parsed.query, keep_blank_values=True)
+        query.extend(
+            (
+                ("title", title),
+                ("body", "Open the secure response page."),
+                ("url", f"{self._web_base_url}/calls/{call_id}"),
+                ("call", "1"),
+            )
+        )
+        request_url = urlunsplit(
+            (parsed.scheme, parsed.netloc, parsed.path, urlencode(query, quote_via=quote), "")
+        )
+        try:
+            with urlopen(request_url, timeout=2.5) as response:  # noqa: S310 - configured Bark endpoint
+                body = response.read()
+                if not 200 <= response.status < 300:
+                    return "failed"
+            try:
+                decoded = json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return "failed"
+            return "success" if isinstance(decoded, dict) and decoded.get("code") == 200 else "failed"
+        except (TimeoutError, URLError, OSError):
+            return "timeout"
+
+
+def _bark_title(message: str) -> str:
+    """Extract only the short display title; never send full tool arguments."""
+    try:
+        arguments = json.loads(message).get("arguments", {})
+    except (json.JSONDecodeError, AttributeError):
+        return "Human input requested"
+    title = arguments.get("title") if isinstance(arguments, dict) else None
+    return title if isinstance(title, str) and title else "Human input requested"
+
+
 def _build_tls_context(config: ServiceConfig) -> ssl.SSLContext:
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(certfile=config.certfile, keyfile=config.keyfile)
@@ -1343,13 +1436,22 @@ def _serve(config: ServiceConfig) -> None:
         attachment_max_archive_bytes=config.attachment_max_archive_bytes,
     )
     scheduler = RingingDeadlineScheduler(coordinator, clock)
+    bark_scheduler = (
+        BarkDeliveryScheduler(coordinator, config.bark_url, config.web_base_url)
+        if config.bark_enabled and config.bark_url is not None
+        else None
+    )
     try:
         coordinator.recover_and_settle()
         scheduler.start()
+        if bark_scheduler is not None:
+            bark_scheduler.start()
         configured_desktop_route_device_id = (
             config.eligible_desktop_device_ids[0] if config.eligible_desktop_device_ids else None
         )
-        gateway = _McpGateway(coordinator, credentials, configured_desktop_route_device_id)
+        gateway = _McpGateway(
+            coordinator, credentials, configured_desktop_route_device_id, config.bark_enabled
+        )
         terminal_gateway = _TerminalGateway(
             coordinator,
             terminal_credentials,
@@ -1362,6 +1464,8 @@ def _serve(config: ServiceConfig) -> None:
         finally:
             server.server_close()
     finally:
+        if bark_scheduler is not None:
+            bark_scheduler.stop()
         scheduler.stop()
         coordinator.close()
 

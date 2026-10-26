@@ -27,6 +27,7 @@ class CreateCall:
     message: str
     ring_timeout_seconds: int
     desktop_route_device_id: str | None = None
+    bark_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -135,12 +136,82 @@ class CallCoordinator:
                     call_id=call_id,
                     retryable=False,
                 )
+                if request.bark_enabled:
+                    connection.execute(
+                        "INSERT INTO bark_deliveries (call_id, state, attempt_count) "
+                        "VALUES (?, 'pending', 0)",
+                        (call_id,),
+                    )
             connection.execute(
                 "INSERT INTO create_operations (caller_id, request_id, payload, result) "
                 "VALUES (?, ?, ?, ?)",
                 (request.caller_id, request.request_id, payload, self._canonical(result)),
             )
             return result
+
+    def claim_next_bark_delivery(self) -> dict[str, str] | None:
+        """Atomically claim one fresh phone delivery without changing call state."""
+        with self._write_transaction() as connection:
+            row = connection.execute(
+                "SELECT deliveries.call_id, calls.message FROM bark_deliveries AS deliveries "
+                "JOIN calls ON calls.call_id = deliveries.call_id "
+                "WHERE deliveries.state = 'pending' ORDER BY deliveries.rowid LIMIT 1"
+            ).fetchone()
+            if row is None:
+                return None
+            call = self._call_or_raise(connection, row["call_id"])
+            self._settle_if_expired(connection, call)
+            call = self._call_or_raise(connection, row["call_id"])
+            if call["state"] != "ringing" or self._now() >= self._parse_stamp(call["ring_deadline"]):
+                connection.execute(
+                    "UPDATE bark_deliveries SET state = 'skipped' WHERE call_id = ? AND state = 'pending'",
+                    (call["call_id"],),
+                )
+                return None
+            claimed = connection.execute(
+                "UPDATE bark_deliveries SET state = 'sending', attempt_count = attempt_count + 1 "
+                "WHERE call_id = ? AND state = 'pending'",
+                (call["call_id"],),
+            ).rowcount
+            if claimed != 1:
+                return None
+            return {"call_id": str(call["call_id"]), "message": str(call["message"])}
+
+    def finish_bark_delivery(self, call_id: str, state: str) -> None:
+        if state not in {"success", "failed", "timeout", "uncertain"}:
+            raise ValueError("invalid Bark delivery state")
+        with self._write_transaction() as connection:
+            connection.execute(
+                "UPDATE bark_deliveries SET state = ? WHERE call_id = ? AND state = 'sending'",
+                (state, call_id),
+            )
+
+    def authorize_bark_send(self, call_id: str) -> bool:
+        """Recheck the durable call immediately before an external Bark request."""
+        with self._write_transaction() as connection:
+            delivery = connection.execute(
+                "SELECT state FROM bark_deliveries WHERE call_id = ?", (call_id,)
+            ).fetchone()
+            if delivery is None or delivery["state"] != "sending":
+                return False
+            call = self._call_or_raise(connection, call_id)
+            self._settle_if_expired(connection, call)
+            call = self._call_or_raise(connection, call_id)
+            if call["state"] == "ringing" and self._now() < self._parse_stamp(call["ring_deadline"]):
+                return True
+            connection.execute(
+                "UPDATE bark_deliveries SET state = 'suppressed' "
+                "WHERE call_id = ? AND state = 'sending'",
+                (call_id,),
+            )
+            return False
+
+    def recover_bark_deliveries(self) -> None:
+        """Never retry an external request whose prior outcome is unknown."""
+        with self._write_transaction() as connection:
+            connection.execute(
+                "UPDATE bark_deliveries SET state = 'uncertain' WHERE state = 'sending'"
+            )
 
     def accept_call(self, request: AcceptCall) -> dict[str, Any]:
         return self._act("accept", request.call_id, request.action_id, asdict(request))
@@ -1511,6 +1582,10 @@ class CallCoordinator:
                 device_id TEXT PRIMARY KEY, terminal_platform TEXT NOT NULL,
                 route_device_id TEXT NOT NULL, callback_url TEXT, instance_id TEXT NOT NULL,
                 gui_ready INTEGER NOT NULL, last_seen_at TEXT NOT NULL, online_expires_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS bark_deliveries (
+                call_id TEXT PRIMARY KEY, state TEXT NOT NULL, attempt_count INTEGER NOT NULL,
+                FOREIGN KEY (call_id) REFERENCES calls(call_id)
             );
             """
         )
