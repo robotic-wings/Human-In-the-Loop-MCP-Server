@@ -11,12 +11,12 @@ from __future__ import annotations
 import http.client
 import json
 import ssl
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Barrier, Thread
 from typing import Any
 
-from call_coordinator import CallCoordinator, CreateCall
+from call_coordinator import AcceptCall, CallCoordinator, CreateCall
 from test_central_mcp_gateway import (
     _call,
     _free_port,
@@ -178,7 +178,6 @@ def test_terminal_state_is_read_only_and_accept_derives_desktop_identity_then_pe
                 "terminal_platform": "ios",
             },
         )
-        opened = _read_opened_event(port, certificate, created, "opened-read")
     finally:
         _stop(process)
 
@@ -186,11 +185,11 @@ def test_terminal_state_is_read_only_and_accept_derives_desktop_identity_then_pe
     assert first_state == second_state
     assert first_state["call"]["call_state"] == "ringing"
     assert accept_status == 200
-    assert accepted["status"] == opened["status"] == "opened"
-    assert accepted["owner_device_id"] == opened["owner_device_id"] == "desktop-registered"
-    assert accepted["owner_session_id"] == opened["owner_session_id"] == "desktop-session-1"
-    assert accepted["handled_on"] == opened["handled_on"] == "desktop"
-    assert accepted["terminal_platform"] == opened["terminal_platform"] == "windows"
+    assert accepted["status"] == "opened"
+    assert accepted["owner_device_id"] == "desktop-registered"
+    assert accepted["owner_session_id"] == "desktop-session-1"
+    assert accepted["handled_on"] == "desktop"
+    assert accepted["terminal_platform"] == "windows"
 
     restarted = _start(config)
     _wait_for_listener(restarted, port)
@@ -206,12 +205,19 @@ def test_terminal_state_is_read_only_and_accept_derives_desktop_identity_then_pe
             "other-desktop-token",
             {"action_id": "takeover", "owner_session_id": "other-session"},
         )
+        opened = _read_opened_event(port, certificate, created, "opened-after-restart")
     finally:
         _stop(restarted)
 
     assert state_status == 200
     assert state["call"]["owner_device_id"] == "desktop-registered"
     assert state["call"]["owner_session_id"] == "desktop-session-1"
+    assert opened["status"] == "opened"
+    assert opened["event_seq"] == 1
+    assert opened["owner_device_id"] == "desktop-registered"
+    assert opened["owner_session_id"] == "desktop-session-1"
+    assert opened["handled_on"] == "desktop"
+    assert opened["terminal_platform"] == "windows"
     assert takeover_status == 409
     assert takeover["status"] == "ownership_conflict"
 
@@ -233,13 +239,21 @@ def test_terminal_decline_releases_busy_and_never_supplies_an_answer_value(
             "desktop-token",
             {"action_id": "decline-1"},
         )
-        event = _read_opened_event(port, certificate, created, "decline-read")
-        next_call = _create_ringing_call(port, certificate, "after-decline")
     finally:
         _stop(process)
 
+    restarted = _start(config)
+    _wait_for_listener(restarted, port)
+    try:
+        event = _read_opened_event(port, certificate, created, "decline-after-restart")
+        terminal_replay = _read_opened_event(port, certificate, created, "decline-after-event")
+        next_call = _create_ringing_call(port, certificate, "after-decline")
+    finally:
+        _stop(restarted)
+
     assert declined_status == 200
     assert declined["status"] == event["status"] == "declined"
+    assert event["event_seq"] == terminal_replay["event_seq"] == 1
     assert declined["human_action"] is True
     for value in (declined, event):
         assert "user_input" not in value
@@ -247,6 +261,79 @@ def test_terminal_decline_releases_busy_and_never_supplies_an_answer_value(
         assert "confirmed" not in value
         assert "acknowledged" not in value
     assert next_call["status"] == "ringing"
+
+
+def test_deadline_settlement_races_terminal_accept_with_one_durable_winner_no_revival(
+    tmp_path: Path,
+) -> None:
+    """Deadline recovery and an authenticated desktop accept share one transaction."""
+    clock = _MutableClock(datetime(2020, 1, 1, tzinfo=UTC))
+    database = tmp_path / "calls.sqlite3"
+    coordinator = CallCoordinator(database, clock=clock)
+    created = coordinator.create_call(
+        CreateCall("operator-default", "agent-alpha", "deadline-race", "create", "prompt", 60)
+    )
+    clock.advance(seconds=60)
+    barrier = Barrier(3)
+    outcomes: list[dict[str, Any]] = []
+
+    def settle_deadline() -> None:
+        barrier.wait()
+        outcomes.extend(coordinator.recover_and_settle())
+
+    def terminal_accept() -> None:
+        barrier.wait()
+        outcomes.append(
+            coordinator.accept_call(
+                AcceptCall(
+                    call_id=created["call_id"],
+                    action_id="accept-at-deadline",
+                    device_id="desktop-registered",
+                    session_id="session-at-deadline",
+                    handled_on="desktop",
+                    terminal_platform="windows",
+                )
+            )
+        )
+
+    settlement, accept = Thread(target=settle_deadline), Thread(target=terminal_accept)
+    settlement.start()
+    accept.start()
+    barrier.wait()
+    settlement.join()
+    accept.join()
+    final = coordinator.get_call(created["call_id"])
+    events = coordinator.events_for(created["call_id"])
+    coordinator.close()
+
+    assert len(outcomes) == 2
+    assert all(result["status"] == "not_accepted" for result in outcomes)
+    assert final["call_state"] == "not_accepted"
+    assert final["owner_device_id"] is None
+    assert final["owner_session_id"] is None
+    assert len(events) == 1
+    assert events[0]["status"] == "not_accepted"
+    assert events[0]["reason"] == "ring_timeout"
+    assert events[0]["event_seq"] == 1
+
+    reopened = CallCoordinator(database, clock=clock)
+    late_accept = reopened.accept_call(
+        AcceptCall(
+            call_id=created["call_id"],
+            action_id="accept-after-restart",
+            device_id="desktop-registered",
+            session_id="late-session",
+            handled_on="desktop",
+            terminal_platform="windows",
+        )
+    )
+    reopened_events = reopened.events_for(created["call_id"])
+    reopened.close()
+
+    assert late_accept["status"] == "not_accepted"
+    assert late_accept["owner_device_id"] is None
+    assert late_accept["owner_session_id"] is None
+    assert reopened_events == events
 
 
 def test_terminal_action_id_replays_exactly_and_changed_request_conflicts_without_new_event(
@@ -357,3 +444,8 @@ class _FrozenClock:
 
     def now_utc(self) -> datetime:
         return self.now
+
+
+class _MutableClock(_FrozenClock):
+    def advance(self, *, seconds: int) -> None:
+        self.now += timedelta(seconds=seconds)
