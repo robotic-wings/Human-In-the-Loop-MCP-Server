@@ -55,7 +55,18 @@ def _page(html: object, call_id: str) -> tuple[str, str]:
     assert parser.send[0].get("data-endpoint") == endpoint
     assert (TYPE_ID, TYPE_LABEL) in [(item.get("value"), item.get("data-label")) for item in parser.options]
     assert "credentials: 'same-origin'" in source and "X-CSRF-Token" in source
-    assert re.search(r"(?s)(?:send|button)\.addEventListener\(\s*['\"]click['\"].*?(?:send|button)\.dataset\.endpoint.*?(?:select|feedbackType).*?(?:textarea|feedbackText).*?JSON\.stringify\(\{[^}]*feedback_type[^}]*feedback_text.*?fetch\(\s*(?:send|button)\.dataset\.endpoint.*?['\"]X-CSRF-Token['\"]\s*:\s*csrf.*?credentials\s*:\s*['\"]same-origin['\"]", source)
+    assert re.search(r'''(?sx)
+        (?:const|let)\s+(?P<send>[A-Za-z_$][\w$]*)\s*=\s*
+        document\.querySelector\(\s*['"]button\[data-feedback-send\]['"]\s*\)
+        .*?(?P=send)\.addEventListener\(\s*['"]click['"]
+        .*?(?P=send)\.dataset\.endpoint
+        .*?(?:document\.querySelector\([^)]*select|feedbackType)
+        .*?(?:document\.querySelector\([^)]*textarea|feedbackText)
+        .*?JSON\.stringify\(\{[^}]*feedback_type[^}]*feedback_text
+        .*?fetch\(\s*(?P=send)\.dataset\.endpoint
+        .*?['"]X-CSRF-Token['"]\s*:\s*csrf
+        .*?credentials\s*:\s*['"]same-origin['"]
+    ''', source)
     return endpoint, parser.csrf
 
 
