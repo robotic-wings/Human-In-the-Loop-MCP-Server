@@ -1061,14 +1061,20 @@ class _OperatorGateway:
                 result = self._coordinator.submit_terminal_single_choice(
                     call_id, "iphone_web", session or "", submission_id, payload["selected_choices"]
                 )
-        elif "confirmed" in payload and "user_input" not in payload:
+        elif (
+            "confirmed" in payload
+            and "user_input" not in payload
+            and "acknowledged" not in payload
+        ):
             confirmed = payload["confirmed"]
             if not isinstance(confirmed, bool):
                 return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
             result = self._coordinator.submit_terminal_confirmation(
                 call_id, "iphone_web", session or "", submission_id, confirmed
             )
-        elif "acknowledged" in payload and "user_input" not in payload:
+        elif "acknowledged" in payload:
+            if set(payload) != {"submission_id", "acknowledged"}:
+                return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
             info_acknowledgement = True
             result = self._coordinator.submit_terminal_info_acknowledgement(
                 call_id, "iphone_web", session or "", submission_id, payload["acknowledged"]
