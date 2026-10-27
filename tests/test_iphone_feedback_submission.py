@@ -81,3 +81,21 @@ def test_tls_iphone_feedback_rejects_invalid_foreign_route_and_expiry_without_mu
     finally: _stop(process)
     assert all(item[0] in {400, 401, 403, 404, 409} for item in bad) and after == before and operations == 0 and after_events == events == [(1,)]
     opaque = repr(bad[-1][2]).lower(); assert not any(word in opaque for word in (call_id.lower(), "status", "call_state", "reason", "result", "feedback", "owner", "route", "accepted"))
+
+
+def test_tls_feedback_route_exclusion_and_restart_expiry_release_busy(tmp_path: Path) -> None:
+    port = _free_port(); config, certificate = _write_operator_config(tmp_path, port); database = tmp_path / "data" / "calls.sqlite3"; process = _start(config); _wait_for_listener(process, port)
+    try:
+        excluded = _call(port, certificate, "feedback-route"); call_id = excluded["call_id"]; assert isinstance(call_id, str); cookie, csrf = _login(port, certificate)
+        denied = _submit(port, certificate, call_id, "route", TYPE_ID, "x", _headers(cookie, csrf, port))
+    finally: _stop(process)
+    assert denied[0] in {400, 401, 403, 404, 409}
+    port = _free_port(); config, certificate = _write_operator_config(tmp_path / "expiry", port); _configure_phone_route(config); database = tmp_path / "expiry" / "data" / "calls.sqlite3"; process = _start(config); _wait_for_listener(process, port)
+    try:
+        created = _call(port, certificate, "feedback-expiry"); call_id, interaction_id = created["call_id"], created["interaction_id"]; assert isinstance(call_id, str) and isinstance(interaction_id, str); cookie, csrf = _login(port, certificate); headers = _headers(cookie, csrf, port); assert _accept(port, certificate, call_id, headers)[0] == 200
+        with sqlite3.connect(database) as connection: connection.execute("UPDATE calls SET terminal_last_seen_at = ?, terminal_disconnect_deadline = ? WHERE call_id = ?", ((datetime.now(UTC) - timedelta(seconds=181)).isoformat(), (datetime.now(UTC) - timedelta(seconds=1)).isoformat(), call_id)); connection.commit()
+        _stop(process); process = _start(config); _wait_for_listener(process, port); late = _submit(port, certificate, call_id, "late", TYPE_ID, "x", headers); _, event, _ = _post(port, certificate, _continuation("feedback-terminal", interaction_id, call_id, 1), "test-token-alpha"); next_call = _call(port, certificate, "feedback-after-expiry")
+        with sqlite3.connect(database) as connection: state = connection.execute("SELECT state FROM calls WHERE call_id = ?", (call_id,)).fetchone(); operations = connection.execute("SELECT count(*) FROM submission_operations WHERE call_id = ?", (call_id,)).fetchone()[0]
+    finally: _stop(process)
+    assert late[0] == 409 and isinstance(late[2], dict) and late[2]["status"] == late[2]["call_state"] == "disconnected" and late[2]["reason"] == "terminal_disconnected"
+    assert _structured(event) == late[2] and state == ("disconnected",) and operations == 0 and next_call["call_state"] == "ringing"
