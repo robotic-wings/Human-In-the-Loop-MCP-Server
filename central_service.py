@@ -1074,6 +1074,7 @@ class _OperatorGateway:
         info_acknowledgement = False
         feedback_submission = False
         task_final_submission = False
+        task_progress_submission = False
         if "feedback_type" in payload or "feedback_text" in payload:
             if set(payload) != {"submission_id", "feedback_type", "feedback_text"}:
                 return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
@@ -1099,11 +1100,17 @@ class _OperatorGateway:
         elif "status" in payload or "report" in payload:
             if set(payload) != {"submission_id", "status", "report"}:
                 return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
-            task_final_submission = True
-            result = self._coordinator.submit_terminal_task_final(
-                call_id, "iphone_web", session or "", submission_id,
-                payload["status"], payload["report"],
-            )
+            if payload["status"] == "in_progress":
+                task_progress_submission = True
+                result = self._coordinator.submit_terminal_task_progress(
+                    call_id, "iphone_web", session or "", submission_id, payload["report"],
+                )
+            else:
+                task_final_submission = True
+                result = self._coordinator.submit_terminal_task_final(
+                    call_id, "iphone_web", session or "", submission_id,
+                    payload["status"], payload["report"],
+                )
         elif "selected_choices" in payload and "user_input" not in payload and "confirmed" not in payload:
             if self._coordinator.multiple_choice_options_for_call(call_id) is not None:
                 result = self._coordinator.submit_terminal_multiple_choice(
@@ -1152,14 +1159,14 @@ class _OperatorGateway:
         if result is None:
             # An authenticated operator may know a ringing call without owning
             # it; do not turn that into a content-bearing response.
-            if feedback_submission or task_final_submission:
+            if feedback_submission or task_final_submission or task_progress_submission:
                 return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
             return HTTPStatus.CONFLICT, {"error": "cannot submit"}
         if result["status"] == "invalid_submission":
             return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
         if result["status"] == "request_conflict":
             return HTTPStatus.CONFLICT, result
-        if result["status"] not in {"answered", "completed", "failed"}:
+        if result["status"] not in {"answered", "completed", "failed", "in_progress"}:
             if (
                 ("confirmed" in payload and "user_input" not in payload)
                 or ("selected_choices" in payload and "user_input" not in payload)
@@ -1168,6 +1175,7 @@ class _OperatorGateway:
                 or info_acknowledgement
                 or feedback_submission
                 or task_final_submission
+                or task_progress_submission
             ):
                 return HTTPStatus.CONFLICT, result
             return HTTPStatus.CONFLICT, {"status": result["status"]}
@@ -1207,7 +1215,7 @@ class _OperatorGateway:
         result = self._coordinator.heartbeat_iphone_call(call_id, session or "")
         if result is None:
             return HTTPStatus.CONFLICT, {"error": "cannot heartbeat"}
-        if result["status"] != "accepted":
+        if result["status"] not in {"accepted", "in_progress"}:
             return HTTPStatus.CONFLICT, result
         return HTTPStatus.OK, result
 
@@ -1452,7 +1460,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
                 f'<button data-action="accept" data-endpoint="{endpoint}/accept">Accept</button>'
                 f'<button data-action="decline" data-endpoint="{endpoint}/decline">Decline</button>'
             )
-        elif call_state == "accepted":
+        elif call_state in {"accepted", "in_progress"}:
             if state.get("owner_device_id") == "iphone_web" and state.get("_page_session_matches_owner"):
                 # The caller has already authenticated this exact browser
                 # session; the form does not create a second ownership path.
@@ -1466,10 +1474,19 @@ class _PublicHandler(BaseHTTPRequestHandler):
                     controls = (
                         f'<h2>{html.escape(title)}</h2><p>{html.escape(description)}</p><p>{html.escape(context_note)}</p>'
                         f'<textarea data-task-report></textarea>'
+                        f'<button data-task-progress="true" data-endpoint="{endpoint}/submissions">Still progressing</button>'
                         f'<button data-task-final="completed" data-endpoint="{endpoint}/submissions">Completed</button>'
                         f'<button data-task-final="failed" data-endpoint="{endpoint}/submissions">Failed</button>'
                     )
                     submission_script = (
+                        "const progress=document.querySelector('button[data-task-progress]');"
+                        "progress.addEventListener('click',()=>{"
+                        "const report=document.querySelector('textarea[data-task-report]').value;"
+                        "const body=JSON.stringify({submission_id:crypto.randomUUID(),status:'in_progress',report:report});"
+                        "fetch(progress.dataset.endpoint,{method:'POST',credentials: 'same-origin',"
+                        "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:body})"
+                        ".then((response)=>{if(response.ok)location.reload();});"
+                        "});"
                         "const completed=document.querySelector('button[data-task-final=\"completed\"]');"
                         "completed.addEventListener('click',()=>{"
                         "const status=completed.dataset.taskFinal;"
