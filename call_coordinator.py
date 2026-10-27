@@ -580,6 +580,7 @@ class CallCoordinator:
             if (
                 self._is_confirmation_request(row["message"])
                 or self._is_single_choice_request(row["message"])
+                or self._multiple_choice_options(row["message"]) is not None
                 or self._numeric_input_type(row["message"]) is not None
             ):
                 return {"success": False, "status": "invalid_submission"}
@@ -652,6 +653,14 @@ class CallCoordinator:
                 "SELECT message FROM calls WHERE call_id = ?", (call_id,)
             ).fetchone()
             return self._numeric_input_type(row["message"]) if row is not None else None
+
+    def multiple_choice_options_for_call(self, call_id: str) -> list[str] | None:
+        """Return stored multi-choice options without changing call state."""
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT message FROM calls WHERE call_id = ?", (call_id,)
+            ).fetchone()
+            return self._multiple_choice_options(row["message"]) if row is not None else None
 
     def submit_terminal_confirmation(
         self,
@@ -788,6 +797,78 @@ class CallCoordinator:
                 "terminal_platform": row["terminal_platform"],
                 "selected_choices": [selected],
                 "result_id": str(uuid.uuid4()),
+            }
+            connection.execute(
+                "UPDATE calls SET state = 'answered', version = version + 1 WHERE call_id = ?",
+                (call_id,),
+            )
+            self._add_event(connection, call_id, result)
+            connection.execute(
+                "INSERT INTO submission_operations (call_id, submission_id, payload, result) "
+                "VALUES (?, ?, ?, ?)",
+                (call_id, submission_id, payload, self._canonical(result)),
+            )
+            return result
+
+    def submit_terminal_multiple_choice(
+        self,
+        call_id: str,
+        device_id: str,
+        owner_session_id: str,
+        submission_id: str,
+        selected_choices: object,
+    ) -> dict[str, Any] | None:
+        """Persist an ordered multi-choice answer from its accepted iPhone owner."""
+        if (
+            not isinstance(submission_id, str)
+            or not submission_id
+            or len(submission_id) > 128
+            or not submission_id.isascii()
+            or not isinstance(selected_choices, list)
+            or not selected_choices
+            or any(not isinstance(choice, str) for choice in selected_choices)
+            or len(set(selected_choices)) != len(selected_choices)
+        ):
+            return {"success": False, "status": "invalid_submission"}
+        with self._write_transaction() as connection:
+            try:
+                row = self._call_or_raise(connection, call_id)
+            except KeyError:
+                return None
+            routed = connection.execute(
+                "SELECT 1 FROM bark_deliveries WHERE call_id = ?", (call_id,)
+            ).fetchone()
+            if routed is None:
+                return None
+            if row["owner_device_id"] != device_id or row["owner_session_id"] != owner_session_id:
+                if self._is_terminal_disconnect_owner(connection, row, device_id, owner_session_id):
+                    return self._current_result(connection, row)
+                return None
+            choices = self._multiple_choice_options(row["message"])
+            if choices is None or any(choice not in choices for choice in selected_choices):
+                return {"success": False, "status": "invalid_submission"}
+            canonical_choices = [choice for choice in choices if choice in selected_choices]
+            payload = self._canonical({"selected_choices": canonical_choices})
+            self._settle_if_expired(connection, row)
+            row = self._call_or_raise(connection, call_id)
+            replay = connection.execute(
+                "SELECT payload, result FROM submission_operations "
+                "WHERE call_id = ? AND submission_id = ?",
+                (call_id, submission_id),
+            ).fetchone()
+            if replay is not None:
+                if replay["payload"] == payload:
+                    return self._decode(replay["result"])
+                return self._conflict()
+            if row["state"] != "accepted":
+                return self._current_result(connection, row)
+            result = {
+                "success": True, "status": "answered", "call_state": "answered",
+                "reason": None, "human_action": True, "needs_continuation": False,
+                "interaction_id": row["interaction_id"], "call_id": row["call_id"],
+                "event_seq": (self._event_seq(connection, call_id) or 0) + 1,
+                "handled_on": row["handled_on"], "terminal_platform": row["terminal_platform"],
+                "selected_choices": canonical_choices, "result_id": str(uuid.uuid4()),
             }
             connection.execute(
                 "UPDATE calls SET state = 'answered', version = version + 1 WHERE call_id = ?",
@@ -1209,6 +1290,22 @@ class CallCoordinator:
             return None
         arguments = request.get("arguments")
         if not isinstance(arguments, dict) or arguments.get("allow_multiple") is not False:
+            return None
+        choices = arguments.get("choices")
+        if not isinstance(choices, list) or not choices or any(not isinstance(choice, str) for choice in choices):
+            return None
+        return choices
+
+    @staticmethod
+    def _multiple_choice_options(message: object) -> list[str] | None:
+        try:
+            request = json.loads(message) if isinstance(message, str) else None
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(request, dict) or request.get("tool") != "get_user_choice":
+            return None
+        arguments = request.get("arguments")
+        if not isinstance(arguments, dict) or arguments.get("allow_multiple") is not True:
             return None
         choices = arguments.get("choices")
         if not isinstance(choices, list) or not choices or any(not isinstance(choice, str) for choice in choices):
