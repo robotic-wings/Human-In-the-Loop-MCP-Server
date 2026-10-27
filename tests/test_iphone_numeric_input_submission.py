@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from html.parser import HTMLParser
@@ -270,7 +271,17 @@ def test_tls_expired_accepted_iphone_numeric_input_settles_disconnect_before_sub
         with sqlite3.connect(database) as connection:
             connection.execute("UPDATE calls SET terminal_last_seen_at = ?, terminal_disconnect_deadline = ? WHERE call_id = ?", ((datetime.now(UTC) - timedelta(seconds=181)).isoformat(), (datetime.now(UTC) - timedelta(seconds=1)).isoformat(), call_id))
             connection.commit()
+
+        # Restarting after the persisted deadline makes startup recovery settle the
+        # call before the original owner's protected submission reaches the route.
+        _stop(process)
+        process = _start(config)
+        _wait_for_listener(process, port)
+        with sqlite3.connect(database) as connection:
+            settled = connection.execute("SELECT state, owner_session_id FROM calls WHERE call_id = ?", (call_id,)).fetchone()
         late = _submit(port, certificate, call_id, "expired-numeric", " 3.5 ", headers)
+        other_cookie, other_csrf = _login(port, certificate)
+        foreign = _submit(port, certificate, call_id, "foreign-expired", " 3.5 ", _headers(other_cookie, other_csrf, port))
         _, continuation, _ = _post(port, certificate, _continuation("numeric-expired-event", interaction_id, call_id, 1), "test-token-alpha")
         next_call = _numeric_call(port, certificate, "numeric-after-expiry", "integer")
         with sqlite3.connect(database) as connection:
@@ -285,6 +296,25 @@ def test_tls_expired_accepted_iphone_numeric_input_settles_disconnect_before_sub
     assert late[2]["status"] == late[2]["call_state"] == "disconnected"
     assert late[2]["reason"] == "terminal_disconnected"
     assert _structured(continuation) == late[2]
+    assert settled == ("disconnected", None)
+    assert foreign[0] in {400, 401, 403, 404, 409}
+    assert isinstance(foreign[2], dict)
+    assert set(foreign[2]).issubset({"success", "error", "message", "code"})
+    opaque_foreign = json.dumps(foreign[2], sort_keys=True).lower()
+    for forbidden in (
+        call_id.lower(),
+        "status",
+        "call_state",
+        "reason",
+        "result",
+        "user_input",
+        "handled_on",
+        "terminal_platform",
+        "disconnected",
+        "terminal_disconnected",
+        "iphone_web",
+    ):
+        assert forbidden not in opaque_foreign
     assert state == ("disconnected", "iphone_web", None, "iphone_web")
     assert operations == 0
     assert '"user_input"' not in result
