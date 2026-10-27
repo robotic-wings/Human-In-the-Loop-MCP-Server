@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
@@ -116,3 +117,27 @@ def test_tls_feedback_route_exclusion_and_restart_expiry_release_busy(tmp_path: 
     finally: _stop(process)
     assert late[0] == 409 and isinstance(late[2], dict) and late[2]["status"] == late[2]["call_state"] == "disconnected" and late[2]["reason"] == "terminal_disconnected"
     assert _structured(event) == late[2] and state == ("disconnected",) and operations == 0 and next_call["call_state"] == "ringing"
+
+
+def test_tls_iphone_feedback_accept_and_submission_race_has_one_authoritative_transition(tmp_path: Path) -> None:
+    port = _free_port(); config, certificate = _write_operator_config(tmp_path, port); _configure_phone_route(config); database = tmp_path / "data" / "calls.sqlite3"; process = _start(config); _wait_for_listener(process, port)
+    try:
+        created = _call(port, certificate, "feedback-race"); call_id = created["call_id"]; assert isinstance(call_id, str)
+        cookie, csrf = _login(port, certificate); headers = _headers(cookie, csrf, port)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            accepted_future = executor.submit(_accept, port, certificate, call_id, headers)
+            submitted_future = executor.submit(_submit, port, certificate, call_id, "feedback-race", TYPE_ID, "Race feedback", headers)
+            accepted = accepted_future.result(); submitted = submitted_future.result()
+        with sqlite3.connect(database) as connection:
+            state = connection.execute("SELECT state, handled_on, terminal_platform FROM calls WHERE call_id = ?", (call_id,)).fetchone()
+            events = connection.execute("SELECT event_seq, result FROM events WHERE call_id = ? ORDER BY event_seq", (call_id,)).fetchall()
+            operations = connection.execute("SELECT count(*) FROM submission_operations WHERE call_id = ?", (call_id,)).fetchone()[0]
+    finally: _stop(process)
+    assert accepted[0] == 200 and submitted[0] in {400, 403, 409, 200}
+    if submitted[0] == 200:
+        assert state == ("answered", "iphone_web", "ios") and operations == 1
+        assert [event[0] for event in events] == [1, 2]
+        assert '"feedback_type":"task_too_big"' in events[-1][1]
+    else:
+        assert state == ("accepted", "iphone_web", "ios") and operations == 0
+        assert [event[0] for event in events] == [1]
