@@ -582,6 +582,7 @@ class CallCoordinator:
                 or self._is_single_choice_request(row["message"])
                 or self._multiple_choice_options(row["message"]) is not None
                 or self._numeric_input_type(row["message"]) is not None
+                or self._is_multiline_request(row["message"])
             ):
                 return {"success": False, "status": "invalid_submission"}
             replay = connection.execute(
@@ -661,6 +662,14 @@ class CallCoordinator:
                 "SELECT message FROM calls WHERE call_id = ?", (call_id,)
             ).fetchone()
             return self._multiple_choice_options(row["message"]) if row is not None else None
+
+    def multiline_default_for_call(self, call_id: str) -> str | None:
+        """Return the stored multiline default without changing call state."""
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT message FROM calls WHERE call_id = ?", (call_id,)
+            ).fetchone()
+            return self._multiline_default(row["message"]) if row is not None else None
 
     def submit_terminal_confirmation(
         self,
@@ -878,6 +887,63 @@ class CallCoordinator:
             connection.execute(
                 "INSERT INTO submission_operations (call_id, submission_id, payload, result) "
                 "VALUES (?, ?, ?, ?)",
+                (call_id, submission_id, payload, self._canonical(result)),
+            )
+            return result
+
+    def submit_terminal_multiline_input(
+        self, call_id: str, device_id: str, owner_session_id: str,
+        submission_id: str, user_input: object,
+    ) -> dict[str, Any] | None:
+        """Persist trimmed multiline text from its accepted iPhone owner."""
+        if (
+            not isinstance(submission_id, str) or not submission_id or len(submission_id) > 128
+            or not submission_id.isascii() or not isinstance(user_input, str)
+        ):
+            return {"success": False, "status": "invalid_submission"}
+        normalized = user_input.strip()
+        if not normalized:
+            return {"success": False, "status": "invalid_submission"}
+        payload = self._canonical({"user_input": normalized})
+        with self._write_transaction() as connection:
+            try:
+                row = self._call_or_raise(connection, call_id)
+            except KeyError:
+                return None
+            routed = connection.execute(
+                "SELECT 1 FROM bark_deliveries WHERE call_id = ?", (call_id,)
+            ).fetchone()
+            if routed is None:
+                return None
+            if row["owner_device_id"] != device_id or row["owner_session_id"] != owner_session_id:
+                if self._is_terminal_disconnect_owner(connection, row, device_id, owner_session_id):
+                    return self._current_result(connection, row)
+                return None
+            if self._multiline_default(row["message"]) is None:
+                return {"success": False, "status": "invalid_submission"}
+            self._settle_if_expired(connection, row)
+            row = self._call_or_raise(connection, call_id)
+            replay = connection.execute(
+                "SELECT payload, result FROM submission_operations WHERE call_id = ? AND submission_id = ?",
+                (call_id, submission_id),
+            ).fetchone()
+            if replay is not None:
+                return self._decode(replay["result"]) if replay["payload"] == payload else self._conflict()
+            if row["state"] != "accepted":
+                return self._current_result(connection, row)
+            result = {
+                "success": True, "status": "answered", "call_state": "answered",
+                "reason": None, "human_action": True, "needs_continuation": False,
+                "interaction_id": row["interaction_id"], "call_id": row["call_id"],
+                "event_seq": (self._event_seq(connection, call_id) or 0) + 1,
+                "handled_on": row["handled_on"], "terminal_platform": row["terminal_platform"],
+                "user_input": normalized, "character_count": len(normalized),
+                "line_count": len(normalized.splitlines()), "result_id": str(uuid.uuid4()),
+            }
+            connection.execute("UPDATE calls SET state = 'answered', version = version + 1 WHERE call_id = ?", (call_id,))
+            self._add_event(connection, call_id, result)
+            connection.execute(
+                "INSERT INTO submission_operations (call_id, submission_id, payload, result) VALUES (?, ?, ?, ?)",
                 (call_id, submission_id, payload, self._canonical(result)),
             )
             return result
@@ -1311,6 +1377,24 @@ class CallCoordinator:
         if not isinstance(choices, list) or not choices or any(not isinstance(choice, str) for choice in choices):
             return None
         return choices
+
+    @staticmethod
+    def _multiline_default(message: object) -> str | None:
+        try:
+            request = json.loads(message) if isinstance(message, str) else None
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(request, dict) or request.get("tool") != "get_multiline_input":
+            return None
+        arguments = request.get("arguments")
+        if not isinstance(arguments, dict):
+            return None
+        default_value = arguments.get("default_value", "")
+        return default_value if isinstance(default_value, str) else None
+
+    @classmethod
+    def _is_multiline_request(cls, message: object) -> bool:
+        return cls._multiline_default(message) is not None
 
     @classmethod
     def _is_single_choice_request(cls, message: object) -> bool:
