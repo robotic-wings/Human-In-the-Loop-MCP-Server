@@ -1051,9 +1051,14 @@ class _OperatorGateway:
             return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
         numeric_input = False
         if "selected_choices" in payload and "user_input" not in payload and "confirmed" not in payload:
-            result = self._coordinator.submit_terminal_single_choice(
-                call_id, "iphone_web", session or "", submission_id, payload["selected_choices"]
-            )
+            if self._coordinator.multiple_choice_options_for_call(call_id) is not None:
+                result = self._coordinator.submit_terminal_multiple_choice(
+                    call_id, "iphone_web", session or "", submission_id, payload["selected_choices"]
+                )
+            else:
+                result = self._coordinator.submit_terminal_single_choice(
+                    call_id, "iphone_web", session or "", submission_id, payload["selected_choices"]
+                )
         elif "confirmed" in payload and "user_input" not in payload:
             confirmed = payload["confirmed"]
             if not isinstance(confirmed, bool):
@@ -1377,6 +1382,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
                 # session; the form does not create a second ownership path.
                 numeric_spec = _numeric_input_spec(state.get("message"))
                 choice_options = _single_choice_options(state.get("message"))
+                multi_choice_options = _multiple_choice_options(state.get("message"))
                 if numeric_spec is not None:
                     input_type, default_value = numeric_spec
                     controls = (
@@ -1392,6 +1398,23 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         "fetch(button.dataset.endpoint,{method:'POST',credentials:'same-origin',"
                         "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},"
                         "body:JSON.stringify({submission_id:crypto.randomUUID(),user_input:user_input})})"
+                        ".then((response)=>{if(response.ok)location.reload();});"
+                        "}));"
+                    )
+                elif multi_choice_options is not None:
+                    controls = "".join(
+                        f'<label><input type="checkbox" data-choice="{html.escape(choice, quote=True)}">'
+                        f'{html.escape(choice)}</label>'
+                        for choice in multi_choice_options
+                    ) + f'<button data-multiple-choice data-endpoint="{endpoint}/submissions">Submit</button>'
+                    submission_script = (
+                        "document.querySelectorAll('button[data-multiple-choice]').forEach((button)=>"
+                        "button.addEventListener('click',()=>{"
+                        "const selected=Array.from(document.querySelectorAll('input[type=checkbox][data-choice]'))"
+                        ".filter((checkbox)=>checkbox.checked).map((checkbox)=>checkbox.dataset.choice);"
+                        "fetch(button.dataset.endpoint,{method:'POST',credentials:'same-origin',"
+                        "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},"
+                        "body:JSON.stringify({submission_id:crypto.randomUUID(),selected_choices:selected})})"
                         ".then((response)=>{if(response.ok)location.reload();});"
                         "}));"
                     )
@@ -1795,6 +1818,24 @@ def _single_choice_options(message: object) -> list[str] | None:
         return None
     arguments = request.get("arguments")
     if not isinstance(arguments, dict) or arguments.get("allow_multiple") is not False:
+        return None
+    choices = arguments.get("choices")
+    if not isinstance(choices, list) or not choices or any(not isinstance(choice, str) for choice in choices):
+        return None
+    return choices
+
+
+def _multiple_choice_options(message: object) -> list[str] | None:
+    if not isinstance(message, str):
+        return None
+    try:
+        request = json.loads(message)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(request, dict) or request.get("tool") != "get_user_choice":
+        return None
+    arguments = request.get("arguments")
+    if not isinstance(arguments, dict) or arguments.get("allow_multiple") is not True:
         return None
     choices = arguments.get("choices")
     if not isinstance(choices, list) or not choices or any(not isinstance(choice, str) for choice in choices):
