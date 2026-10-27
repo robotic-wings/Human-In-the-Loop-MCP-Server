@@ -1050,6 +1050,7 @@ class _OperatorGateway:
         if not isinstance(submission_id, str):
             return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
         numeric_input = False
+        multiline_input = False
         if "selected_choices" in payload and "user_input" not in payload and "confirmed" not in payload:
             if self._coordinator.multiple_choice_options_for_call(call_id) is not None:
                 result = self._coordinator.submit_terminal_multiple_choice(
@@ -1071,8 +1072,13 @@ class _OperatorGateway:
             if not isinstance(user_input, str) or not user_input or "confirmed" in payload:
                 return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
             numeric_input = self._coordinator.numeric_input_type_for_call(call_id) is not None
+            multiline_input = self._coordinator.multiline_default_for_call(call_id) is not None
             if numeric_input:
                 result = self._coordinator.submit_terminal_numeric_input(
+                    call_id, "iphone_web", session or "", submission_id, user_input
+                )
+            elif multiline_input:
+                result = self._coordinator.submit_terminal_multiline_input(
                     call_id, "iphone_web", session or "", submission_id, user_input
                 )
             else:
@@ -1092,6 +1098,7 @@ class _OperatorGateway:
                 ("confirmed" in payload and "user_input" not in payload)
                 or ("selected_choices" in payload and "user_input" not in payload)
                 or numeric_input
+                or multiline_input
             ):
                 return HTTPStatus.CONFLICT, result
             return HTTPStatus.CONFLICT, {"status": result["status"]}
@@ -1381,6 +1388,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
                 # The caller has already authenticated this exact browser
                 # session; the form does not create a second ownership path.
                 numeric_spec = _numeric_input_spec(state.get("message"))
+                multiline_default = _multiline_default(state.get("message"))
                 choice_options = _single_choice_options(state.get("message"))
                 multi_choice_options = _multiple_choice_options(state.get("message"))
                 if numeric_spec is not None:
@@ -1395,6 +1403,23 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         "button.addEventListener('click',()=>{"
                         "const input=document.querySelector('input[data-input-type]');"
                         "const user_input=input.value;"
+                        "fetch(button.dataset.endpoint,{method:'POST',credentials:'same-origin',"
+                        "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},"
+                        "body:JSON.stringify({submission_id:crypto.randomUUID(),user_input:user_input})})"
+                        ".then((response)=>{if(response.ok)location.reload();});"
+                        "}));"
+                    )
+                elif multiline_default is not None:
+                    escaped_default = html.escape(multiline_default, quote=False)
+                    controls = (
+                        f'<textarea data-input-kind="multiline" data-default="{html.escape(multiline_default, quote=True)}">'
+                        f'{escaped_default}</textarea><button data-multiline-input data-endpoint="{endpoint}/submissions">Submit</button>'
+                    )
+                    submission_script = (
+                        "document.querySelectorAll('button[data-multiline-input]').forEach((button)=>"
+                        "button.addEventListener('click',()=>{"
+                        "const textarea=document.querySelector('textarea[data-input-kind=multiline]');"
+                        "const user_input=textarea.value;"
                         "fetch(button.dataset.endpoint,{method:'POST',credentials:'same-origin',"
                         "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},"
                         "body:JSON.stringify({submission_id:crypto.randomUUID(),user_input:user_input})})"
@@ -1785,6 +1810,7 @@ def _page_summary(message: object) -> str:
             (
                 decoded.get("tool") in {"show_confirmation_dialog", "get_user_choice"}
                 or _numeric_input_spec(message) is not None
+                or _multiline_default(message) is not None
             )
             and isinstance(arguments, dict)
         ):
@@ -1841,6 +1867,22 @@ def _multiple_choice_options(message: object) -> list[str] | None:
     if not isinstance(choices, list) or not choices or any(not isinstance(choice, str) for choice in choices):
         return None
     return choices
+
+
+def _multiline_default(message: object) -> str | None:
+    if not isinstance(message, str):
+        return None
+    try:
+        request = json.loads(message)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(request, dict) or request.get("tool") != "get_multiline_input":
+        return None
+    arguments = request.get("arguments")
+    if not isinstance(arguments, dict):
+        return None
+    default_value = arguments.get("default_value", "")
+    return default_value if isinstance(default_value, str) else None
 
 
 def _numeric_input_spec(message: object) -> tuple[str, str] | None:
