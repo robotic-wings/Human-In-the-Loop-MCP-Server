@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -20,6 +21,9 @@ from test_central_mcp_gateway import (
     _wait_for_listener,
     _write_gateway_config,
 )
+from test_iphone_web_acceptance import _create_call, _login, _write_operator_config
+from test_iphone_web_submission import _accept, _headers, _submit
+from test_mcp_continuation import _continuation
 
 
 @dataclass
@@ -190,6 +194,12 @@ def test_tls_mcp_lists_and_executes_original_caller_cancel_without_leaking_other
             _cancel_rpc(created["interaction_id"], created["call_id"], "mcp-cancel"),
             "test-token-alpha",
         )
+        continuation_status, continuation, _ = _post(
+            port,
+            certificate,
+            _continuation("cancel-read", created["interaction_id"], created["call_id"], 0),
+            "test-token-alpha",
+        )
         post_cancel_status, post_cancel, _ = _post(port, certificate, _call("mcp-after"), "test-token-beta")
         wrong_status, wrong, _ = _post(
             port, certificate,
@@ -206,8 +216,174 @@ def test_tls_mcp_lists_and_executes_original_caller_cancel_without_leaking_other
     assert valid_status == 200
     assert cancelled["status"] == "cancelled"
     assert cancelled["reason"] == "agent_cancelled"
+    assert continuation_status == 200
+    assert _structured(continuation) == cancelled
     assert post_cancel_status == 200
     assert _structured(post_cancel)["status"] == "ringing"
     assert wrong_status == unknown_status == 200
     assert wrong == unknown
     assert wrong["error"] == {"code": -32602, "message": "invalid params"}
+
+
+def test_tls_mcp_rejects_invalid_cancel_request_ids_without_mutating_the_exact_call(
+    tmp_path: Path,
+) -> None:
+    """Cancellation identifiers have the same bounded ASCII contract as other MCP operations."""
+    port = _free_port()
+    config, certificate = _write_gateway_config(tmp_path, port)
+    database = tmp_path / "data" / "calls.sqlite3"
+    process = _start(config)
+    _wait_for_listener(process, port)
+    try:
+        status, created_response, _ = _post(port, certificate, _call("bounded-cancel"), "test-token-alpha")
+        assert status == 200
+        created = _structured(created_response)
+        call_id = created["call_id"]
+        interaction_id = created["interaction_id"]
+        assert isinstance(call_id, str) and isinstance(interaction_id, str)
+        invalid_results = []
+        for request_id in ("x" * 129, "non-ascii-\u00e9"):
+            status, response, _ = _post(
+                port, certificate, _cancel_rpc(interaction_id, call_id, request_id), "test-token-alpha"
+            )
+            invalid_results.append((status, response))
+        with sqlite3.connect(database) as connection:
+            state = connection.execute("SELECT state FROM calls WHERE call_id = ?", (call_id,)).fetchone()
+            operations = connection.execute(
+                "SELECT count(*) FROM cancel_operations WHERE caller_id = ?", ("agent-alpha",)
+            ).fetchone()
+            events = connection.execute(
+                "SELECT event_seq FROM events WHERE call_id = ? ORDER BY event_seq", (call_id,)
+            ).fetchall()
+    finally:
+        _stop(process)
+
+    assert all(status == 200 for status, _ in invalid_results)
+    assert all(response["error"] == {"code": -32602, "message": "invalid params"} for _, response in invalid_results)
+    assert state == ("ringing",)
+    assert operations == (0,)
+    assert events == []
+
+
+def test_tls_mcp_accepts_exactly_128_ascii_cancel_request_id_and_replays_it_durably(
+    tmp_path: Path,
+) -> None:
+    """The inclusive identifier boundary must not turn a valid cancel into a rejection."""
+    port = _free_port()
+    config, certificate = _write_gateway_config(tmp_path, port)
+    process = _start(config)
+    _wait_for_listener(process, port)
+    request_id = "a" * 128
+    try:
+        _, created_response, _ = _post(port, certificate, _call("cancel-id-boundary"), "test-token-alpha")
+        created = _structured(created_response)
+        first_status, first_response, _ = _post(
+            port, certificate,
+            _cancel_rpc(created["interaction_id"], created["call_id"], request_id),
+            "test-token-alpha",
+        )
+        replay_status, replay_response, _ = _post(
+            port, certificate,
+            _cancel_rpc(created["interaction_id"], created["call_id"], request_id),
+            "test-token-alpha",
+        )
+        with sqlite3.connect(tmp_path / "data" / "calls.sqlite3") as connection:
+            state = connection.execute(
+                "SELECT state FROM calls WHERE call_id = ?", (created["call_id"],)
+            ).fetchone()
+            operations = connection.execute(
+                "SELECT count(*) FROM cancel_operations WHERE caller_id = ?", ("agent-alpha",)
+            ).fetchone()
+            events = connection.execute(
+                "SELECT event_seq FROM events WHERE call_id = ? ORDER BY event_seq", (created["call_id"],)
+            ).fetchall()
+    finally:
+        _stop(process)
+
+    first = _structured(first_response)
+    assert first_status == replay_status == 200
+    assert _structured(replay_response) == first
+    assert first["status"] == first["call_state"] == "cancelled"
+    assert first["reason"] == "agent_cancelled"
+    assert state == ("cancelled",)
+    assert operations == (1,)
+    assert events == [(1,)]
+
+
+def test_tls_agent_cancel_and_owner_final_submission_race_has_one_terminal_event_and_releases_busy(
+    tmp_path: Path,
+) -> None:
+    """The SQLite transaction chooses exactly one terminal action for an accepted call."""
+    port = _free_port()
+    config, certificate = _write_operator_config(tmp_path, port)
+    database = tmp_path / "data" / "calls.sqlite3"
+    process = _start(config)
+    _wait_for_listener(process, port)
+    try:
+        created = _create_call(port, certificate, "cancel-final-race")
+        call_id = created["call_id"]
+        interaction_id = created["interaction_id"]
+        assert isinstance(call_id, str) and isinstance(interaction_id, str)
+        cookie, csrf = _login(port, certificate)
+        assert _accept(port, certificate, call_id, cookie, csrf)[0] == 200
+
+        start = threading.Barrier(3)
+        responses: dict[str, object] = {}
+
+        def cancel() -> None:
+            start.wait()
+            responses["cancel"] = _post(
+                port, certificate, _cancel_rpc(interaction_id, call_id, "race-cancel"), "test-token-alpha"
+            )
+
+        def submit() -> None:
+            start.wait()
+            responses["submit"] = _submit(
+                port, certificate, call_id, "race-final", "final answer", _headers(cookie, csrf, port)
+            )
+
+        cancel_thread = threading.Thread(target=cancel)
+        submit_thread = threading.Thread(target=submit)
+        cancel_thread.start()
+        submit_thread.start()
+        start.wait()
+        cancel_thread.join(timeout=5)
+        submit_thread.join(timeout=5)
+        assert not cancel_thread.is_alive() and not submit_thread.is_alive()
+
+        with sqlite3.connect(database) as connection:
+            call = connection.execute(
+                "SELECT state FROM calls WHERE call_id = ?", (call_id,)
+            ).fetchone()
+            events = connection.execute(
+                "SELECT event_seq, result FROM events WHERE call_id = ? ORDER BY event_seq", (call_id,)
+            ).fetchall()
+            cancellation_operations = connection.execute(
+                "SELECT count(*) FROM cancel_operations WHERE caller_id = ? AND request_id = ?",
+                ("agent-alpha", "race-cancel"),
+            ).fetchone()
+            submissions = connection.execute(
+                "SELECT count(*) FROM submission_operations WHERE call_id = ?", (call_id,)
+            ).fetchone()
+
+        # A new, independently authenticated caller proves the completed race freed
+        # the sole busy slot and did not alter a later, unrelated call.
+        _, other_response, _ = _post(port, certificate, _call("unrelated-after-race"), "test-token-beta")
+        unrelated = _structured(other_response)
+        with sqlite3.connect(database) as connection:
+            unrelated_state = connection.execute(
+                "SELECT state FROM calls WHERE call_id = ?", (unrelated["call_id"],)
+            ).fetchone()
+    finally:
+        _stop(process)
+
+    assert call is not None and call[0] in {"cancelled", "answered"}
+    assert [sequence for sequence, _ in events] == [1, 2]
+    assert ("agent_cancelled" in events[-1][1]) == (call[0] == "cancelled")
+    assert ("final answer" in events[-1][1]) == (call[0] == "answered")
+    # The losing agent operation may retain a replay snapshot, but it must not
+    # create a second terminal event or change the final state.
+    assert cancellation_operations == (1,)
+    assert submissions == ((0,) if call[0] == "cancelled" else (1,))
+    assert unrelated["status"] == unrelated["call_state"] == "ringing"
+    assert unrelated_state == ("ringing",)
