@@ -583,6 +583,7 @@ class CallCoordinator:
                 or self._multiple_choice_options(row["message"]) is not None
                 or self._numeric_input_type(row["message"]) is not None
                 or self._is_multiline_request(row["message"])
+                or self._is_info_request(row["message"])
             ):
                 return {"success": False, "status": "invalid_submission"}
             replay = connection.execute(
@@ -739,6 +740,61 @@ class CallCoordinator:
             connection.execute(
                 "INSERT INTO submission_operations (call_id, submission_id, payload, result) "
                 "VALUES (?, ?, ?, ?)",
+                (call_id, submission_id, payload, self._canonical(result)),
+            )
+            return result
+
+    def submit_terminal_info_acknowledgement(
+        self, call_id: str, device_id: str, owner_session_id: str,
+        submission_id: str, acknowledged: object,
+    ) -> dict[str, Any] | None:
+        """Persist the sole affirmative acknowledgement for an information call."""
+        if (
+            not isinstance(submission_id, str) or not submission_id or len(submission_id) > 128
+            or not submission_id.isascii() or not isinstance(acknowledged, bool)
+        ):
+            return {"success": False, "status": "invalid_submission"}
+        payload = self._canonical({"acknowledged": acknowledged})
+        with self._write_transaction() as connection:
+            try:
+                row = self._call_or_raise(connection, call_id)
+            except KeyError:
+                return None
+            routed = connection.execute(
+                "SELECT 1 FROM bark_deliveries WHERE call_id = ?", (call_id,)
+            ).fetchone()
+            if routed is None:
+                return None
+            if row["owner_device_id"] != device_id or row["owner_session_id"] != owner_session_id:
+                if self._is_terminal_disconnect_owner(connection, row, device_id, owner_session_id):
+                    return self._current_result(connection, row)
+                return None
+            if not self._is_info_request(row["message"]):
+                return {"success": False, "status": "invalid_submission"}
+            self._settle_if_expired(connection, row)
+            row = self._call_or_raise(connection, call_id)
+            replay = connection.execute(
+                "SELECT payload, result FROM submission_operations WHERE call_id = ? AND submission_id = ?",
+                (call_id, submission_id),
+            ).fetchone()
+            if replay is not None:
+                return self._decode(replay["result"]) if replay["payload"] == payload else self._conflict()
+            if acknowledged is not True:
+                return {"success": False, "status": "invalid_submission"}
+            if row["state"] != "accepted":
+                return self._current_result(connection, row)
+            result = {
+                "success": True, "status": "answered", "call_state": "answered",
+                "reason": None, "human_action": True, "needs_continuation": False,
+                "interaction_id": row["interaction_id"], "call_id": row["call_id"],
+                "event_seq": (self._event_seq(connection, call_id) or 0) + 1,
+                "handled_on": row["handled_on"], "terminal_platform": row["terminal_platform"],
+                "acknowledged": True, "result_id": str(uuid.uuid4()),
+            }
+            connection.execute("UPDATE calls SET state = 'answered', version = version + 1 WHERE call_id = ?", (call_id,))
+            self._add_event(connection, call_id, result)
+            connection.execute(
+                "INSERT INTO submission_operations (call_id, submission_id, payload, result) VALUES (?, ?, ?, ?)",
                 (call_id, submission_id, payload, self._canonical(result)),
             )
             return result
@@ -1345,6 +1401,14 @@ class CallCoordinator:
         except json.JSONDecodeError:
             return False
         return isinstance(request, dict) and request.get("tool") == "show_confirmation_dialog"
+
+    @staticmethod
+    def _is_info_request(message: object) -> bool:
+        try:
+            request = json.loads(message) if isinstance(message, str) else None
+        except json.JSONDecodeError:
+            return False
+        return isinstance(request, dict) and request.get("tool") == "show_info_message"
 
     @staticmethod
     def _single_choice_options(message: object) -> list[str] | None:

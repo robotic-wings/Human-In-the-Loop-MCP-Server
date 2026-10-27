@@ -1051,6 +1051,7 @@ class _OperatorGateway:
             return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
         numeric_input = False
         multiline_input = False
+        info_acknowledgement = False
         if "selected_choices" in payload and "user_input" not in payload and "confirmed" not in payload:
             if self._coordinator.multiple_choice_options_for_call(call_id) is not None:
                 result = self._coordinator.submit_terminal_multiple_choice(
@@ -1060,12 +1061,23 @@ class _OperatorGateway:
                 result = self._coordinator.submit_terminal_single_choice(
                     call_id, "iphone_web", session or "", submission_id, payload["selected_choices"]
                 )
-        elif "confirmed" in payload and "user_input" not in payload:
+        elif (
+            "confirmed" in payload
+            and "user_input" not in payload
+            and "acknowledged" not in payload
+        ):
             confirmed = payload["confirmed"]
             if not isinstance(confirmed, bool):
                 return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
             result = self._coordinator.submit_terminal_confirmation(
                 call_id, "iphone_web", session or "", submission_id, confirmed
+            )
+        elif "acknowledged" in payload:
+            if set(payload) != {"submission_id", "acknowledged"}:
+                return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
+            info_acknowledgement = True
+            result = self._coordinator.submit_terminal_info_acknowledgement(
+                call_id, "iphone_web", session or "", submission_id, payload["acknowledged"]
             )
         else:
             user_input = payload.get("user_input")
@@ -1099,6 +1111,7 @@ class _OperatorGateway:
                 or ("selected_choices" in payload and "user_input" not in payload)
                 or numeric_input
                 or multiline_input
+                or info_acknowledgement
             ):
                 return HTTPStatus.CONFLICT, result
             return HTTPStatus.CONFLICT, {"status": result["status"]}
@@ -1460,6 +1473,19 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         ".then((response)=>{if(response.ok)location.reload();});"
                         "}));"
                     )
+                elif _is_info_message(state.get("message")):
+                    controls = f'<button data-acknowledged="true" data-endpoint="{endpoint}/submissions">OK</button>'
+                    submission_script = (
+                        "document.querySelectorAll('button[data-acknowledged]').forEach((button)=>"
+                        "button.addEventListener('click',()=>{"
+                        "const acknowledged=button.dataset.acknowledged==='true';"
+                        "const body=JSON.stringify({submission_id:crypto.randomUUID(),acknowledged:acknowledged});"
+                        "fetch(button.dataset.endpoint,{method:'POST',credentials:'same-origin',"
+                        "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},"
+                        "body:body})"
+                        ".then((response)=>{if(response.ok)location.reload();});"
+                        "}));"
+                    )
                 elif _is_confirmation_message(state.get("message")):
                     controls = (
                         f'<button data-confirmed="true" data-endpoint="{endpoint}/submissions">Yes</button>'
@@ -1808,7 +1834,7 @@ def _page_summary(message: object) -> str:
         arguments = decoded.get("arguments")
         if (
             (
-                decoded.get("tool") in {"show_confirmation_dialog", "get_user_choice"}
+                decoded.get("tool") in {"show_confirmation_dialog", "show_info_message", "get_user_choice"}
                 or _numeric_input_spec(message) is not None
                 or _multiline_default(message) is not None
             )
@@ -1831,6 +1857,16 @@ def _is_confirmation_message(message: object) -> bool:
     except json.JSONDecodeError:
         return False
     return isinstance(request, dict) and request.get("tool") == "show_confirmation_dialog"
+
+
+def _is_info_message(message: object) -> bool:
+    if not isinstance(message, str):
+        return False
+    try:
+        request = json.loads(message)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(request, dict) and request.get("tool") == "show_info_message"
 
 
 def _single_choice_options(message: object) -> list[str] | None:
