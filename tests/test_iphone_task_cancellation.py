@@ -125,6 +125,10 @@ def test_tls_iphone_task_cancel_is_owner_route_expiry_first_and_race_safe(tmp_pa
             connection.execute("UPDATE calls SET terminal_last_seen_at = ?, terminal_disconnect_deadline = ? WHERE call_id = ?", ((datetime.now(UTC) - timedelta(seconds=181)).isoformat(), (datetime.now(UTC) - timedelta(seconds=1)).isoformat(), call_id)); connection.commit()
         expired = _cancel(port, certificate, call_id, "expired", owner); after_expiry = _call(port, certificate, "cancel-after-expiry")
         assert expired[0] == 409 and isinstance(expired[2], dict) and expired[2]["status"] == expired[2]["call_state"] == "disconnected" and expired[2]["reason"] == "terminal_disconnected" and after_expiry["call_state"] == "ringing"
+        admitted_id = after_expiry["call_id"]; assert isinstance(admitted_id, str)
+        assert _accept(port, certificate, admitted_id, owner)[0] == 200
+        cleanup = _cancel(port, certificate, admitted_id, "post-expiry-cleanup", owner)
+        assert cleanup[0] == 200 and isinstance(cleanup[2], dict) and cleanup[2]["status"] == "cancelled"
 
         raced = _call(port, certificate, "cancel-race"); race_id = raced["call_id"]; assert isinstance(race_id, str); race_cookie, race_csrf = _login(port, certificate); race_headers = _headers(race_cookie, race_csrf, port); assert _accept(port, certificate, race_id, race_headers)[0] == 200
         with ThreadPoolExecutor(max_workers=2) as executor:
