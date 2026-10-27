@@ -495,9 +495,20 @@ class _McpGateway:
         name = params.get("name")
         arguments = params.get("arguments")
         spec = _find_tool_spec(name) if isinstance(name, str) else None
+        # Task continuations retain the task_id alias even when a transport
+        # client reuses the generic continuation shape.  It is not a second
+        # tool: route that alias through the task contract before validation.
+        if (
+            name == "get_user_input"
+            and isinstance(arguments, dict)
+            and "task_id" in arguments
+            and "interaction_id" not in arguments
+        ):
+            spec = _find_tool_spec("assign_task_to_human")
         if spec is None or not isinstance(arguments, dict):
             return _rpc_error(rpc_id, -32602, "invalid params")
-        missing = [field for field in spec.required if field not in arguments]
+        is_continuation = "call_id" in arguments or "after_event_seq" in arguments
+        missing = [] if is_continuation else [field for field in spec.required if field not in arguments]
         request_id = arguments.get("request_id")
         if missing:
             return _rpc_error(rpc_id, -32602, "invalid params")
@@ -1062,6 +1073,7 @@ class _OperatorGateway:
         multiline_input = False
         info_acknowledgement = False
         feedback_submission = False
+        task_final_submission = False
         if "feedback_type" in payload or "feedback_text" in payload:
             if set(payload) != {"submission_id", "feedback_type", "feedback_text"}:
                 return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
@@ -1083,6 +1095,14 @@ class _OperatorGateway:
             result = self._coordinator.submit_terminal_feedback(
                 call_id, "iphone_web", session or "", submission_id,
                 payload["feedback_type"], payload["feedback_text"],
+            )
+        elif "status" in payload or "report" in payload:
+            if set(payload) != {"submission_id", "status", "report"}:
+                return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
+            task_final_submission = True
+            result = self._coordinator.submit_terminal_task_final(
+                call_id, "iphone_web", session or "", submission_id,
+                payload["status"], payload["report"],
             )
         elif "selected_choices" in payload and "user_input" not in payload and "confirmed" not in payload:
             if self._coordinator.multiple_choice_options_for_call(call_id) is not None:
@@ -1132,14 +1152,14 @@ class _OperatorGateway:
         if result is None:
             # An authenticated operator may know a ringing call without owning
             # it; do not turn that into a content-bearing response.
-            if feedback_submission:
+            if feedback_submission or task_final_submission:
                 return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
             return HTTPStatus.CONFLICT, {"error": "cannot submit"}
         if result["status"] == "invalid_submission":
             return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
         if result["status"] == "request_conflict":
             return HTTPStatus.CONFLICT, result
-        if result["status"] != "answered":
+        if result["status"] not in {"answered", "completed", "failed"}:
             if (
                 ("confirmed" in payload and "user_input" not in payload)
                 or ("selected_choices" in payload and "user_input" not in payload)
@@ -1147,6 +1167,7 @@ class _OperatorGateway:
                 or multiline_input
                 or info_acknowledgement
                 or feedback_submission
+                or task_final_submission
             ):
                 return HTTPStatus.CONFLICT, result
             return HTTPStatus.CONFLICT, {"status": result["status"]}
@@ -1439,7 +1460,38 @@ class _PublicHandler(BaseHTTPRequestHandler):
                 multiline_default = _multiline_default(state.get("message"))
                 choice_options = _single_choice_options(state.get("message"))
                 multi_choice_options = _multiple_choice_options(state.get("message"))
-                if _is_feedback_message(state.get("message")):
+                task_spec = _task_final_spec(state.get("message"))
+                if task_spec is not None:
+                    title, description, context_note = task_spec
+                    controls = (
+                        f'<h2>{html.escape(title)}</h2><p>{html.escape(description)}</p><p>{html.escape(context_note)}</p>'
+                        f'<textarea data-task-report></textarea>'
+                        f'<button data-task-final="completed" data-endpoint="{endpoint}/submissions">Completed</button>'
+                        f'<button data-task-final="failed" data-endpoint="{endpoint}/submissions">Failed</button>'
+                    )
+                    submission_script = (
+                        "const completed=document.querySelector('button[data-task-final=\"completed\"]');"
+                        "completed.addEventListener('click',()=>{"
+                        "const status=completed.dataset.taskFinal;"
+                        "const report=document.querySelector('textarea[data-task-report]').value;"
+                        "const body=JSON.stringify({submission_id:crypto.randomUUID(),status:status,report:report});"
+                        "fetch(completed.dataset.endpoint,{method:'POST',credentials: 'same-origin',"
+                        "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},"
+                        "body:body})"
+                        ".then((response)=>{if(response.ok)location.reload();});"
+                        "});"
+                        "const failed=document.querySelector('button[data-task-final=\"failed\"]');"
+                        "failed.addEventListener('click',()=>{"
+                        "const status=failed.dataset.taskFinal;"
+                        "const report=document.querySelector('textarea[data-task-report]').value;"
+                        "const body=JSON.stringify({submission_id:crypto.randomUUID(),status:status,report:report});"
+                        "fetch(failed.dataset.endpoint,{method:'POST',credentials: 'same-origin',"
+                        "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},"
+                        "body:body})"
+                        ".then((response)=>{if(response.ok)location.reload();});"
+                        "});"
+                    )
+                elif _is_feedback_message(state.get("message")):
                     options = "".join(
                         f'<option value="{html.escape(type_id, quote=True)}" data-label="{html.escape(label, quote=True)}">{html.escape(label)}</option>'
                         for type_id, label in _FEEDBACK_TYPES.items()
@@ -1900,6 +1952,14 @@ def _page_summary(message: object) -> str:
             parts = [arguments[key] for key in ("title", "message", "prompt") if isinstance(arguments.get(key), str)]
             if parts:
                 return "\n".join(parts)
+        if decoded.get("tool") == "assign_task_to_human" and isinstance(arguments, dict):
+            parts = [
+                arguments[key]
+                for key in ("task_title", "task_description", "context_note")
+                if isinstance(arguments.get(key), str)
+            ]
+            if parts:
+                return "\n".join(parts)
         title = decoded.get("title")
         if isinstance(title, str):
             return title
@@ -1934,6 +1994,27 @@ def _is_feedback_message(message: object) -> bool:
     except json.JSONDecodeError:
         return False
     return isinstance(request, dict) and request.get("tool") == "get_feedback_from_user"
+
+
+def _task_final_spec(message: object) -> tuple[str, str, str] | None:
+    """Return only the text-only task fields supported by this page vertical."""
+    if not isinstance(message, str):
+        return None
+    try:
+        request = json.loads(message)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(request, dict) or request.get("tool") != "assign_task_to_human":
+        return None
+    arguments = request.get("arguments")
+    if not isinstance(arguments, dict):
+        return None
+    title = arguments.get("task_title")
+    description = arguments.get("task_description")
+    context_note = arguments.get("context_note", "")
+    if not isinstance(title, str) or not isinstance(description, str) or not isinstance(context_note, str):
+        return None
+    return title, description, context_note
 
 
 def _single_choice_options(message: object) -> list[str] | None:
