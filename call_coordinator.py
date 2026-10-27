@@ -147,6 +147,12 @@ class CallCoordinator:
                         "VALUES (?, 'pending', 0)",
                         (call_id,),
                     )
+                if request.desktop_route_device_id is not None:
+                    connection.execute(
+                        "INSERT INTO terminal_callback_deliveries (call_id, state, attempt_count) "
+                        "VALUES (?, 'pending', 0)",
+                        (call_id,),
+                    )
             connection.execute(
                 "INSERT INTO create_operations (caller_id, request_id, payload, result) "
                 "VALUES (?, ?, ?, ?)",
@@ -216,6 +222,87 @@ class CallCoordinator:
         with self._write_transaction() as connection:
             connection.execute(
                 "UPDATE bark_deliveries SET state = 'uncertain' WHERE state = 'sending'"
+            )
+
+    def claim_next_terminal_callback_delivery(self) -> dict[str, object] | None:
+        """Claim one desktop callback using only the persisted managed target."""
+        with self._write_transaction() as connection:
+            row = connection.execute(
+                "SELECT deliveries.call_id, calls.desktop_route_device_id, calls.version, "
+                "calls.ring_deadline, presence.callback_url "
+                "FROM terminal_callback_deliveries AS deliveries "
+                "JOIN calls ON calls.call_id = deliveries.call_id "
+                "LEFT JOIN terminal_presence AS presence "
+                "ON presence.device_id = calls.desktop_route_device_id "
+                "WHERE deliveries.state = 'pending' ORDER BY deliveries.rowid LIMIT 1"
+            ).fetchone()
+            if row is None:
+                return None
+            call = self._call_or_raise(connection, row["call_id"])
+            self._settle_if_expired(connection, call)
+            call = self._call_or_raise(connection, row["call_id"])
+            if (
+                call["state"] != "ringing"
+                or self._now() >= self._parse_stamp(call["ring_deadline"])
+                or not isinstance(row["callback_url"], str)
+                or not row["callback_url"]
+            ):
+                connection.execute(
+                    "UPDATE terminal_callback_deliveries SET state = 'suppressed' "
+                    "WHERE call_id = ? AND state = 'pending'",
+                    (call["call_id"],),
+                )
+                return None
+            claimed = connection.execute(
+                "UPDATE terminal_callback_deliveries SET state = 'sending', attempt_count = attempt_count + 1 "
+                "WHERE call_id = ? AND state = 'pending'",
+                (call["call_id"],),
+            ).rowcount
+            if claimed != 1:
+                return None
+            return {
+                "call_id": str(call["call_id"]),
+                "device_id": str(call["desktop_route_device_id"]),
+                "callback_url": str(row["callback_url"]),
+                "version": int(call["version"]),
+                "ring_deadline": str(call["ring_deadline"]),
+            }
+
+    def authorize_terminal_callback_send(self, call_id: str) -> bool:
+        """Recheck authoritative state immediately before callback I/O."""
+        with self._write_transaction() as connection:
+            delivery = connection.execute(
+                "SELECT state FROM terminal_callback_deliveries WHERE call_id = ?", (call_id,)
+            ).fetchone()
+            if delivery is None or delivery["state"] != "sending":
+                return False
+            call = self._call_or_raise(connection, call_id)
+            self._settle_if_expired(connection, call)
+            call = self._call_or_raise(connection, call_id)
+            if call["state"] == "ringing" and self._now() < self._parse_stamp(call["ring_deadline"]):
+                return True
+            connection.execute(
+                "UPDATE terminal_callback_deliveries SET state = 'suppressed' "
+                "WHERE call_id = ? AND state = 'sending'",
+                (call_id,),
+            )
+            return False
+
+    def finish_terminal_callback_delivery(self, call_id: str, state: str) -> None:
+        if state not in {"success", "failed", "timeout", "uncertain"}:
+            raise ValueError("invalid terminal callback delivery state")
+        with self._write_transaction() as connection:
+            connection.execute(
+                "UPDATE terminal_callback_deliveries SET state = ? "
+                "WHERE call_id = ? AND state = 'sending'",
+                (state, call_id),
+            )
+
+    def recover_terminal_callback_deliveries(self) -> None:
+        """A callback interrupted during I/O is not safe to replay."""
+        with self._write_transaction() as connection:
+            connection.execute(
+                "UPDATE terminal_callback_deliveries SET state = 'uncertain' WHERE state = 'sending'"
             )
 
     def accept_call(self, request: AcceptCall) -> dict[str, Any]:
@@ -2643,6 +2730,10 @@ class CallCoordinator:
                 gui_ready INTEGER NOT NULL, last_seen_at TEXT NOT NULL, online_expires_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS bark_deliveries (
+                call_id TEXT PRIMARY KEY, state TEXT NOT NULL, attempt_count INTEGER NOT NULL,
+                FOREIGN KEY (call_id) REFERENCES calls(call_id)
+            );
+            CREATE TABLE IF NOT EXISTS terminal_callback_deliveries (
                 call_id TEXT PRIMARY KEY, state TEXT NOT NULL, attempt_count INTEGER NOT NULL,
                 FOREIGN KEY (call_id) REFERENCES calls(call_id)
             );

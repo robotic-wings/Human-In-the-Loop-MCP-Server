@@ -27,7 +27,7 @@ from types import MappingProxyType
 from typing import Any, NoReturn
 from urllib.error import URLError
 from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlsplit, urlunsplit
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 from call_coordinator import AcceptCall, CallCoordinator, CreateCall
 
@@ -57,6 +57,7 @@ class ServiceConfig:
     attachment_max_archive_bytes: int
     bark_enabled: bool
     bark_url: str | None
+    terminal_callback_ca_file: Path | None
     operator_credentials_file: Path | None
 
 
@@ -156,6 +157,15 @@ def _load_config(config_path: Path) -> ServiceConfig:
             raise ConfigurationError("config bark_url must be an HTTP(S) URL")
     else:
         bark_url = None
+    callback_ca_value = raw.get("terminal_callback_ca_file")
+    if callback_ca_value is None:
+        terminal_callback_ca_file = None
+    elif isinstance(callback_ca_value, str) and callback_ca_value.strip():
+        terminal_callback_ca_file = Path(callback_ca_value.strip())
+        if not terminal_callback_ca_file.is_file():
+            raise ConfigurationError("config terminal callback CA file must exist")
+    else:
+        raise ConfigurationError("config terminal_callback_ca_file must be a non-empty path")
     return ServiceConfig(
         host,
         port,
@@ -171,6 +181,7 @@ def _load_config(config_path: Path) -> ServiceConfig:
         attachment_max_archive_bytes,
         bark_enabled,
         bark_url,
+        terminal_callback_ca_file,
         operator_credentials_file,
     )
 
@@ -382,6 +393,8 @@ def _load_agent_credentials(path: Path | None) -> dict[str, str]:
 class _TerminalIdentity:
     device_id: str
     terminal_platform: str
+    callback_url: str | None = None
+    callback_auth_token: str | None = None
 
 
 @dataclass(frozen=True)
@@ -405,7 +418,21 @@ def _load_terminal_credentials(path: Path | None) -> dict[str, _TerminalIdentity
         device_id, platform = value.get("device_id"), value.get("terminal_platform")
         if not isinstance(device_id, str) or not device_id or not isinstance(platform, str) or not platform:
             raise ConfigurationError("config terminal credentials contain invalid entries")
-        credentials[token] = _TerminalIdentity(device_id, platform)
+        callback_url = value.get("callback_url")
+        callback_auth_token = value.get("callback_auth_token")
+        if callback_url is not None and (
+            not isinstance(callback_url, str)
+            or not callback_url
+            or urlparse(callback_url).scheme not in {"http", "https"}
+        ):
+            raise ConfigurationError("config terminal credentials contain invalid callback URL")
+        if callback_auth_token is not None and (
+            not isinstance(callback_auth_token, str) or not callback_auth_token
+        ):
+            raise ConfigurationError("config terminal credentials contain invalid callback credential")
+        if (callback_url is None) != (callback_auth_token is None):
+            raise ConfigurationError("config terminal callback URL and credential must be configured together")
+        credentials[token] = _TerminalIdentity(device_id, platform, callback_url, callback_auth_token)
     return credentials
 
 
@@ -507,6 +534,10 @@ class _McpGateway:
         ):
             spec = _find_tool_spec("assign_task_to_human")
         if spec is None or not isinstance(arguments, dict):
+            return _rpc_error(rpc_id, -32602, "invalid params")
+        # Callback routing and its credential are managed terminal configuration,
+        # never Agent-controlled tool arguments.
+        if {"callback_url", "callback_auth_token"} & arguments.keys():
             return _rpc_error(rpc_id, -32602, "invalid params")
         is_continuation = "call_id" in arguments or "after_event_seq" in arguments
         missing = [] if is_continuation else [field for field in spec.required if field not in arguments]
@@ -811,7 +842,7 @@ class _TerminalGateway:
             device_id=identity.device_id,
             terminal_platform=identity.terminal_platform,
             route_device_id=identity.device_id,
-            callback_url=None,
+            callback_url=identity.callback_url,
             instance_id=instance_id,
             gui_ready=gui_ready,
         )
@@ -2299,6 +2330,77 @@ class BarkDeliveryScheduler:
             return "timeout"
 
 
+class DesktopCallbackDeliveryScheduler:
+    """Send one persisted, managed desktop callback outside the MCP wait path."""
+
+    def __init__(
+        self,
+        coordinator: CallCoordinator,
+        *,
+        callback_ca_file: Path | None = None,
+        callback_auth_tokens: dict[str, str] | None = None,
+    ) -> None:
+        self._coordinator = coordinator
+        self._callback_ca_file = callback_ca_file
+        self._callback_auth_tokens = callback_auth_tokens or {}
+        self._stopped = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self._coordinator.recover_terminal_callback_deliveries()
+        self._thread = threading.Thread(
+            target=self._run, name="desktop-callback-delivery-scheduler", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stopped.set()
+        if self._thread is not None:
+            self._thread.join(timeout=3)
+            self._thread = None
+
+    def _run(self) -> None:
+        while not self._stopped.is_set():
+            delivery = self._coordinator.claim_next_terminal_callback_delivery()
+            if delivery is None:
+                self._stopped.wait(0.03)
+                continue
+            if not self._coordinator.authorize_terminal_callback_send(delivery["call_id"]):
+                continue
+            state = self._send(delivery)
+            self._coordinator.finish_terminal_callback_delivery(delivery["call_id"], state)
+
+    def _send(self, delivery: dict[str, object]) -> str:
+        callback_url = delivery["callback_url"]
+        if not isinstance(callback_url, str):
+            return "failed"
+        headers = {"Content-Type": "application/json"}
+        device_id = delivery.get("device_id")
+        if isinstance(device_id, str) and (token := self._callback_auth_tokens.get(device_id)):
+            headers["Authorization"] = f"Bearer {token}"
+        payload = json.dumps(
+            {
+                "call_id": delivery["call_id"],
+                "version": delivery["version"],
+                "ring_deadline": delivery["ring_deadline"],
+                "event_type": "ringing",
+            }
+        ).encode("utf-8")
+        context = (
+            ssl.create_default_context(cafile=str(self._callback_ca_file))
+            if self._callback_ca_file is not None
+            else None
+        )
+        try:
+            with urlopen(Request(callback_url, data=payload, headers=headers, method="POST"), timeout=2.5, context=context) as response:  # noqa: S310 - managed terminal callback URL
+                response.read()
+                return "success" if 200 <= response.status < 300 else "failed"
+        except TimeoutError:
+            return "timeout"
+        except (URLError, OSError):
+            return "failed"
+
+
 def _bark_title(message: str) -> str:
     """Extract only the short display title; never send full tool arguments."""
     try:
@@ -2357,9 +2459,20 @@ def _serve(config: ServiceConfig) -> None:
         if config.bark_enabled and config.bark_url is not None
         else None
     )
+    callback_auth_tokens = {
+        identity.device_id: identity.callback_auth_token
+        for identity in terminal_credentials.values()
+        if identity.callback_auth_token is not None
+    }
+    desktop_callback_scheduler = DesktopCallbackDeliveryScheduler(
+        coordinator,
+        callback_ca_file=config.terminal_callback_ca_file,
+        callback_auth_tokens=callback_auth_tokens,
+    )
     try:
         coordinator.recover_and_settle()
         scheduler.start()
+        desktop_callback_scheduler.start()
         if bark_scheduler is not None:
             bark_scheduler.start()
         configured_desktop_route_device_id = (
@@ -2387,6 +2500,7 @@ def _serve(config: ServiceConfig) -> None:
     finally:
         if bark_scheduler is not None:
             bark_scheduler.stop()
+        desktop_callback_scheduler.stop()
         scheduler.stop()
         coordinator.close()
 
