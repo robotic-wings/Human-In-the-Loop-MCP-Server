@@ -263,6 +263,48 @@ class CallCoordinator:
             )
             return result
 
+    def cancel_iphone_call(
+        self, call_id: str, session_id: str, action_id: str, cancelled: object,
+    ) -> dict[str, Any] | None:
+        """Cancel one phone-routed task from its accepted browser session."""
+        scoped_action_id = f"iphone:{session_id}:{call_id}:{action_id}"
+        action = asdict(CancelCall(call_id, scoped_action_id, "iphone_web", session_id))
+        action["cancelled"] = cancelled
+        payload = self._canonical(action)
+        with self._write_transaction() as connection:
+            try:
+                row = self._call_or_raise(connection, call_id)
+            except KeyError:
+                return None
+            routed = connection.execute(
+                "SELECT 1 FROM bark_deliveries WHERE call_id = ?", (call_id,)
+            ).fetchone()
+            if routed is None or (
+                row["owner_device_id"] != "iphone_web"
+                or row["owner_session_id"] != session_id
+            ):
+                return None
+            replay = connection.execute(
+                "SELECT payload, result FROM cancel_operations WHERE caller_id = ? AND request_id = ?",
+                (f"iphone:{session_id}:{call_id}", action_id),
+            ).fetchone()
+            if replay is not None:
+                return self._decode(replay["result"]) if replay["payload"] == payload else self._conflict()
+            if cancelled is not True:
+                return {"success": False, "status": "invalid_submission"}
+            self._settle_if_expired(connection, row)
+            row = self._call_or_raise(connection, call_id)
+            if row["state"] not in {"accepted", "in_progress"}:
+                return self._current_result(connection, row)
+            if not self._is_task_request(row["message"]):
+                return {"success": False, "status": "invalid_submission"}
+            result = self._cancel(connection, row)
+            connection.execute(
+                "INSERT INTO cancel_operations (caller_id, request_id, payload, result) VALUES (?, ?, ?, ?)",
+                (f"iphone:{session_id}:{call_id}", action_id, payload, self._canonical(result)),
+            )
+            return result
+
     def heartbeat_iphone_call(self, call_id: str, session_id: str) -> dict[str, Any] | None:
         """Refresh only the accepted iPhone browser session's liveness."""
         with self._write_transaction() as connection:
@@ -1866,7 +1908,7 @@ class CallCoordinator:
         self._settle_if_expired(connection, row)
         row = self._call_or_raise(connection, call_id)
         if kind == "cancel":
-            if row["state"] != "accepted":
+            if row["state"] not in {"accepted", "in_progress"}:
                 return self._current_result(connection, row)
             result = self._cancel(connection, row)
         elif row["state"] != "ringing":
@@ -2173,6 +2215,8 @@ class CallCoordinator:
             owner_session_id=row["owner_session_id"],
             ring_deadline=row["ring_deadline"],
         )
+        if self._is_task_request(row["message"]):
+            result["task_id"] = row["interaction_id"]
         connection.execute(
             "UPDATE calls SET state = 'cancelled', version = version + 1 WHERE call_id = ?",
             (row["call_id"],),
