@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -148,3 +150,95 @@ def test_tls_iphone_confirmation_is_denied_when_persisted_phone_route_is_disable
     assert state == ("ringing", None, None, None)
     assert submissions == 0
     assert events == 0
+
+
+def test_tls_expired_accepted_iphone_confirmation_settles_disconnect_before_submission(tmp_path: Path) -> None:
+    port = _free_port()
+    config, certificate = _write_operator_config(tmp_path, port)
+    _configure_phone_route(config)
+    database = tmp_path / "data" / "calls.sqlite3"
+    process = _start(config)
+    _wait_for_listener(process, port)
+    try:
+        created = _confirmation_call(port, certificate, "iphone-confirm-expiry")
+        call_id, interaction_id = created["call_id"], created["interaction_id"]
+        assert isinstance(call_id, str) and isinstance(interaction_id, str)
+        cookie, csrf = _login(port, certificate)
+        headers = _headers(cookie, csrf, port)
+        assert _accept(port, certificate, call_id, headers)[0] == 200
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "UPDATE calls SET terminal_last_seen_at = ?, terminal_disconnect_deadline = ? WHERE call_id = ?",
+                (
+                    (datetime.now(UTC) - timedelta(seconds=181)).isoformat(),
+                    (datetime.now(UTC) - timedelta(seconds=1)).isoformat(),
+                    call_id,
+                ),
+            )
+            connection.commit()
+        late = _submit(port, certificate, call_id, "expired-confirm", False, headers)
+        _, continuation, _ = _post(
+            port, certificate, _continuation("expired-confirm-event", interaction_id, call_id, 1), "test-token-alpha"
+        )
+        next_call = _confirmation_call(port, certificate, "iphone-confirm-after-expiry")
+        with sqlite3.connect(database) as connection:
+            state = connection.execute(
+                "SELECT state, owner_device_id, owner_session_id, handled_on FROM calls WHERE call_id = ?", (call_id,)
+            ).fetchone()
+            submissions = connection.execute(
+                "SELECT count(*) FROM submission_operations WHERE call_id = ?", (call_id,)
+            ).fetchone()[0]
+            result = connection.execute("SELECT result FROM events WHERE call_id = ? ORDER BY event_seq DESC", (call_id,)).fetchone()[0]
+    finally:
+        _stop(process)
+
+    assert late[0] == 409
+    assert isinstance(late[2], dict)
+    assert late[2]["status"] == late[2]["call_state"] == "disconnected"
+    assert late[2]["reason"] == "terminal_disconnected"
+    assert _structured(continuation) == late[2]
+    assert state == ("disconnected", "iphone_web", None, "iphone_web")
+    assert submissions == 0
+    assert '"confirmed"' not in result
+    assert next_call["status"] == "heartbeat"
+    assert next_call["call_state"] == "ringing"
+
+
+def test_tls_iphone_accept_and_typed_confirmation_race_has_one_authoritative_transition(tmp_path: Path) -> None:
+    port = _free_port()
+    config, certificate = _write_operator_config(tmp_path, port)
+    _configure_phone_route(config)
+    database = tmp_path / "data" / "calls.sqlite3"
+    process = _start(config)
+    _wait_for_listener(process, port)
+    try:
+        created = _confirmation_call(port, certificate, "iphone-confirm-race")
+        call_id = created["call_id"]
+        assert isinstance(call_id, str)
+        cookie, csrf = _login(port, certificate)
+        headers = _headers(cookie, csrf, port)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            accepted_future = executor.submit(_accept, port, certificate, call_id, headers)
+            submitted_future = executor.submit(_submit, port, certificate, call_id, "race-confirm", False, headers)
+            accepted = accepted_future.result()
+            submitted = submitted_future.result()
+        with sqlite3.connect(database) as connection:
+            state = connection.execute("SELECT state, handled_on, terminal_platform FROM calls WHERE call_id = ?", (call_id,)).fetchone()
+            events = connection.execute("SELECT event_seq, result FROM events WHERE call_id = ? ORDER BY event_seq", (call_id,)).fetchall()
+            submissions = connection.execute(
+                "SELECT count(*) FROM submission_operations WHERE call_id = ?", (call_id,)
+            ).fetchone()[0]
+    finally:
+        _stop(process)
+
+    assert accepted[0] == 200
+    assert submitted[0] in {400, 403, 409, 200}
+    if submitted[0] == 200:
+        assert state == ("answered", "iphone_web", "ios")
+        assert submissions == 1
+        assert [event[0] for event in events] == [1, 2]
+        assert '"confirmed":false' in events[-1][1]
+    else:
+        assert state == ("accepted", "iphone_web", "ios")
+        assert submissions == 0
+        assert [event[0] for event in events] == [1]
