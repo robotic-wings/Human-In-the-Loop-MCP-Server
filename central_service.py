@@ -1815,7 +1815,7 @@ def _numeric_input_spec(message: object) -> tuple[str, str] | None:
     if not isinstance(arguments, dict):
         return None
     input_type = arguments.get("input_type")
-    default_value = arguments.get("default_value")
+    default_value = arguments.get("default_value", "")
     if input_type not in {"integer", "float"} or not isinstance(default_value, str):
         return None
     return input_type, default_value
