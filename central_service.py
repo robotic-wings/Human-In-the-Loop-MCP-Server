@@ -525,6 +525,11 @@ class _McpGateway:
         if not isinstance(request_id, str) or not request_id:
             return _rpc_error(rpc_id, -32602, "invalid params")
         if spec.name == "cancel_interaction":
+            # Agent cancellation operation identifiers are persisted for replay,
+            # so enforce their bounded ASCII wire contract before the coordinator
+            # can inspect a call or create an operation record.
+            if len(request_id) > 128 or not request_id.isascii():
+                return _rpc_error(rpc_id, -32602, "invalid params")
             return self._cancel_interaction_tool(
                 rpc_id, safe_arguments, caller_id, request_id
             )
