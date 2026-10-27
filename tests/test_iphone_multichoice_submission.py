@@ -42,6 +42,13 @@ def _submit(port: int, certificate: Path, call_id: str, submission_id: str, sele
     return _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": submission_id, "selected_choices": selected_choices}, headers=headers)
 
 
+def _opaque(body: object, call_id: str) -> None:
+    if isinstance(body, dict):
+        assert not set(body).intersection({"status", "call_state", "reason", "result", "selected_choices", "handled_on", "terminal_platform", "call_id", "owner", "route"})
+    rendered = repr(body).lower()
+    assert not any(marker in rendered for marker in (call_id.lower(), "status", "call_state", "reason", "result", "selected_choices", "handled_on", "terminal_platform", "terminal", "disconnect", "owner", "route", "answered", "accepted", "ringing"))
+
+
 class _Page(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
@@ -123,8 +130,7 @@ def test_tls_iphone_multichoice_rejects_invalid_foreign_and_wrong_form_writers_w
     assert preaccept[0] in {400, 401, 403, 409}
     assert all(response[0] in {400, 401, 403, 404, 409} for response in bad)
     assert state is not None and state[0] == "accepted" and operations == 0 and events == [(1,)]
-    other_body = bad[4][2]
-    assert not isinstance(other_body, dict) or not set(other_body).intersection({"status", "call_state", "reason", "result", "selected_choices", "handled_on", "terminal_platform"})
+    _opaque(bad[4][2], call_id)
 
 
 def test_tls_multichoice_route_exclusion_and_expiry_settlement_are_authoritative(tmp_path: Path) -> None:
