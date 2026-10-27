@@ -51,10 +51,11 @@ def _page(html: object, call_id: str) -> tuple[str, str]:
     assert parser.endpoint == f"/api/calls/{call_id}/submissions"
     assert isinstance(parser.csrf, str) and parser.csrf
     assert len(parser.ok) == 1
+    assert parser.ok[0].get("data-endpoint") == parser.endpoint
     assert "textarea" not in source and "data-confirmed" not in source
     assert "<script>safe summary</script>" not in source and "&lt;script&gt;safe summary&lt;/script&gt;" in source
     assert "crypto.randomUUID()" in source
-    assert re.search(r"(?s)button\.addEventListener\(\s*['\"]click['\"]\s*,\s*\(\)\s*=>\s*\{.*?fetch\(\s*button\.dataset\.endpoint.*?credentials\s*:\s*['\"]same-origin['\"].*?['\"]X-CSRF-Token['\"]\s*:\s*csrf.*?acknowledged", source)
+    assert re.search(r"(?s)button\.addEventListener\(\s*['\"]click['\"]\s*,\s*\(\)\s*=>\s*\{.*?(?:const|let)\s+acknowledged\s*=\s*button\.dataset\.acknowledged\s*===\s*['\"]true['\"].*?JSON\.stringify\(\{[^}]*acknowledged.*?fetch\(\s*button\.dataset\.endpoint.*?credentials\s*:\s*['\"]same-origin['\"].*?['\"]X-CSRF-Token['\"]\s*:\s*csrf", source)
     return parser.endpoint, parser.csrf
 
 
