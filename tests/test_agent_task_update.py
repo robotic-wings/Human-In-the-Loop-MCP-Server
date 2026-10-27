@@ -27,11 +27,12 @@ def _call(port: int, certificate: Path, request_id: str) -> dict[str, object]:
 
 def _update(request_id: str, task_id: str, call_id: str, cursor: int, version: int, description: object, context: object) -> dict[str, object]:
     request = _continuation_for_task(request_id, task_id, call_id, cursor)
-    request["params"]["arguments"].update({
-        "expected_task_version": version,
-        "task_description": description,
-        "context_note": context,
-    })
+    arguments = request["params"]["arguments"]
+    arguments["expected_task_version"] = version
+    if description is not None:
+        arguments["task_description"] = description
+    if context is not None:
+        arguments["context_note"] = context
     return request
 
 
@@ -174,3 +175,26 @@ def test_tls_expired_task_update_settles_before_mutating_instructions_or_task_ve
     assert after[0] == before[0] and after[1] == before[1] == 0
     assert after[2] == "disconnected" and after[3] == before[3] + 1 and events == [(1,), (2,), (3,)]
     assert replacement["call_state"] == "ringing"
+
+
+def test_tls_task_update_allows_each_mutable_field_independently_and_preserves_the_other(tmp_path: Path) -> None:
+    port = _free_port(); config, certificate = _write_operator_config(tmp_path, port); _configure_phone_route(config); database = tmp_path / "data" / "calls.sqlite3"; process = _start(config); _wait_for_listener(process, port)
+    try:
+        call_id, task_id, cookie, _ = _accepted_progress(port, certificate, database, "update-partial")
+        context_only = _update("context-only", task_id, call_id, 2, 0, None, "<Changed & context only>")
+        _, context_raw, _ = _post(port, certificate, context_only, "test-token-alpha")
+        context_replay = _update("context-only", task_id, call_id, 2, 0, None, "<Changed & context only>")
+        _, context_replay_raw, _ = _post(port, certificate, context_replay, "test-token-alpha")
+        description_only = _update("description-only", task_id, call_id, 2, 1, "<Changed & description only>", None)
+        _, description_raw, _ = _post(port, certificate, description_only, "test-token-alpha")
+        page = _request(port, certificate, "GET", f"/calls/{call_id}", headers={"Cookie": cookie})
+        state = _snapshot(database, call_id)
+    finally:
+        _stop(process)
+    context_result, context_replayed, description_result = _structured(context_raw), _structured(context_replay_raw), _structured(description_raw)
+    assert context_result == context_replayed and context_result["success"] is True and context_result["status"] == "updated"
+    assert context_result["task_version"] == 1 and description_result["success"] is True and description_result["status"] == "updated"
+    assert description_result["task_version"] == 2
+    assert state[0] is not None and state[0][0] == "in_progress" and state[0][6] == 2
+    assert "<Changed & description only>" in state[0][10] and "<Changed & context only>" in state[0][10]
+    assert page[0] == 200 and "&lt;Changed &amp; description only&gt;" in str(page[2]) and "&lt;Changed &amp; context only&gt;" in str(page[2])
