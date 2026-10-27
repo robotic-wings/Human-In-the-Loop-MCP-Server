@@ -38,13 +38,19 @@ def _submit(port: int, certificate: Path, call_id: str, submission_id: str, user
 
 class _Page(HTMLParser):
     def __init__(self) -> None:
-        super().__init__(); self.csrf: str | None = None; self.endpoint: str | None = None; self.textarea: dict[str, str] | None = None
+        super().__init__(); self.csrf: str | None = None; self.endpoint: str | None = None; self.textarea: dict[str, str] | None = None; self._in_textarea = False; self.textarea_value = ""
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = {key: value or "" for key, value in attrs}
         if tag == "meta" and values.get("name") == "X-CSRF-Token": self.csrf = values.get("content")
-        if tag == "textarea" and values.get("data-input-kind") == "multiline": self.textarea = values
+        if tag == "textarea" and values.get("data-input-kind") == "multiline": self.textarea = values; self._in_textarea = True
         if values.get("data-endpoint"): self.endpoint = values["data-endpoint"]
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "textarea": self._in_textarea = False
+
+    def handle_data(self, data: str) -> None:
+        if self._in_textarea: self.textarea_value += data
 
 
 def _page(html: object, call_id: str) -> tuple[str, str]:
@@ -52,6 +58,7 @@ def _page(html: object, call_id: str) -> tuple[str, str]:
     assert parser.endpoint == f"/api/calls/{call_id}/submissions"
     assert isinstance(parser.csrf, str) and parser.csrf
     assert parser.textarea is not None and parser.textarea.get("data-default") == DEFAULT
+    assert parser.textarea_value == DEFAULT
     assert "<script>write safely</script>" not in source and "&lt;script&gt;write safely&lt;/script&gt;" in source
     assert "<script>draft</script>" not in source and "&lt;script&gt;draft&lt;/script&gt;" in source
     assert "crypto.randomUUID()" in source
