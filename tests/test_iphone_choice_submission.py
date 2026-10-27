@@ -70,13 +70,16 @@ def _parsed_choice_page(html: object, call_id: str) -> tuple[str, str, set[str]]
     assert "&lt;script&gt;pick exactly one&lt;/script&gt;" in source
     assert "<script>Alpha</script>" not in source
     assert "&lt;script&gt;Alpha&lt;/script&gt;" in source
-    assert "fetch(" in source
-    assert "credentials:'same-origin'" in source
-    assert "selected_choices" in source
     assert "crypto.randomUUID()" in source
-    assert re.search(r"(?:const|let)\s+selected\s*=\s*[^;]+\.dataset\.choice", source)
-    assert re.search(r"JSON\.stringify\(\{[^}]*selected_choices", source)
-    assert "button.dataset.endpoint" in source
+    assert re.search(
+        r"(?s)button\.addEventListener\(\s*['\"]click['\"]\s*,\s*\(\)\s*=>\s*\{"
+        r".*?(?:const|let)\s+selected\s*=\s*button\.dataset\.choice\s*;"
+        r".*?fetch\(\s*button\.dataset\.endpoint\s*,\s*\{"
+        r".*?credentials\s*:\s*['\"]same-origin['\"]"
+        r".*?['\"]X-CSRF-Token['\"]\s*:\s*csrf"
+        r".*?body\s*:\s*JSON\.stringify\(\{[^}]*selected_choices\s*:\s*\[\s*selected\s*\]",
+        source,
+    )
     return parser.endpoint, parser.csrf, parser.choices
 
 
