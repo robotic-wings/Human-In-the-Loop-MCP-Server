@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from html.parser import HTMLParser
@@ -64,7 +65,13 @@ def _parsed_confirmation_page(html: object, call_id: str) -> tuple[str, str, set
     assert parser.choices == {"true", "false"}
     assert "fetch(" in source
     assert "credentials:'same-origin'" in source
-    assert '"confirmed"' in source or "confirmed" in source
+    assert "button.dataset.confirmed" in source
+    assert re.search(
+        r"(?:const|let)\s+confirmed\s*=\s*button\.dataset\.confirmed\s*===\s*['\"]true['\"]",
+        source,
+    )
+    assert re.search(r"JSON\.stringify\(\{[^}]*confirmed", source)
+    assert "button.dataset.endpoint" in source
     assert "crypto.randomUUID()" in source
     return parser.endpoint, parser.csrf, parser.choices
 
