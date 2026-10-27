@@ -1072,7 +1072,7 @@ class CallCoordinator:
 
     def submit_terminal_task_final(
         self, call_id: str, device_id: str, owner_session_id: str,
-        submission_id: str, status: object, report: object,
+        submission_id: str, status: object, report: object, task_version: object = 0,
     ) -> dict[str, Any] | None:
         """Persist one completed or failed terminal report from its task owner."""
         if (
@@ -1080,12 +1080,15 @@ class CallCoordinator:
             or not submission_id.isascii() or not isinstance(status, str)
             or status not in {"completed", "failed"}
             or not isinstance(report, str)
+            or not isinstance(task_version, int)
+            or isinstance(task_version, bool)
+            or task_version < 0
         ):
             return {"success": False, "status": "invalid_submission"}
         normalized_report = report.strip()
         if not normalized_report:
             return {"success": False, "status": "invalid_submission"}
-        payload = self._canonical({"status": status, "report": normalized_report})
+        payload = self._canonical({"status": status, "report": normalized_report, "task_version": task_version})
         with self._write_transaction() as connection:
             try:
                 row = self._call_or_raise(connection, call_id)
@@ -1110,8 +1113,14 @@ class CallCoordinator:
             ).fetchone()
             if replay is not None:
                 return self._decode(replay["result"]) if replay["payload"] == payload else self._conflict()
-            if row["state"] != "accepted":
+            if row["state"] not in {"accepted", "in_progress"}:
                 return self._current_result(connection, row)
+            if row["task_version"] != task_version:
+                return {
+                    "success": False, "status": "task_version_conflict",
+                    "call_state": row["state"], "task_version": row["task_version"],
+                    "needs_continuation": False,
+                }
             result = {
                 "success": True, "status": status, "call_state": status,
                 "reason": None, "human_action": True, "needs_continuation": False,
@@ -1127,6 +1136,74 @@ class CallCoordinator:
                 "INSERT INTO submission_operations (call_id, submission_id, payload, result) VALUES (?, ?, ?, ?)",
                 (call_id, submission_id, payload, self._canonical(result)),
             )
+            return result
+
+    def update_active_task(
+        self,
+        caller_id: str,
+        request_id: str,
+        interaction_id: object,
+        call_id: object,
+        after_event_seq: object,
+        expected_task_version: object,
+        task_description: object,
+        context_note: object,
+    ) -> dict[str, Any]:
+        """Atomically revise acknowledged active task instructions for its caller."""
+        if (
+            not all(isinstance(value, str) and value for value in (caller_id, request_id, interaction_id, call_id))
+            or len(request_id) > 128 or not request_id.isascii()
+            or not isinstance(after_event_seq, int) or isinstance(after_event_seq, bool) or after_event_seq < 0
+            or not isinstance(expected_task_version, int) or isinstance(expected_task_version, bool) or expected_task_version < 0
+            or (task_description is not None and not isinstance(task_description, str))
+            or (context_note is not None and not isinstance(context_note, str))
+            or (task_description is None and context_note is None)
+        ):
+            return {"success": False, "status": "invalid_request", "needs_continuation": False}
+        operation_payload = self._canonical({
+            "kind": "task_update", "interaction_id": interaction_id, "call_id": call_id,
+            "after_event_seq": after_event_seq, "expected_task_version": expected_task_version,
+            "task_description": task_description, "context_note": context_note,
+        })
+        with self._write_transaction() as connection:
+            row = self._owned_call(connection, caller_id, interaction_id, call_id)
+            if row is None:
+                return self._session_not_found()
+            replay = self._continuation_replay(connection, caller_id, request_id, operation_payload)
+            if replay is not None:
+                return replay
+            self._settle_if_expired(connection, row)
+            row = self._call_or_raise(connection, call_id)
+            if row["state"] != "in_progress":
+                if row["state"] in {"completed", "failed", "answered", "cancelled", "declined", "not_accepted"}:
+                    return {
+                        "success": False, "status": "invalid_update", "call_state": row["state"],
+                        "task_version": row["task_version"], "needs_continuation": False,
+                    }
+                return self._current_result(connection, row)
+            if row["agent_progress_event_seq"] != after_event_seq:
+                return {"success": False, "status": "invalid_update", "call_state": row["state"], "needs_continuation": False}
+            if row["task_version"] != expected_task_version:
+                return {
+                    "success": False, "status": "task_version_conflict", "call_state": row["state"],
+                    "task_version": row["task_version"], "needs_continuation": False,
+                }
+            updated_message = self._task_message_with_update(row["message"], task_description, context_note)
+            if updated_message is None:
+                return {"success": False, "status": "invalid_update", "needs_continuation": False}
+            connection.execute(
+                "UPDATE calls SET message = ?, task_version = task_version + 1, version = version + 1 WHERE call_id = ?",
+                (updated_message, call_id),
+            )
+            result = self._envelope(
+                status="updated", call_state="in_progress", interaction_id=interaction_id, call_id=call_id,
+                needs_continuation=True, handled_on=row["handled_on"], terminal_platform=row["terminal_platform"],
+                event_seq=self._event_seq(connection, call_id), owner_device_id=row["owner_device_id"],
+                owner_session_id=row["owner_session_id"], version=row["version"] + 1,
+            )
+            result["task_id"] = interaction_id
+            result["task_version"] = expected_task_version + 1
+            self._store_continuation_snapshot(connection, caller_id, request_id, operation_payload, result)
             return result
 
     def submit_terminal_task_progress(
@@ -1573,6 +1650,7 @@ class CallCoordinator:
             "call_state": row["state"],
             "version": row["version"],
             "ring_deadline": row["ring_deadline"],
+            "task_version": row["task_version"],
         }
         if row["owner_device_id"] is not None:
             result["owner_device_id"] = row["owner_device_id"]
@@ -1612,6 +1690,29 @@ class CallCoordinator:
         except json.JSONDecodeError:
             return False
         return isinstance(request, dict) and request.get("tool") == "assign_task_to_human"
+
+    @staticmethod
+    def _task_message_with_update(
+        message: object, task_description: str | None, context_note: str | None
+    ) -> str | None:
+        """Return the canonical task request with only its mutable instructions revised."""
+        try:
+            request = json.loads(message) if isinstance(message, str) else None
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(request, dict) or request.get("tool") != "assign_task_to_human":
+            return None
+        arguments = request.get("arguments")
+        if not isinstance(arguments, dict):
+            return None
+        arguments = dict(arguments)
+        if task_description is not None:
+            arguments["task_description"] = task_description
+        if context_note is not None:
+            arguments["context_note"] = context_note
+        request = dict(request)
+        request["arguments"] = arguments
+        return CallCoordinator._canonical(request)
 
     @staticmethod
     def _single_choice_options(message: object) -> list[str] | None:
