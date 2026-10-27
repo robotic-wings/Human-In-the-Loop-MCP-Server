@@ -1155,7 +1155,9 @@ class CallCoordinator:
             or len(request_id) > 128 or not request_id.isascii()
             or not isinstance(after_event_seq, int) or isinstance(after_event_seq, bool) or after_event_seq < 0
             or not isinstance(expected_task_version, int) or isinstance(expected_task_version, bool) or expected_task_version < 0
-            or not isinstance(task_description, str) or not isinstance(context_note, str)
+            or (task_description is not None and not isinstance(task_description, str))
+            or (context_note is not None and not isinstance(context_note, str))
+            or (task_description is None and context_note is None)
         ):
             return {"success": False, "status": "invalid_request", "needs_continuation": False}
         operation_payload = self._canonical({
@@ -1691,7 +1693,7 @@ class CallCoordinator:
 
     @staticmethod
     def _task_message_with_update(
-        message: object, task_description: str, context_note: str
+        message: object, task_description: str | None, context_note: str | None
     ) -> str | None:
         """Return the canonical task request with only its mutable instructions revised."""
         try:
@@ -1704,8 +1706,10 @@ class CallCoordinator:
         if not isinstance(arguments, dict):
             return None
         arguments = dict(arguments)
-        arguments["task_description"] = task_description
-        arguments["context_note"] = context_note
+        if task_description is not None:
+            arguments["task_description"] = task_description
+        if context_note is not None:
+            arguments["context_note"] = context_note
         request = dict(request)
         request["arguments"] = arguments
         return CallCoordinator._canonical(request)
