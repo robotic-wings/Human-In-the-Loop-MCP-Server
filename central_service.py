@@ -1049,7 +1049,11 @@ class _OperatorGateway:
         submission_id = payload.get("submission_id")
         if not isinstance(submission_id, str):
             return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
-        if "confirmed" in payload and "user_input" not in payload:
+        if "selected_choices" in payload and "user_input" not in payload and "confirmed" not in payload:
+            result = self._coordinator.submit_terminal_single_choice(
+                call_id, "iphone_web", session or "", submission_id, payload["selected_choices"]
+            )
+        elif "confirmed" in payload and "user_input" not in payload:
             confirmed = payload["confirmed"]
             if not isinstance(confirmed, bool):
                 return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
@@ -1072,7 +1076,10 @@ class _OperatorGateway:
         if result["status"] == "request_conflict":
             return HTTPStatus.CONFLICT, result
         if result["status"] != "answered":
-            if "confirmed" in payload and "user_input" not in payload:
+            if (
+                ("confirmed" in payload and "user_input" not in payload)
+                or ("selected_choices" in payload and "user_input" not in payload)
+            ):
                 return HTTPStatus.CONFLICT, result
             return HTTPStatus.CONFLICT, {"status": result["status"]}
         return HTTPStatus.OK, result
@@ -1360,7 +1367,25 @@ class _PublicHandler(BaseHTTPRequestHandler):
             if state.get("owner_device_id") == "iphone_web" and state.get("_page_session_matches_owner"):
                 # The caller has already authenticated this exact browser
                 # session; the form does not create a second ownership path.
-                if _is_confirmation_message(state.get("message")):
+                choice_options = _single_choice_options(state.get("message"))
+                if choice_options is not None:
+                    controls = "".join(
+                        f'<button data-choice="{html.escape(choice, quote=True)}" '
+                        f'data-endpoint="{endpoint}/submissions"><input type="radio" '
+                        f'data-choice="{html.escape(choice, quote=True)}">{html.escape(choice)}</button>'
+                        for choice in choice_options
+                    )
+                    confirmation_script = (
+                        "document.querySelectorAll('button[data-choice]').forEach((button)=>"
+                        "button.addEventListener('click',()=>{"
+                        "const selected=button.dataset.choice;"
+                        "fetch(button.dataset.endpoint,{method:'POST',credentials:'same-origin',"
+                        "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},"
+                        "body:JSON.stringify({submission_id:crypto.randomUUID(),selected_choices:[selected])})"
+                        ".then((response)=>{if(response.ok)location.reload();});"
+                        "}));"
+                    )
+                elif _is_confirmation_message(state.get("message")):
                     controls = (
                         f'<button data-confirmed="true" data-endpoint="{endpoint}/submissions">Yes</button>'
                         f'<button data-confirmed="false" data-endpoint="{endpoint}/submissions">No</button>'
@@ -1706,8 +1731,11 @@ def _page_summary(message: object) -> str:
         return message
     if isinstance(decoded, dict):
         arguments = decoded.get("arguments")
-        if isinstance(arguments, dict):
-            parts = [arguments[key] for key in ("title", "message") if isinstance(arguments.get(key), str)]
+        if (
+            decoded.get("tool") in {"show_confirmation_dialog", "get_user_choice"}
+            and isinstance(arguments, dict)
+        ):
+            parts = [arguments[key] for key in ("title", "message", "prompt") if isinstance(arguments.get(key), str)]
             if parts:
                 return "\n".join(parts)
         title = decoded.get("title")
@@ -1724,6 +1752,24 @@ def _is_confirmation_message(message: object) -> bool:
     except json.JSONDecodeError:
         return False
     return isinstance(request, dict) and request.get("tool") == "show_confirmation_dialog"
+
+
+def _single_choice_options(message: object) -> list[str] | None:
+    if not isinstance(message, str):
+        return None
+    try:
+        request = json.loads(message)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(request, dict) or request.get("tool") != "get_user_choice":
+        return None
+    arguments = request.get("arguments")
+    if not isinstance(arguments, dict) or arguments.get("allow_multiple") is not False:
+        return None
+    choices = arguments.get("choices")
+    if not isinstance(choices, list) or not choices or any(not isinstance(choice, str) for choice in choices):
+        return None
+    return choices
 
 
 def _unauthorized_response() -> dict[str, object]:

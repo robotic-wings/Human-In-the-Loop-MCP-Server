@@ -577,7 +577,7 @@ class CallCoordinator:
                     return None
             if row["owner_device_id"] != device_id or row["owner_session_id"] != owner_session_id:
                 return None
-            if self._is_confirmation_request(row["message"]):
+            if self._is_confirmation_request(row["message"]) or self._is_single_choice_request(row["message"]):
                 return {"success": False, "status": "invalid_submission"}
             replay = connection.execute(
                 "SELECT payload, result FROM submission_operations "
@@ -699,6 +699,82 @@ class CallCoordinator:
                 "handled_on": row["handled_on"],
                 "terminal_platform": row["terminal_platform"],
                 "confirmed": confirmed,
+                "result_id": str(uuid.uuid4()),
+            }
+            connection.execute(
+                "UPDATE calls SET state = 'answered', version = version + 1 WHERE call_id = ?",
+                (call_id,),
+            )
+            self._add_event(connection, call_id, result)
+            connection.execute(
+                "INSERT INTO submission_operations (call_id, submission_id, payload, result) "
+                "VALUES (?, ?, ?, ?)",
+                (call_id, submission_id, payload, self._canonical(result)),
+            )
+            return result
+
+    def submit_terminal_single_choice(
+        self,
+        call_id: str,
+        device_id: str,
+        owner_session_id: str,
+        submission_id: str,
+        selected_choices: object,
+    ) -> dict[str, Any] | None:
+        """Persist exactly one saved choice from its accepted iPhone owner."""
+        if (
+            not isinstance(submission_id, str)
+            or not submission_id
+            or len(submission_id) > 128
+            or not submission_id.isascii()
+            or not isinstance(selected_choices, list)
+            or len(selected_choices) != 1
+            or not isinstance(selected_choices[0], str)
+        ):
+            return {"success": False, "status": "invalid_submission"}
+        selected = selected_choices[0]
+        payload = self._canonical({"selected_choices": [selected]})
+        with self._write_transaction() as connection:
+            try:
+                row = self._call_or_raise(connection, call_id)
+            except KeyError:
+                return None
+            routed = connection.execute(
+                "SELECT 1 FROM bark_deliveries WHERE call_id = ?", (call_id,)
+            ).fetchone()
+            if routed is None:
+                return None
+            if row["owner_device_id"] != device_id or row["owner_session_id"] != owner_session_id:
+                return None
+            choices = self._single_choice_options(row["message"])
+            if choices is None or selected not in choices:
+                return {"success": False, "status": "invalid_submission"}
+            self._settle_if_expired(connection, row)
+            row = self._call_or_raise(connection, call_id)
+            replay = connection.execute(
+                "SELECT payload, result FROM submission_operations "
+                "WHERE call_id = ? AND submission_id = ?",
+                (call_id, submission_id),
+            ).fetchone()
+            if replay is not None:
+                if replay["payload"] == payload:
+                    return self._decode(replay["result"])
+                return self._conflict()
+            if row["state"] != "accepted":
+                return self._current_result(connection, row)
+            result = {
+                "success": True,
+                "status": "answered",
+                "call_state": "answered",
+                "reason": None,
+                "human_action": True,
+                "needs_continuation": False,
+                "interaction_id": row["interaction_id"],
+                "call_id": row["call_id"],
+                "event_seq": (self._event_seq(connection, call_id) or 0) + 1,
+                "handled_on": row["handled_on"],
+                "terminal_platform": row["terminal_platform"],
+                "selected_choices": [selected],
                 "result_id": str(uuid.uuid4()),
             }
             connection.execute(
@@ -1033,6 +1109,26 @@ class CallCoordinator:
         except json.JSONDecodeError:
             return False
         return isinstance(request, dict) and request.get("tool") == "show_confirmation_dialog"
+
+    @staticmethod
+    def _single_choice_options(message: object) -> list[str] | None:
+        try:
+            request = json.loads(message) if isinstance(message, str) else None
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(request, dict) or request.get("tool") != "get_user_choice":
+            return None
+        arguments = request.get("arguments")
+        if not isinstance(arguments, dict) or arguments.get("allow_multiple") is not False:
+            return None
+        choices = arguments.get("choices")
+        if not isinstance(choices, list) or not choices or any(not isinstance(choice, str) for choice in choices):
+            return None
+        return choices
+
+    @classmethod
+    def _is_single_choice_request(cls, message: object) -> bool:
+        return cls._single_choice_options(message) is not None
 
     def _terminal_presence_result(self, row: sqlite3.Row) -> dict[str, Any]:
         return {
