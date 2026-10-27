@@ -828,12 +828,14 @@ class CallCoordinator:
             ).fetchone()
             if routed is None:
                 return None
-            if row["owner_device_id"] != device_id or row["owner_session_id"] != owner_session_id:
-                return None
             input_type = self._numeric_input_type(row["message"])
             typed_input = self._parse_numeric_input(input_type, user_input)
             if typed_input is None:
                 return {"success": False, "status": "invalid_submission"}
+            if row["owner_device_id"] != device_id or row["owner_session_id"] != owner_session_id:
+                if self._is_terminal_disconnect_owner(connection, row, device_id, owner_session_id):
+                    return self._current_result(connection, row)
+                return None
             payload = self._canonical({"input_type": input_type, "user_input": typed_input})
             self._settle_if_expired(connection, row)
             row = self._call_or_raise(connection, call_id)
@@ -1797,6 +1799,29 @@ class CallCoordinator:
             owner_device_id=row["owner_device_id"],
             owner_session_id=row["owner_session_id"],
             version=row["version"],
+        )
+
+    def _is_terminal_disconnect_owner(
+        self, connection: sqlite3.Connection, row: sqlite3.Row,
+        device_id: str, owner_session_id: str,
+    ) -> bool:
+        """Authorize only the pre-expiry iPhone owner to read its terminal result."""
+        if (
+            row["state"] != "disconnected"
+            or row["handled_on"] != "iphone_web"
+            or device_id != "iphone_web"
+        ):
+            return False
+        event = connection.execute(
+            "SELECT result FROM events WHERE call_id = ? ORDER BY event_seq DESC LIMIT 1",
+            (row["call_id"],),
+        ).fetchone()
+        if event is None:
+            return False
+        result = self._decode(event["result"])
+        return (
+            result.get("reason") == "terminal_disconnected"
+            and result.get("owner_session_id") == owner_session_id
         )
 
     @staticmethod
