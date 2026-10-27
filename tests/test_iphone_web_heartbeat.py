@@ -164,8 +164,11 @@ def test_tls_late_iphone_heartbeat_settles_disconnect_and_releases_busy_after_re
     process = _start(config)
     _wait_for_listener(process, port)
     try:
+        late = _heartbeat(port, certificate, call_id, _headers(cookie, csrf, port))
+        after_original_owner = _call_row(database, call_id)
         restarted_cookie, restarted_csrf = _login(port, certificate)
-        late = _heartbeat(port, certificate, call_id, _headers(restarted_cookie, restarted_csrf, port))
+        takeover = _heartbeat(port, certificate, call_id, _headers(restarted_cookie, restarted_csrf, port))
+        after_new_session = _call_row(database, call_id)
         _, continuation, _ = _post(
             port, certificate, _continuation("iphone-heartbeat-terminal", interaction_id, call_id, 1), "test-token-alpha"
         )
@@ -179,6 +182,8 @@ def test_tls_late_iphone_heartbeat_settles_disconnect_and_releases_busy_after_re
     assert late[2]["status"] == late[2]["call_state"] == "disconnected"
     assert late[2]["reason"] == "terminal_disconnected"
     assert _structured(continuation) == late[2]
+    assert takeover[0] in {400, 401, 403, 404, 409}
+    assert after_new_session == after_original_owner
     assert final[0] == "disconnected"
     assert final[1] == "iphone_web"
     assert next_call["status"] == "heartbeat"
