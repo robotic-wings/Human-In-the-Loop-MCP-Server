@@ -61,16 +61,18 @@ def _page(html: object, call_id: str) -> str:
     assert {item.get("data-task-final") for item in parser.actions} == {"completed", "failed"}
     assert {item.get("data-endpoint") for item in parser.actions} == {endpoint}
     assert "credentials: 'same-origin'" in source and "X-CSRF-Token" in source
-    assert re.search(r'''(?sx)
-        (?:const|let)\s+(?P<completed>[A-Za-z_$][\w$]*)\s*=\s*document\.querySelector\(\s*['"]button\[data-task-final=["']completed["']\]['"]\s*\)
-        .*?(?:const|let)\s+(?P<failed>[A-Za-z_$][\w$]*)\s*=\s*document\.querySelector\(\s*['"]button\[data-task-final=["']failed["']\]['"]\s*\)
-        .*?(?P=completed)\.addEventListener\(\s*['"]click['"]
-        .*?(?P=failed)\.addEventListener\(\s*['"]click['"]
-        .*?JSON\.stringify\(\{[^}]*status[^}]*report
-        .*?\.dataset\.endpoint
-        .*?['"]X-CSRF-Token['"]\s*:\s*csrf
-        .*?credentials\s*:\s*['"]same-origin['"]
-    ''', source)
+    for final_status in ("completed", "failed"):
+        assert re.search(fr'''(?sx)
+            (?:const|let)\s+(?P<button>[A-Za-z_$][\w$]*)\s*=\s*
+            document\.querySelector\(\s*['"]button\[data-task-final=["']{final_status}["']\]['"]\s*\)
+            .*?(?P=button)\.addEventListener\(\s*['"]click['"]
+            .*?(?:const|let)\s+(?P<status>[A-Za-z_$][\w$]*)\s*=\s*(?P=button)\.dataset\.taskFinal
+            .*?(?:document\.querySelector\([^)]*textarea|report)
+            .*?JSON\.stringify\(\{{[^}}]*(?P=status)[^}}]*report
+            .*?fetch\(\s*(?P=button)\.dataset\.endpoint
+            .*?['"]X-CSRF-Token['"]\s*:\s*csrf
+            .*?credentials\s*:\s*['"]same-origin['"]
+        ''', source)
     return parser.csrf
 
 
