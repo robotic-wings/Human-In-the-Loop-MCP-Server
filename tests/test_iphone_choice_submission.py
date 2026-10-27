@@ -155,6 +155,15 @@ def test_tls_iphone_single_choice_rejects_wrong_payloads_and_untrusted_writers_w
         owner_headers = _headers(owner_cookie, owner_csrf, port)
         preaccept = _submit(port, certificate, call_id, "preaccept", ["Beta"], owner_headers)
         assert _accept(port, certificate, call_id, owner_headers)[0] == 200
+        with sqlite3.connect(database) as connection:
+            accepted_state = connection.execute(
+                "SELECT state, owner_device_id, owner_session_id, handled_on, terminal_platform "
+                "FROM calls WHERE call_id = ?",
+                (call_id,),
+            ).fetchone()
+            accepted_events = connection.execute(
+                "SELECT event_seq, result FROM events WHERE call_id = ? ORDER BY event_seq", (call_id,)
+            ).fetchall()
         foreign = _submit(port, certificate, call_id, "foreign", ["Beta"], {"Cookie": owner_cookie, "X-CSRF-Token": owner_csrf, "Origin": "https://evil.example"})
         other = _submit(port, certificate, call_id, "other", ["Beta"], _headers(other_cookie, other_csrf, port))
         nonmember = _submit(port, certificate, call_id, "nonmember", ["outside"], owner_headers)
@@ -162,9 +171,13 @@ def test_tls_iphone_single_choice_rejects_wrong_payloads_and_untrusted_writers_w
         text = _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "text", "user_input": "not a choice"}, headers=owner_headers)
         confirmation = _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "confirmation", "confirmed": False}, headers=owner_headers)
         with sqlite3.connect(database) as connection:
-            state = connection.execute("SELECT state FROM calls WHERE call_id = ?", (call_id,)).fetchone()[0]
+            state = connection.execute(
+                "SELECT state, owner_device_id, owner_session_id, handled_on, terminal_platform "
+                "FROM calls WHERE call_id = ?",
+                (call_id,),
+            ).fetchone()
             submissions = connection.execute("SELECT count(*) FROM submission_operations WHERE call_id = ?", (call_id,)).fetchone()[0]
-            events = connection.execute("SELECT count(*) FROM events WHERE call_id = ?", (call_id,)).fetchone()[0]
+            events = connection.execute("SELECT event_seq, result FROM events WHERE call_id = ? ORDER BY event_seq", (call_id,)).fetchall()
     finally:
         _stop(process)
 
@@ -172,8 +185,12 @@ def test_tls_iphone_single_choice_rejects_wrong_payloads_and_untrusted_writers_w
     assert foreign[0] in {400, 403}
     assert other[0] in {400, 401, 403, 404, 409}
     assert nonmember[0] == multiple[0] == text[0] == confirmation[0] == 400
-    assert state == "accepted"
-    assert submissions == events == 0
+    assert accepted_state is not None and accepted_state[0] == "accepted"
+    assert accepted_events and [event[0] for event in accepted_events] == [1]
+    assert state == accepted_state
+    assert submissions == 0
+    assert events == accepted_events
+    assert '"selected_choices"' not in events[0][1]
 
 
 def test_tls_iphone_single_choice_is_denied_when_phone_route_is_disabled(tmp_path: Path) -> None:
