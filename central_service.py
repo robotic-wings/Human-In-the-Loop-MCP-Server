@@ -1049,6 +1049,7 @@ class _OperatorGateway:
         submission_id = payload.get("submission_id")
         if not isinstance(submission_id, str):
             return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
+        numeric_input = False
         if "selected_choices" in payload and "user_input" not in payload and "confirmed" not in payload:
             result = self._coordinator.submit_terminal_single_choice(
                 call_id, "iphone_web", session or "", submission_id, payload["selected_choices"]
@@ -1064,9 +1065,15 @@ class _OperatorGateway:
             user_input = payload.get("user_input")
             if not isinstance(user_input, str) or not user_input or "confirmed" in payload:
                 return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
-            result = self._coordinator.submit_terminal_text(
-                call_id, "iphone_web", session or "", submission_id, user_input, operator_owner=True
-            )
+            numeric_input = self._coordinator.numeric_input_type_for_call(call_id) is not None
+            if numeric_input:
+                result = self._coordinator.submit_terminal_numeric_input(
+                    call_id, "iphone_web", session or "", submission_id, user_input
+                )
+            else:
+                result = self._coordinator.submit_terminal_text(
+                    call_id, "iphone_web", session or "", submission_id, user_input, operator_owner=True
+                )
         if result is None:
             # An authenticated operator may know a ringing call without owning
             # it; do not turn that into a content-bearing response.
@@ -1079,6 +1086,7 @@ class _OperatorGateway:
             if (
                 ("confirmed" in payload and "user_input" not in payload)
                 or ("selected_choices" in payload and "user_input" not in payload)
+                or numeric_input
             ):
                 return HTTPStatus.CONFLICT, result
             return HTTPStatus.CONFLICT, {"status": result["status"]}
@@ -1357,7 +1365,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
         csrf_value = html.escape(csrf, quote=True)
         controls = ""
         heartbeat_script = ""
-        confirmation_script = ""
+        submission_script = ""
         if call_state == "ringing":
             controls = (
                 f'<button data-action="accept" data-endpoint="{endpoint}/accept">Accept</button>'
@@ -1367,15 +1375,34 @@ class _PublicHandler(BaseHTTPRequestHandler):
             if state.get("owner_device_id") == "iphone_web" and state.get("_page_session_matches_owner"):
                 # The caller has already authenticated this exact browser
                 # session; the form does not create a second ownership path.
+                numeric_spec = _numeric_input_spec(state.get("message"))
                 choice_options = _single_choice_options(state.get("message"))
-                if choice_options is not None:
+                if numeric_spec is not None:
+                    input_type, default_value = numeric_spec
+                    controls = (
+                        f'<input data-input-type="{html.escape(input_type, quote=True)}" '
+                        f'value="{html.escape(default_value, quote=True)}">'
+                        f'<button data-numeric-input data-endpoint="{endpoint}/submissions">Submit</button>'
+                    )
+                    submission_script = (
+                        "document.querySelectorAll('button[data-numeric-input]').forEach((button)=>"
+                        "button.addEventListener('click',()=>{"
+                        "const input=document.querySelector('input[data-input-type]');"
+                        "const user_input=input.value;"
+                        "fetch(button.dataset.endpoint,{method:'POST',credentials:'same-origin',"
+                        "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},"
+                        "body:JSON.stringify({submission_id:crypto.randomUUID(),user_input:user_input})})"
+                        ".then((response)=>{if(response.ok)location.reload();});"
+                        "}));"
+                    )
+                elif choice_options is not None:
                     controls = "".join(
                         f'<button data-choice="{html.escape(choice, quote=True)}" '
                         f'data-endpoint="{endpoint}/submissions"><input type="radio" '
                         f'data-choice="{html.escape(choice, quote=True)}">{html.escape(choice)}</button>'
                         for choice in choice_options
                     )
-                    confirmation_script = (
+                    submission_script = (
                         "document.querySelectorAll('button[data-choice]').forEach((button)=>"
                         "button.addEventListener('click',()=>{"
                         "const selected=button.dataset.choice;"
@@ -1390,7 +1417,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         f'<button data-confirmed="true" data-endpoint="{endpoint}/submissions">Yes</button>'
                         f'<button data-confirmed="false" data-endpoint="{endpoint}/submissions">No</button>'
                     )
-                    confirmation_script = (
+                    submission_script = (
                         "document.querySelectorAll('button[data-confirmed]').forEach((button)=>"
                         "button.addEventListener('click',async()=>{"
                         "const confirmed=button.dataset.confirmed==='true';"
@@ -1431,7 +1458,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
             "body:JSON.stringify({action_id:crypto.randomUUID()})});"
             "if(response.ok)location.reload();"
             "}));"
-            f"{confirmation_script}"
+            f"{submission_script}"
             f"{heartbeat_script}"
             "</script>"
             f"<a href=\"{endpoint}\">Refresh</a></main>"
@@ -1732,7 +1759,10 @@ def _page_summary(message: object) -> str:
     if isinstance(decoded, dict):
         arguments = decoded.get("arguments")
         if (
-            decoded.get("tool") in {"show_confirmation_dialog", "get_user_choice"}
+            (
+                decoded.get("tool") in {"show_confirmation_dialog", "get_user_choice"}
+                or _numeric_input_spec(message) is not None
+            )
             and isinstance(arguments, dict)
         ):
             parts = [arguments[key] for key in ("title", "message", "prompt") if isinstance(arguments.get(key), str)]
@@ -1770,6 +1800,25 @@ def _single_choice_options(message: object) -> list[str] | None:
     if not isinstance(choices, list) or not choices or any(not isinstance(choice, str) for choice in choices):
         return None
     return choices
+
+
+def _numeric_input_spec(message: object) -> tuple[str, str] | None:
+    if not isinstance(message, str):
+        return None
+    try:
+        request = json.loads(message)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(request, dict) or request.get("tool") != "get_user_input":
+        return None
+    arguments = request.get("arguments")
+    if not isinstance(arguments, dict):
+        return None
+    input_type = arguments.get("input_type")
+    default_value = arguments.get("default_value", "")
+    if input_type not in {"integer", "float"} or not isinstance(default_value, str):
+        return None
+    return input_type, default_value
 
 
 def _unauthorized_response() -> dict[str, object]:
