@@ -1046,12 +1046,23 @@ class _OperatorGateway:
             or not isinstance(payload, dict)
         ):
             return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
-        submission_id, user_input = payload.get("submission_id"), payload.get("user_input")
-        if not isinstance(submission_id, str) or not isinstance(user_input, str) or not user_input:
+        submission_id = payload.get("submission_id")
+        if not isinstance(submission_id, str):
             return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
-        result = self._coordinator.submit_terminal_text(
-            call_id, "iphone_web", session or "", submission_id, user_input, operator_owner=True
-        )
+        if "confirmed" in payload and "user_input" not in payload:
+            confirmed = payload["confirmed"]
+            if not isinstance(confirmed, bool):
+                return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
+            result = self._coordinator.submit_terminal_confirmation(
+                call_id, "iphone_web", session or "", submission_id, confirmed
+            )
+        else:
+            user_input = payload.get("user_input")
+            if not isinstance(user_input, str) or not user_input or "confirmed" in payload:
+                return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
+            result = self._coordinator.submit_terminal_text(
+                call_id, "iphone_web", session or "", submission_id, user_input, operator_owner=True
+            )
         if result is None:
             # An authenticated operator may know a ringing call without owning
             # it; do not turn that into a content-bearing response.
@@ -1061,6 +1072,8 @@ class _OperatorGateway:
         if result["status"] == "request_conflict":
             return HTTPStatus.CONFLICT, result
         if result["status"] != "answered":
+            if "confirmed" in payload and "user_input" not in payload:
+                return HTTPStatus.CONFLICT, result
             return HTTPStatus.CONFLICT, {"status": result["status"]}
         return HTTPStatus.OK, result
 
@@ -1337,6 +1350,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
         csrf_value = html.escape(csrf, quote=True)
         controls = ""
         heartbeat_script = ""
+        confirmation_script = ""
         if call_state == "ringing":
             controls = (
                 f'<button data-action="accept" data-endpoint="{endpoint}/accept">Accept</button>'
@@ -1346,10 +1360,26 @@ class _PublicHandler(BaseHTTPRequestHandler):
             if state.get("owner_device_id") == "iphone_web" and state.get("_page_session_matches_owner"):
                 # The caller has already authenticated this exact browser
                 # session; the form does not create a second ownership path.
-                controls = (
-                    f'<form data-endpoint="{endpoint}/submissions"><textarea name="user_input"></textarea>'
-                    '<input name="submission_id"><button>Submit</button></form>'
-                )
+                if _is_confirmation_message(state.get("message")):
+                    controls = (
+                        f'<button data-confirmed="true" data-endpoint="{endpoint}/submissions">Yes</button>'
+                        f'<button data-confirmed="false" data-endpoint="{endpoint}/submissions">No</button>'
+                    )
+                    confirmation_script = (
+                        "document.querySelectorAll('button[data-confirmed]').forEach((button)=>"
+                        "button.addEventListener('click',async()=>{"
+                        "const confirmed=button.dataset.confirmed==='true';"
+                        "const response=await fetch(button.dataset.endpoint,{method:'POST',credentials:'same-origin',"
+                        "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},"
+                        "body:JSON.stringify({submission_id:crypto.randomUUID(),confirmed:confirmed})});"
+                        "if(response.ok)location.reload();"
+                        "}));"
+                    )
+                else:
+                    controls = (
+                        f'<form data-endpoint="{endpoint}/submissions"><textarea name="user_input"></textarea>'
+                        '<input name="submission_id"><button>Submit</button></form>'
+                    )
                 heartbeat_script = (
                     f"const heartbeatEndpoint='{endpoint}/heartbeat';"
                     "const heartbeatTimer=setInterval(async()=>{"
@@ -1376,6 +1406,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
             "body:JSON.stringify({action_id:crypto.randomUUID()})});"
             "if(response.ok)location.reload();"
             "}));"
+            f"{confirmation_script}"
             f"{heartbeat_script}"
             "</script>"
             f"<a href=\"{endpoint}\">Refresh</a></main>"
@@ -1674,10 +1705,25 @@ def _page_summary(message: object) -> str:
     except json.JSONDecodeError:
         return message
     if isinstance(decoded, dict):
+        arguments = decoded.get("arguments")
+        if isinstance(arguments, dict):
+            parts = [arguments[key] for key in ("title", "message") if isinstance(arguments.get(key), str)]
+            if parts:
+                return "\n".join(parts)
         title = decoded.get("title")
         if isinstance(title, str):
             return title
     return "Operator call"
+
+
+def _is_confirmation_message(message: object) -> bool:
+    if not isinstance(message, str):
+        return False
+    try:
+        request = json.loads(message)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(request, dict) and request.get("tool") == "show_confirmation_dialog"
 
 
 def _unauthorized_response() -> dict[str, object]:

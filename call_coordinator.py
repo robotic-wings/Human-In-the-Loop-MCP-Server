@@ -577,6 +577,8 @@ class CallCoordinator:
                     return None
             if row["owner_device_id"] != device_id or row["owner_session_id"] != owner_session_id:
                 return None
+            if self._is_confirmation_request(row["message"]):
+                return {"success": False, "status": "invalid_submission"}
             replay = connection.execute(
                 "SELECT payload, result FROM submission_operations "
                 "WHERE call_id = ? AND submission_id = ?",
@@ -627,6 +629,78 @@ class CallCoordinator:
             }
             if has_attachment_ids:
                 result["attachment_ids"] = attachment_ids
+            connection.execute(
+                "UPDATE calls SET state = 'answered', version = version + 1 WHERE call_id = ?",
+                (call_id,),
+            )
+            self._add_event(connection, call_id, result)
+            connection.execute(
+                "INSERT INTO submission_operations (call_id, submission_id, payload, result) "
+                "VALUES (?, ?, ?, ?)",
+                (call_id, submission_id, payload, self._canonical(result)),
+            )
+            return result
+
+    def submit_terminal_confirmation(
+        self,
+        call_id: str,
+        device_id: str,
+        owner_session_id: str,
+        submission_id: str,
+        confirmed: bool,
+    ) -> dict[str, Any] | None:
+        """Persist one typed confirmation answer from its accepted iPhone owner."""
+        if (
+            not isinstance(submission_id, str)
+            or not submission_id
+            or len(submission_id) > 128
+            or not submission_id.isascii()
+            or not isinstance(confirmed, bool)
+        ):
+            return {"success": False, "status": "invalid_submission"}
+        payload = self._canonical({"confirmed": confirmed})
+        with self._write_transaction() as connection:
+            try:
+                row = self._call_or_raise(connection, call_id)
+            except KeyError:
+                return None
+            routed = connection.execute(
+                "SELECT 1 FROM bark_deliveries WHERE call_id = ?", (call_id,)
+            ).fetchone()
+            if routed is None:
+                return None
+            if row["owner_device_id"] != device_id or row["owner_session_id"] != owner_session_id:
+                return None
+            if not self._is_confirmation_request(row["message"]):
+                return {"success": False, "status": "invalid_submission"}
+            self._settle_if_expired(connection, row)
+            row = self._call_or_raise(connection, call_id)
+            replay = connection.execute(
+                "SELECT payload, result FROM submission_operations "
+                "WHERE call_id = ? AND submission_id = ?",
+                (call_id, submission_id),
+            ).fetchone()
+            if replay is not None:
+                if replay["payload"] == payload:
+                    return self._decode(replay["result"])
+                return self._conflict()
+            if row["state"] != "accepted":
+                return self._current_result(connection, row)
+            result = {
+                "success": True,
+                "status": "answered",
+                "call_state": "answered",
+                "reason": None,
+                "human_action": True,
+                "needs_continuation": False,
+                "interaction_id": row["interaction_id"],
+                "call_id": row["call_id"],
+                "event_seq": (self._event_seq(connection, call_id) or 0) + 1,
+                "handled_on": row["handled_on"],
+                "terminal_platform": row["terminal_platform"],
+                "confirmed": confirmed,
+                "result_id": str(uuid.uuid4()),
+            }
             connection.execute(
                 "UPDATE calls SET state = 'answered', version = version + 1 WHERE call_id = ?",
                 (call_id,),
@@ -951,6 +1025,14 @@ class CallCoordinator:
             result["owner_device_id"] = row["owner_device_id"]
             result["owner_session_id"] = row["owner_session_id"]
         return result
+
+    @staticmethod
+    def _is_confirmation_request(message: object) -> bool:
+        try:
+            request = json.loads(message) if isinstance(message, str) else None
+        except json.JSONDecodeError:
+            return False
+        return isinstance(request, dict) and request.get("tool") == "show_confirmation_dialog"
 
     def _terminal_presence_result(self, row: sqlite3.Row) -> dict[str, Any]:
         return {
