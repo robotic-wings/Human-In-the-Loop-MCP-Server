@@ -258,6 +258,41 @@ class CallCoordinator:
             )
             return result
 
+    def heartbeat_iphone_call(self, call_id: str, session_id: str) -> dict[str, Any] | None:
+        """Refresh only the accepted iPhone browser session's liveness."""
+        with self._write_transaction() as connection:
+            try:
+                row = self._call_or_raise(connection, call_id)
+            except KeyError:
+                return None
+            self._settle_if_expired(connection, row)
+            row = self._call_or_raise(connection, call_id)
+            if row["state"] != "accepted":
+                return self._current_result(connection, row)
+            if (
+                row["owner_device_id"] != "iphone_web"
+                or row["owner_session_id"] != session_id
+            ):
+                return self._ownership_conflict()
+            self._refresh_terminal_liveness(connection, call_id)
+            return self._current_result(connection, self._call_or_raise(connection, call_id))
+
+    def create_operator_session(self, session_id: str, csrf: str) -> None:
+        with self._write_transaction() as connection:
+            connection.execute(
+                "INSERT INTO operator_sessions (session_id, csrf) VALUES (?, ?)",
+                (session_id, csrf),
+            )
+
+    def operator_session_csrf(self, session_id: str | None) -> str | None:
+        if not isinstance(session_id, str):
+            return None
+        with self._write_transaction() as connection:
+            row = connection.execute(
+                "SELECT csrf FROM operator_sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+            return row["csrf"] if row is not None else None
+
     def terminal_state(self, device_id: str, call_id: str | None = None) -> dict[str, Any] | None:
         with self._write_transaction() as connection:
             row = self._routed_terminal_call(connection, device_id, call_id)
@@ -1671,6 +1706,9 @@ class CallCoordinator:
             CREATE TABLE IF NOT EXISTS bark_deliveries (
                 call_id TEXT PRIMARY KEY, state TEXT NOT NULL, attempt_count INTEGER NOT NULL,
                 FOREIGN KEY (call_id) REFERENCES calls(call_id)
+            );
+            CREATE TABLE IF NOT EXISTS operator_sessions (
+                session_id TEXT PRIMARY KEY, csrf TEXT NOT NULL
             );
             """
         )

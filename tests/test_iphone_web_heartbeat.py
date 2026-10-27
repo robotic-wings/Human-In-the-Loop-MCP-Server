@@ -68,6 +68,7 @@ def test_tls_accepted_iphone_owner_heartbeat_refreshes_only_liveness(tmp_path: P
         assert isinstance(call_id, str)
         cookie, csrf = _login(port, certificate)
         assert _accept(port, certificate, call_id, _headers(cookie, csrf, port))[0] == 200
+        active_page = _request(port, certificate, "GET", f"/calls/{call_id}", headers={"Cookie": cookie})
         with sqlite3.connect(database) as connection:
             connection.execute(
                 "UPDATE calls SET terminal_last_seen_at = ?, terminal_disconnect_deadline = ? WHERE call_id = ?",
@@ -94,6 +95,9 @@ def test_tls_accepted_iphone_owner_heartbeat_refreshes_only_liveness(tmp_path: P
     assert refreshed[0] == 200
     assert isinstance(refreshed[2], dict)
     assert refreshed[2]["status"] == refreshed[2]["call_state"] == "accepted"
+    assert f"/api/calls/{call_id}/heartbeat" in str(active_page[2])
+    assert "setInterval" in str(active_page[2])
+    assert "Connection lost." in str(active_page[2])
     assert after[:3] == ("accepted", "iphone_web", before[2])
     assert after[3] != before[3]
     assert after[4] != before[4]

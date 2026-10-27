@@ -996,6 +996,7 @@ class _OperatorGateway:
             return HTTPStatus.UNAUTHORIZED, {"error": "invalid credentials"}, None
         session = secrets.token_urlsafe(32)
         csrf = secrets.token_urlsafe(32)
+        self._coordinator.create_operator_session(session, csrf)
         with self._lock:
             self._sessions[session] = csrf
         return HTTPStatus.OK, {"csrf_token": csrf}, session
@@ -1007,8 +1008,7 @@ class _OperatorGateway:
 
     def page(self, session: str | None, call_id: str) -> tuple[dict[str, object] | None, str | None]:
         """Return the authenticated page view and its CSRF value without new state."""
-        with self._lock:
-            csrf = self._sessions.get(session or "")
+        csrf = self._csrf_for_session(session)
         if csrf is None:
             return None, None
         state = self._coordinator.operator_call_page(call_id)
@@ -1085,14 +1085,42 @@ class _OperatorGateway:
             return HTTPStatus.CONFLICT, result
         return HTTPStatus.OK, result
 
+    def heartbeat(
+        self, session: str | None, csrf: str | None, origin: str | None, host: str | None,
+        call_id: str,
+    ) -> tuple[HTTPStatus, dict[str, object]]:
+        if (
+            not self._session_matches(session, csrf)
+            or origin != f"https://{self._expected_host}"
+            or host != self._expected_host
+        ):
+            return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+        result = self._coordinator.heartbeat_iphone_call(call_id, session or "")
+        if result is None:
+            return HTTPStatus.CONFLICT, {"error": "cannot heartbeat"}
+        if result["status"] != "accepted":
+            return HTTPStatus.CONFLICT, result
+        return HTTPStatus.OK, result
+
     def _session_exists(self, session: str | None) -> bool:
-        with self._lock:
-            return isinstance(session, str) and session in self._sessions
+        return self._csrf_for_session(session) is not None
 
     def _session_matches(self, session: str | None, csrf: str | None) -> bool:
-        with self._lock:
-            expected = self._sessions.get(session or "")
+        expected = self._csrf_for_session(session)
         return isinstance(csrf, str) and expected is not None and hmac.compare_digest(expected, csrf)
+
+    def _csrf_for_session(self, session: str | None) -> str | None:
+        if not isinstance(session, str):
+            return None
+        with self._lock:
+            cached = self._sessions.get(session)
+        if cached is not None:
+            return cached
+        persisted = self._coordinator.operator_session_csrf(session)
+        if persisted is not None:
+            with self._lock:
+                self._sessions[session] = persisted
+        return persisted
 
     def _password_matches(self, password: str) -> bool:
         try:
@@ -1209,6 +1237,17 @@ class _PublicHandler(BaseHTTPRequestHandler):
             )
             self._send_json(status, response)
             return
+        web_heartbeat_id = self._web_heartbeat_call_id(path)
+        if operator is not None and web_heartbeat_id is not None:
+            body_ok, _ = self._terminal_request_body()
+            if not body_ok:
+                return
+            status, response = operator.heartbeat(
+                self._operator_session(), self.headers.get("X-CSRF-Token"), self.headers.get("Origin"),
+                self.headers.get("Host"), web_heartbeat_id,
+            )
+            self._send_json(status, response)
+            return
         web_submission_id = self._web_submission_call_id(path)
         if operator is not None and web_submission_id is not None:
             body_ok, payload = self._terminal_request_body()
@@ -1297,6 +1336,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
         endpoint = f"/api/calls/{escaped_call}"
         csrf_value = html.escape(csrf, quote=True)
         controls = ""
+        heartbeat_script = ""
         if call_state == "ringing":
             controls = (
                 f'<button data-action="accept" data-endpoint="{endpoint}/accept">Accept</button>'
@@ -1309,6 +1349,15 @@ class _PublicHandler(BaseHTTPRequestHandler):
                 controls = (
                     f'<form data-endpoint="{endpoint}/submissions"><textarea name="user_input"></textarea>'
                     '<input name="submission_id"><button>Submit</button></form>'
+                )
+                heartbeat_script = (
+                    f"const heartbeatEndpoint='{endpoint}/heartbeat';"
+                    "const heartbeatTimer=setInterval(async()=>{"
+                    "const response=await fetch(heartbeatEndpoint,{method:'POST',credentials:'same-origin',"
+                    "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:'{}'});"
+                    "if(!response.ok){clearInterval(heartbeatTimer);"
+                    "document.querySelector('[data-state]').textContent='Connection lost.';}"
+                    "},10000);"
                 )
             else:
                 controls = "<p>Another device is handling this call.</p>"
@@ -1327,6 +1376,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
             "body:JSON.stringify({action_id:crypto.randomUUID()})});"
             "if(response.ok)location.reload();"
             "}));"
+            f"{heartbeat_script}"
             "</script>"
             f"<a href=\"{endpoint}\">Refresh</a></main>"
         )
@@ -1386,6 +1436,13 @@ class _PublicHandler(BaseHTTPRequestHandler):
     def _web_decline_call_id(path: str) -> str | None:
         parts = path.split("/")
         if len(parts) == 5 and parts[:3] == ["", "api", "calls"] and parts[3] and parts[4] == "decline":
+            return parts[3]
+        return None
+
+    @staticmethod
+    def _web_heartbeat_call_id(path: str) -> str | None:
+        parts = path.split("/")
+        if len(parts) == 5 and parts[:3] == ["", "api", "calls"] and parts[3] and parts[4] == "heartbeat":
             return parts[3]
         return None
 
