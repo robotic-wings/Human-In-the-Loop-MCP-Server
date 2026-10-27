@@ -133,14 +133,34 @@ def test_tls_iphone_feedback_accept_and_submission_race_has_one_authoritative_tr
             events = connection.execute("SELECT event_seq, result FROM events WHERE call_id = ? ORDER BY event_seq", (call_id,)).fetchall()
             operations = connection.execute("SELECT count(*) FROM submission_operations WHERE call_id = ?", (call_id,)).fetchone()[0]
     finally: _stop(process)
-    assert accepted[0] == 200 and submitted[0] in {400, 403, 409, 200}
+    assert accepted[0] == 200 and submitted[0] in {400, 409, 200}
     if submitted[0] == 200:
         assert state == ("answered", "iphone_web", "ios") and operations == 1
         assert [event[0] for event in events] == [1, 2]
         assert '"feedback_type":"task_too_big"' in events[-1][1]
     else:
-        assert submitted[0] == 409 and isinstance(submitted[2], dict)
-        assert submitted[2]["status"] == submitted[2]["call_state"] == "accepted"
-        assert submitted[2]["handled_on"] == "iphone_web" and submitted[2]["terminal_platform"] == "ios"
         assert state == ("accepted", "iphone_web", "ios") and operations == 0
         assert [event[0] for event in events] == [1]
+        if submitted[0] == 409:
+            assert isinstance(submitted[2], dict)
+            assert submitted[2]["status"] == submitted[2]["call_state"] == "accepted"
+            assert submitted[2]["handled_on"] == "iphone_web" and submitted[2]["terminal_platform"] == "ios"
+        else:
+            assert submitted[0] == 400
+
+
+def test_tls_accepted_iphone_feedback_late_submission_returns_current_state(tmp_path: Path) -> None:
+    port = _free_port(); config, certificate = _write_operator_config(tmp_path, port); _configure_phone_route(config); database = tmp_path / "data" / "calls.sqlite3"; process = _start(config); _wait_for_listener(process, port)
+    try:
+        created = _call(port, certificate, "feedback-late-after-accept"); call_id = created["call_id"]; assert isinstance(call_id, str)
+        cookie, csrf = _login(port, certificate); headers = _headers(cookie, csrf, port); assert _accept(port, certificate, call_id, headers)[0] == 200
+        late = _submit(port, certificate, call_id, "feedback-late-after-accept", TYPE_ID, "Late feedback", headers)
+        with sqlite3.connect(database) as connection:
+            state = connection.execute("SELECT state, handled_on, terminal_platform FROM calls WHERE call_id = ?", (call_id,)).fetchone()
+            operations = connection.execute("SELECT count(*) FROM submission_operations WHERE call_id = ?", (call_id,)).fetchone()[0]
+            events = connection.execute("SELECT event_seq FROM events WHERE call_id = ? ORDER BY event_seq", (call_id,)).fetchall()
+    finally: _stop(process)
+    assert late[0] == 409 and isinstance(late[2], dict)
+    assert late[2]["status"] == late[2]["call_state"] == "accepted"
+    assert late[2]["handled_on"] == "iphone_web" and late[2]["terminal_platform"] == "ios"
+    assert state == ("accepted", "iphone_web", "ios") and operations == 0 and events == [(1,)]
