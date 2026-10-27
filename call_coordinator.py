@@ -1070,6 +1070,65 @@ class CallCoordinator:
             )
             return result
 
+    def submit_terminal_task_final(
+        self, call_id: str, device_id: str, owner_session_id: str,
+        submission_id: str, status: object, report: object,
+    ) -> dict[str, Any] | None:
+        """Persist one completed or failed terminal report from its task owner."""
+        if (
+            not isinstance(submission_id, str) or not submission_id or len(submission_id) > 128
+            or not submission_id.isascii() or not isinstance(status, str)
+            or status not in {"completed", "failed"}
+            or not isinstance(report, str)
+        ):
+            return {"success": False, "status": "invalid_submission"}
+        normalized_report = report.strip()
+        if not normalized_report:
+            return {"success": False, "status": "invalid_submission"}
+        payload = self._canonical({"status": status, "report": normalized_report})
+        with self._write_transaction() as connection:
+            try:
+                row = self._call_or_raise(connection, call_id)
+            except KeyError:
+                return None
+            routed = connection.execute(
+                "SELECT 1 FROM bark_deliveries WHERE call_id = ?", (call_id,)
+            ).fetchone()
+            if routed is None:
+                return None
+            if row["owner_device_id"] != device_id or row["owner_session_id"] != owner_session_id:
+                if self._is_terminal_disconnect_owner(connection, row, device_id, owner_session_id):
+                    return self._current_result(connection, row)
+                return None
+            if not self._is_task_request(row["message"]):
+                return {"success": False, "status": "invalid_submission"}
+            self._settle_if_expired(connection, row)
+            row = self._call_or_raise(connection, call_id)
+            replay = connection.execute(
+                "SELECT payload, result FROM submission_operations WHERE call_id = ? AND submission_id = ?",
+                (call_id, submission_id),
+            ).fetchone()
+            if replay is not None:
+                return self._decode(replay["result"]) if replay["payload"] == payload else self._conflict()
+            if row["state"] != "accepted":
+                return self._current_result(connection, row)
+            result = {
+                "success": True, "status": status, "call_state": status,
+                "reason": None, "human_action": True, "needs_continuation": False,
+                "interaction_id": row["interaction_id"], "task_id": row["interaction_id"],
+                "call_id": row["call_id"],
+                "event_seq": (self._event_seq(connection, call_id) or 0) + 1,
+                "handled_on": row["handled_on"], "terminal_platform": row["terminal_platform"],
+                "report": normalized_report, "resubmittable": True, "result_id": str(uuid.uuid4()),
+            }
+            connection.execute("UPDATE calls SET state = ?, version = version + 1 WHERE call_id = ?", (status, call_id))
+            self._add_event(connection, call_id, result)
+            connection.execute(
+                "INSERT INTO submission_operations (call_id, submission_id, payload, result) VALUES (?, ?, ?, ?)",
+                (call_id, submission_id, payload, self._canonical(result)),
+            )
+            return result
+
     def submit_terminal_numeric_input(
         self,
         call_id: str,
@@ -1485,6 +1544,14 @@ class CallCoordinator:
         except json.JSONDecodeError:
             return False
         return isinstance(request, dict) and request.get("tool") == "get_feedback_from_user"
+
+    @staticmethod
+    def _is_task_request(message: object) -> bool:
+        try:
+            request = json.loads(message) if isinstance(message, str) else None
+        except json.JSONDecodeError:
+            return False
+        return isinstance(request, dict) and request.get("tool") == "assign_task_to_human"
 
     @staticmethod
     def _single_choice_options(message: object) -> list[str] | None:
@@ -2101,7 +2168,7 @@ class CallCoordinator:
     def _current_result(
         self, connection: sqlite3.Connection, row: sqlite3.Row
     ) -> dict[str, Any]:
-        if row["state"] in {"declined", "not_accepted", "disconnected", "cancelled", "answered"}:
+        if row["state"] in {"declined", "not_accepted", "disconnected", "cancelled", "answered", "completed", "failed"}:
             event = connection.execute(
                 "SELECT result FROM events WHERE call_id = ? ORDER BY event_seq DESC LIMIT 1",
                 (row["call_id"],),
