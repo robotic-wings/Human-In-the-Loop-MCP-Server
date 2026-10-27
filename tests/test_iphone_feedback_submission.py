@@ -37,24 +37,26 @@ def _submit(port: int, certificate: Path, call_id: str, submission_id: str, feed
 
 class _Page(HTMLParser):
     def __init__(self) -> None:
-        super().__init__(); self.csrf = None; self.endpoint = None; self.options: list[dict[str, str]] = []; self.textarea = False; self.send = 0
+        super().__init__(); self.csrf = None; self.endpoint = None; self.options: list[dict[str, str]] = []; self.textarea = False; self.send: list[dict[str, str]] = []
     def handle_starttag(self, tag, attrs) -> None:
         values = {key: value or "" for key, value in attrs}
         if tag == "meta" and values.get("name") == "X-CSRF-Token": self.csrf = values.get("content")
         if values.get("data-endpoint"): self.endpoint = values["data-endpoint"]
         if tag == "option": self.options.append(values)
         if tag == "textarea": self.textarea = True
-        if tag == "button" and values.get("data-feedback-send") == "true": self.send += 1
+        if tag == "button" and values.get("data-feedback-send") == "true": self.send.append(values)
 
 
 def _page(html: object, call_id: str) -> tuple[str, str]:
     parser = _Page(); source = str(html); parser.feed(source)
-    assert parser.endpoint == f"/api/calls/{call_id}/submissions" and parser.csrf
-    assert parser.textarea and parser.send == 1
+    endpoint = f"/api/calls/{call_id}/submissions"
+    assert parser.endpoint == endpoint and parser.csrf
+    assert parser.textarea and len(parser.send) == 1
+    assert parser.send[0].get("data-endpoint") == endpoint
     assert (TYPE_ID, TYPE_LABEL) in [(item.get("value"), item.get("data-label")) for item in parser.options]
     assert "credentials: 'same-origin'" in source and "X-CSRF-Token" in source
-    assert re.search(r"(?s)button\.dataset\.endpoint.*?feedback_type.*?feedback_text.*?JSON\.stringify.*?fetch\(.*?credentials\s*:\s*['\"]same-origin['\"]", source)
-    return parser.endpoint, parser.csrf
+    assert re.search(r"(?s)(?:send|button)\.addEventListener\(\s*['\"]click['\"].*?(?:send|button)\.dataset\.endpoint.*?(?:select|feedbackType).*?(?:textarea|feedbackText).*?JSON\.stringify\(\{[^}]*feedback_type[^}]*feedback_text.*?fetch\(\s*(?:send|button)\.dataset\.endpoint.*?['\"]X-CSRF-Token['\"]\s*:\s*csrf.*?credentials\s*:\s*['\"]same-origin['\"]", source)
+    return endpoint, parser.csrf
 
 
 def test_tls_accepted_iphone_feedback_page_persists_canonical_replays_and_delivers_agent_event(tmp_path: Path) -> None:
