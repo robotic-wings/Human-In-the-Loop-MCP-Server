@@ -72,13 +72,18 @@ def test_tls_accepted_iphone_multiline_trims_replays_and_delivers_agent_result(t
         endpoint, page_csrf = _page(_request(port, certificate, "GET", f"/calls/{call_id}", headers={"Cookie": cookie})[2], call_id); protected = _headers(cookie, page_csrf, port)
         first = _submit(port, certificate, call_id, "multiline-1", "  " + NORMALIZED + "  ", protected); replay = _submit(port, certificate, call_id, "multiline-1", NORMALIZED, protected); conflict = _submit(port, certificate, call_id, "multiline-1", "different", protected)
         _, continuation, _ = _post(port, certificate, _continuation("multiline-event", interaction_id, call_id, 1), "test-token-alpha")
-        with sqlite3.connect(database) as connection: events = connection.execute("SELECT event_seq FROM events WHERE call_id = ? ORDER BY event_seq", (call_id,)).fetchall()
+        with sqlite3.connect(database) as connection:
+            state = connection.execute("SELECT state, owner_device_id, owner_session_id, handled_on, terminal_platform FROM calls WHERE call_id = ?", (call_id,)).fetchone()
+            operations = connection.execute("SELECT count(*) FROM submission_operations WHERE call_id = ?", (call_id,)).fetchone()[0]
+            events = connection.execute("SELECT event_seq FROM events WHERE call_id = ? ORDER BY event_seq", (call_id,)).fetchall()
     finally:
         _stop(process)
     assert first[0] == replay[0] == 200 and conflict[0] == 409 and first[2] == replay[2]
     assert isinstance(first[2], dict) and first[2]["status"] == first[2]["call_state"] == "answered"
     assert first[2]["user_input"] == NORMALIZED and first[2]["character_count"] == len(NORMALIZED) and first[2]["line_count"] == 3
-    assert first[2]["handled_on"] == "iphone_web" and first[2]["terminal_platform"] == "ios" and _structured(continuation) == first[2] and events == [(1,), (2,)]
+    assert first[2]["handled_on"] == "iphone_web" and first[2]["terminal_platform"] == "ios" and _structured(continuation) == first[2]
+    assert state is not None and state[0] == "answered" and state[3:] == ("iphone_web", "ios")
+    assert operations == 1 and events == [(1,), (2,)]
 
 
 def test_tls_iphone_multiline_rejects_invalid_foreign_and_wrong_form_writers_without_mutation(tmp_path: Path) -> None:
@@ -87,12 +92,16 @@ def test_tls_iphone_multiline_rejects_invalid_foreign_and_wrong_form_writers_wit
         created = _call(port, certificate, "multiline-security"); call_id = created["call_id"]; assert isinstance(call_id, str)
         owner_cookie, owner_csrf = _login(port, certificate); other_cookie, other_csrf = _login(port, certificate); owner = _headers(owner_cookie, owner_csrf, port)
         preaccept = _submit(port, certificate, call_id, "pre", "text", owner); assert _accept(port, certificate, call_id, owner)[0] == 200
+        with sqlite3.connect(database) as connection:
+            accepted_state = connection.execute("SELECT state, owner_device_id, owner_session_id, handled_on, terminal_platform FROM calls WHERE call_id = ?", (call_id,)).fetchone()
+            opened = connection.execute("SELECT event_seq FROM events WHERE call_id = ? ORDER BY event_seq", (call_id,)).fetchall()
         bad = (_submit(port, certificate, call_id, "empty", " \n ", owner), _submit(port, certificate, call_id, "non-string", ["text"], owner), _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "choice", "selected_choices": ["Beta"]}, headers=owner), _submit(port, certificate, call_id, "other", "text", _headers(other_cookie, other_csrf, port)), _submit(port, certificate, call_id, "cross", "text", {"Cookie": owner_cookie, "X-CSRF-Token": owner_csrf, "Origin": "https://evil.example"}))
-        with sqlite3.connect(database) as connection: state = connection.execute("SELECT state, owner_session_id FROM calls WHERE call_id = ?", (call_id,)).fetchone(); operations = connection.execute("SELECT count(*) FROM submission_operations WHERE call_id = ?", (call_id,)).fetchone()[0]; events = connection.execute("SELECT event_seq FROM events WHERE call_id = ? ORDER BY event_seq", (call_id,)).fetchall()
+        with sqlite3.connect(database) as connection: state = connection.execute("SELECT state, owner_device_id, owner_session_id, handled_on, terminal_platform FROM calls WHERE call_id = ?", (call_id,)).fetchone(); operations = connection.execute("SELECT count(*) FROM submission_operations WHERE call_id = ?", (call_id,)).fetchone()[0]; events = connection.execute("SELECT event_seq FROM events WHERE call_id = ? ORDER BY event_seq", (call_id,)).fetchall()
     finally:
         _stop(process)
     assert preaccept[0] in {400, 401, 403, 409} and all(item[0] in {400, 401, 403, 404, 409} for item in bad)
-    assert state is not None and state[0] == "accepted" and operations == 0 and events == [(1,)]
+    assert accepted_state is not None and accepted_state[0] == "accepted" and opened == [(1,)]
+    assert state == accepted_state and operations == 0 and events == opened
     _opaque(bad[3][2], call_id)
 
 
