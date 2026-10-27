@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from html.parser import HTMLParser
 from pathlib import Path
 
 import pytest
@@ -37,6 +38,37 @@ def _submit(port: int, certificate: Path, call_id: str, submission_id: str, conf
     return _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": submission_id, "confirmed": confirmed}, headers=headers)
 
 
+class _ConfirmationPageParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.endpoint: str | None = None
+        self.csrf: str | None = None
+        self.choices: set[str] = set()
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = dict(attrs)
+        if tag == "meta" and values.get("name") == "X-CSRF-Token":
+            self.csrf = values.get("content")
+        if values.get("data-endpoint"):
+            self.endpoint = values["data-endpoint"]
+        if values.get("data-confirmed") in {"true", "false"}:
+            self.choices.add(values["data-confirmed"])
+
+
+def _parsed_confirmation_page(html: object, call_id: str) -> tuple[str, str, set[str]]:
+    source = str(html)
+    parser = _ConfirmationPageParser()
+    parser.feed(source)
+    assert parser.endpoint == f"/api/calls/{call_id}/submissions"
+    assert isinstance(parser.csrf, str) and parser.csrf
+    assert parser.choices == {"true", "false"}
+    assert "fetch(" in source
+    assert "credentials:'same-origin'" in source
+    assert '"confirmed"' in source or "confirmed" in source
+    assert "crypto.randomUUID()" in source
+    return parser.endpoint, parser.csrf, parser.choices
+
+
 @pytest.mark.parametrize(
     ("confirmed", "submission_id"),
     [(False, "confirm-no-1"), (True, "confirm-yes-1")],
@@ -57,9 +89,15 @@ def test_tls_accepted_iphone_confirmation_is_answered_replayable_and_agent_reada
         ringing_page = _request(port, certificate, "GET", f"/calls/{call_id}", headers={"Cookie": cookie})
         assert _accept(port, certificate, call_id, _headers(cookie, csrf, port))[0] == 200
         owner_page = _request(port, certificate, "GET", f"/calls/{call_id}", headers={"Cookie": cookie})
-        first = _submit(port, certificate, call_id, submission_id, confirmed, _headers(cookie, csrf, port))
-        replay = _submit(port, certificate, call_id, submission_id, confirmed, _headers(cookie, csrf, port))
-        conflict = _submit(port, certificate, call_id, submission_id, not confirmed, _headers(cookie, csrf, port))
+        endpoint, rendered_csrf, choices = _parsed_confirmation_page(owner_page[2], call_id)
+        assert str(confirmed).lower() in choices
+        rendered_headers = _headers(cookie, rendered_csrf, port)
+        first = _request(
+            port, certificate, "POST", endpoint,
+            body={"submission_id": submission_id, "confirmed": confirmed}, headers=rendered_headers,
+        )
+        replay = _request(port, certificate, "POST", endpoint, body={"submission_id": submission_id, "confirmed": confirmed}, headers=rendered_headers)
+        conflict = _request(port, certificate, "POST", endpoint, body={"submission_id": submission_id, "confirmed": not confirmed}, headers=rendered_headers)
         _, continuation, _ = _post(port, certificate, _continuation(f"confirm-event-{confirmed}", interaction_id, call_id, 1), "test-token-alpha")
         with sqlite3.connect(tmp_path / "data" / "calls.sqlite3") as connection:
             state = connection.execute("SELECT state, handled_on, terminal_platform, acted_on FROM calls WHERE call_id = ?", (call_id,)).fetchone()
@@ -71,7 +109,6 @@ def test_tls_accepted_iphone_confirmation_is_answered_replayable_and_agent_reada
     assert "textarea" not in str(ringing_page[2])
     assert "<script>must be escaped</script>" not in str(owner_page[2])
     assert "&lt;script&gt;must be escaped&lt;/script&gt;" in str(owner_page[2])
-    assert "confirmed" in str(owner_page[2])
     assert first[0] == replay[0] == 200
     assert first[2] == replay[2]
     assert conflict[0] == 409
