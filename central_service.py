@@ -1229,6 +1229,34 @@ class _OperatorGateway:
             return HTTPStatus.CONFLICT, result
         return HTTPStatus.OK, result
 
+    def cancel(
+        self, session: str | None, csrf: str | None, origin: str | None, host: str | None,
+        call_id: str, payload: object,
+    ) -> tuple[HTTPStatus, dict[str, object]]:
+        if (
+            not self._session_matches(session, csrf)
+            or origin != f"https://{self._expected_host}"
+            or host != self._expected_host
+            or not isinstance(payload, dict)
+            or set(payload) != {"action_id", "cancelled"}
+            or not isinstance(payload.get("action_id"), str)
+            or not payload["action_id"]
+            or not isinstance(payload.get("cancelled"), bool)
+        ):
+            return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+        result = self._coordinator.cancel_iphone_call(
+            call_id, session or "", payload["action_id"], payload["cancelled"],
+        )
+        if result is None:
+            return HTTPStatus.CONFLICT, {"error": "cannot cancel"}
+        if result["status"] == "invalid_submission":
+            return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
+        if result["status"] == "request_conflict":
+            return HTTPStatus.CONFLICT, result
+        if result["status"] != "cancelled":
+            return HTTPStatus.CONFLICT, result
+        return HTTPStatus.OK, result
+
     def heartbeat(
         self, session: str | None, csrf: str | None, origin: str | None, host: str | None,
         call_id: str,
@@ -1381,6 +1409,17 @@ class _PublicHandler(BaseHTTPRequestHandler):
             )
             self._send_json(status, response)
             return
+        web_cancel_id = self._web_cancel_call_id(path)
+        if operator is not None and web_cancel_id is not None:
+            body_ok, payload = self._terminal_request_body()
+            if not body_ok:
+                return
+            status, response = operator.cancel(
+                self._operator_session(), self.headers.get("X-CSRF-Token"), self.headers.get("Origin"),
+                self.headers.get("Host"), web_cancel_id, payload,
+            )
+            self._send_json(status, response)
+            return
         web_heartbeat_id = self._web_heartbeat_call_id(path)
         if operator is not None and web_heartbeat_id is not None:
             body_ok, _ = self._terminal_request_body()
@@ -1505,6 +1544,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         f'<button data-task-progress="true" data-endpoint="{endpoint}/submissions">Still progressing</button>'
                         f'<button data-task-final="completed" data-task-version="{html.escape(str(task_version), quote=True)}" data-endpoint="{endpoint}/submissions">Completed</button>'
                         f'<button data-task-final="failed" data-task-version="{html.escape(str(task_version), quote=True)}" data-endpoint="{endpoint}/submissions">Failed</button>'
+                        f'<button data-task-cancel="true" data-endpoint="{endpoint}/cancel">Cancel task</button>'
                     )
                     submission_script = (
                         "const progress=document.querySelector('button[data-task-progress]');"
@@ -1535,6 +1575,13 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         "fetch(failed.dataset.endpoint,{method:'POST',credentials: 'same-origin',"
                         "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},"
                         "body:body})"
+                        ".then((response)=>{if(response.ok)location.reload();});"
+                        "});"
+                        "const cancel=document.querySelector('button[data-task-cancel]');"
+                        "cancel.addEventListener('click',()=>{"
+                        "const body=JSON.stringify({action_id:crypto.randomUUID(),cancelled:true});"
+                        "fetch(cancel.dataset.endpoint,{method:'POST',credentials: 'same-origin',"
+                        "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:body})"
                         ".then((response)=>{if(response.ok)location.reload();});"
                         "});"
                     )
@@ -1749,6 +1796,13 @@ class _PublicHandler(BaseHTTPRequestHandler):
     def _web_decline_call_id(path: str) -> str | None:
         parts = path.split("/")
         if len(parts) == 5 and parts[:3] == ["", "api", "calls"] and parts[3] and parts[4] == "decline":
+            return parts[3]
+        return None
+
+    @staticmethod
+    def _web_cancel_call_id(path: str) -> str | None:
+        parts = path.split("/")
+        if len(parts) == 5 and parts[:3] == ["", "api", "calls"] and parts[3] and parts[4] == "cancel":
             return parts[3]
         return None
 
