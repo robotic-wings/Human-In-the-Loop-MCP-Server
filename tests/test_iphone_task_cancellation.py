@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from html.parser import HTMLParser
@@ -138,3 +139,32 @@ def test_tls_iphone_task_cancel_is_owner_route_expiry_first_and_race_safe(tmp_pa
     assert all(item[0] in {400, 401, 403, 404, 409} for item in rejected) and after == before and after_events == events == [(1,)]
     assert call_id.lower() not in repr(rejected[0][2]).lower()
     assert {cancel_response[0], final_response[0]} <= {200, 400, 409} and race_state in {"cancelled", "completed"} and race_events == [(1,), (2,)]
+
+
+def test_tls_task_cancel_and_progress_race_has_ordered_events_and_no_feedback(tmp_path: Path) -> None:
+    port = _free_port(); config, certificate = _write_operator_config(tmp_path, port); _configure_phone_route(config); database = tmp_path / "data" / "calls.sqlite3"; process = _start(config); _wait_for_listener(process, port)
+    try:
+        created = _call(port, certificate, "cancel-progress-race"); call_id = created["call_id"]; assert isinstance(call_id, str)
+        cookie, csrf = _login(port, certificate); headers = _headers(cookie, csrf, port); assert _accept(port, certificate, call_id, headers)[0] == 200
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            cancelling = executor.submit(_cancel, port, certificate, call_id, "cancel-progress-race", headers)
+            progressing = executor.submit(_submit, port, certificate, call_id, "cancel-progress", "in_progress", "Race progress", headers)
+            cancel_response, progress_response = cancelling.result(), progressing.result()
+        with sqlite3.connect(database) as connection:
+            state = connection.execute("SELECT state FROM calls WHERE call_id = ?", (call_id,)).fetchone()[0]
+            events = connection.execute("SELECT event_seq, result FROM events WHERE call_id = ? ORDER BY event_seq", (call_id,)).fetchall()
+            action_operations = connection.execute("SELECT count(*) FROM action_operations WHERE action_id LIKE ?", (f"%:{call_id}:%",)).fetchone()[0]
+            submission_operations = connection.execute("SELECT count(*) FROM submission_operations WHERE call_id = ?", (call_id,)).fetchone()[0]
+        next_call = _call(port, certificate, "cancel-progress-after")
+    finally:
+        _stop(process)
+    assert cancel_response[0] in {200, 409} and progress_response[0] in {200, 400, 409}
+    assert state == "cancelled" and action_operations == 1 and submission_operations in {0, 1}
+    assert [(seq,) for seq, _ in events] in ([(1,), (2,)], [(1,), (2,), (3,)])
+    event_results = [json.loads(result) for _, result in events]
+    assert event_results[0]["status"] == "opened" and event_results[-1]["status"] == event_results[-1]["call_state"] == "cancelled"
+    assert all(item.get("feedback_requested") is not True for item in event_results) and next_call["call_state"] == "ringing"
+    if len(event_results) == 3:
+        assert event_results[1]["status"] == event_results[1]["call_state"] == "in_progress" and submission_operations == 1
+    else:
+        assert submission_operations == 0
