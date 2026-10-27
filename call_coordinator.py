@@ -577,7 +577,11 @@ class CallCoordinator:
                     return None
             if row["owner_device_id"] != device_id or row["owner_session_id"] != owner_session_id:
                 return None
-            if self._is_confirmation_request(row["message"]) or self._is_single_choice_request(row["message"]):
+            if (
+                self._is_confirmation_request(row["message"])
+                or self._is_single_choice_request(row["message"])
+                or self._numeric_input_type(row["message"]) is not None
+            ):
                 return {"success": False, "status": "invalid_submission"}
             replay = connection.execute(
                 "SELECT payload, result FROM submission_operations "
@@ -640,6 +644,14 @@ class CallCoordinator:
                 (call_id, submission_id, payload, self._canonical(result)),
             )
             return result
+
+    def numeric_input_type_for_call(self, call_id: str) -> str | None:
+        """Return the stored numeric input kind without changing call state."""
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT message FROM calls WHERE call_id = ?", (call_id,)
+            ).fetchone()
+            return self._numeric_input_type(row["message"]) if row is not None else None
 
     def submit_terminal_confirmation(
         self,
@@ -775,6 +787,81 @@ class CallCoordinator:
                 "handled_on": row["handled_on"],
                 "terminal_platform": row["terminal_platform"],
                 "selected_choices": [selected],
+                "result_id": str(uuid.uuid4()),
+            }
+            connection.execute(
+                "UPDATE calls SET state = 'answered', version = version + 1 WHERE call_id = ?",
+                (call_id,),
+            )
+            self._add_event(connection, call_id, result)
+            connection.execute(
+                "INSERT INTO submission_operations (call_id, submission_id, payload, result) "
+                "VALUES (?, ?, ?, ?)",
+                (call_id, submission_id, payload, self._canonical(result)),
+            )
+            return result
+
+    def submit_terminal_numeric_input(
+        self,
+        call_id: str,
+        device_id: str,
+        owner_session_id: str,
+        submission_id: str,
+        user_input: object,
+    ) -> dict[str, Any] | None:
+        """Persist a normalized integer or float from its accepted iPhone owner."""
+        if (
+            not isinstance(submission_id, str)
+            or not submission_id
+            or len(submission_id) > 128
+            or not submission_id.isascii()
+            or not isinstance(user_input, str)
+        ):
+            return {"success": False, "status": "invalid_submission"}
+        with self._write_transaction() as connection:
+            try:
+                row = self._call_or_raise(connection, call_id)
+            except KeyError:
+                return None
+            routed = connection.execute(
+                "SELECT 1 FROM bark_deliveries WHERE call_id = ?", (call_id,)
+            ).fetchone()
+            if routed is None:
+                return None
+            if row["owner_device_id"] != device_id or row["owner_session_id"] != owner_session_id:
+                return None
+            input_type = self._numeric_input_type(row["message"])
+            typed_input = self._parse_numeric_input(input_type, user_input)
+            if typed_input is None:
+                return {"success": False, "status": "invalid_submission"}
+            payload = self._canonical({"input_type": input_type, "user_input": typed_input})
+            self._settle_if_expired(connection, row)
+            row = self._call_or_raise(connection, call_id)
+            replay = connection.execute(
+                "SELECT payload, result FROM submission_operations "
+                "WHERE call_id = ? AND submission_id = ?",
+                (call_id, submission_id),
+            ).fetchone()
+            if replay is not None:
+                if replay["payload"] == payload:
+                    return self._decode(replay["result"])
+                return self._conflict()
+            if row["state"] != "accepted":
+                return self._current_result(connection, row)
+            result = {
+                "success": True,
+                "status": "answered",
+                "call_state": "answered",
+                "reason": None,
+                "human_action": True,
+                "needs_continuation": False,
+                "interaction_id": row["interaction_id"],
+                "call_id": row["call_id"],
+                "event_seq": (self._event_seq(connection, call_id) or 0) + 1,
+                "handled_on": row["handled_on"],
+                "terminal_platform": row["terminal_platform"],
+                "input_type": input_type,
+                "user_input": typed_input,
                 "result_id": str(uuid.uuid4()),
             }
             connection.execute(
@@ -1129,6 +1216,34 @@ class CallCoordinator:
     @classmethod
     def _is_single_choice_request(cls, message: object) -> bool:
         return cls._single_choice_options(message) is not None
+
+    @staticmethod
+    def _numeric_input_type(message: object) -> str | None:
+        try:
+            request = json.loads(message) if isinstance(message, str) else None
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(request, dict) or request.get("tool") != "get_user_input":
+            return None
+        arguments = request.get("arguments")
+        if not isinstance(arguments, dict):
+            return None
+        input_type = arguments.get("input_type")
+        return input_type if input_type in {"integer", "float"} else None
+
+    @staticmethod
+    def _parse_numeric_input(input_type: str | None, user_input: str) -> int | float | None:
+        value = user_input.strip()
+        if not value:
+            return None
+        try:
+            if input_type == "integer":
+                return int(value)
+            if input_type == "float":
+                return float(value)
+        except ValueError:
+            return None
+        return None
 
     def _terminal_presence_result(self, row: sqlite3.Row) -> dict[str, Any]:
         return {
