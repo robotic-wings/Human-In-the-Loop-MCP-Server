@@ -100,6 +100,7 @@ def test_tls_task_progress_reconnect_grace_is_300_seconds_and_replay_does_not_ex
     try:
         created = _call(port, certificate, "progress-grace"); call_id, task_id = created["call_id"], created["interaction_id"]; assert isinstance(call_id, str) and isinstance(task_id, str)
         cookie, csrf = _login(port, certificate); headers = _headers(cookie, csrf, port); assert _accept(port, certificate, call_id, headers)[0] == 200; assert _submit(port, certificate, call_id, "progress-grace", "in_progress", "Still working", headers)[0] == 200
+        delivery_started = datetime.now(UTC)
         _, delivered, _ = _post(port, certificate, _continuation_for_task("progress-deliver", task_id, call_id, 1), "test-token-alpha")
         with sqlite3.connect(database) as connection: first_deadline = connection.execute("SELECT agent_reconnect_deadline FROM calls WHERE call_id = ?", (call_id,)).fetchone()[0]
         _, replayed, _ = _post(port, certificate, _continuation_for_task("progress-replay", task_id, call_id, 1), "test-token-alpha")
@@ -108,7 +109,8 @@ def test_tls_task_progress_reconnect_grace_is_300_seconds_and_replay_does_not_ex
         with sqlite3.connect(database) as connection: third_deadline = connection.execute("SELECT agent_reconnect_deadline FROM calls WHERE call_id = ?", (call_id,)).fetchone()[0]
     finally: _stop(process)
     assert _structured(delivered)["status"] == "in_progress" and _structured(delivered)["event_seq"] == 2 and _structured(replayed) == _structured(delivered)
-    assert first_deadline == second_deadline == third_deadline and first_deadline is not None and datetime.fromisoformat(first_deadline) - datetime.now(UTC) > timedelta(seconds=240)
+    assert first_deadline == second_deadline == third_deadline and first_deadline is not None
+    assert timedelta(seconds=299) <= datetime.fromisoformat(first_deadline) - delivery_started <= timedelta(seconds=302)
     assert _structured(waiting)["status"] in {"heartbeat", "waiting"}
 
 
