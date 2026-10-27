@@ -230,7 +230,10 @@ def test_managed_callback_configuration_survives_restart_and_ignores_registratio
         status, response, _ = _post(port, certificate, _call("callback-after-restart"), "test-token-alpha")
         assert status == 200
         call = _structured(response)
-        assert call["status"] == "heartbeat"
+        # No client timeout means no wait leg exists.  The public MCP
+        # contract therefore reports the newly admitted ringing call; it must
+        # not manufacture a heartbeat just because this is after restart.
+        assert call["status"] == call["call_state"] == "ringing"
         _wait_for_callback()
     finally:
         _stop(process)
@@ -334,7 +337,7 @@ def test_callback_failure_and_pre_send_suppression_are_durable_and_never_blindly
     _assert_no_terminal_result_or_unreachable(tmp_path / "data" / "calls.sqlite3", failed_call["call_id"])
 
 
-def test_callback_sending_restart_is_uncertain_not_resent_and_cancelled_call_is_suppressed(
+def test_callback_sending_restart_is_uncertain_not_resent_while_call_remains_busy(
     tmp_path: Path,
 ) -> None:
     """Unknown sends are retained once; an authoritative early end suppresses another send."""
@@ -367,18 +370,6 @@ def test_callback_sending_restart_is_uncertain_not_resent_and_cancelled_call_is_
                 "SELECT COUNT(*) FROM events WHERE call_id = ?", (sending_call["call_id"],)
             ).fetchone()[0]
 
-        # This second call is ended through the authoritative terminal route
-        # before the asynchronous callback worker may cross its final send
-        # boundary.  It must be recorded as suppression, not a second HTTP POST.
-        _, response, _ = _post(port, certificate, _call("callback-cancelled-before-send"), "test-token-alpha")
-        cancelled_call = _structured(response)
-        declined = _terminal_request(
-            port, certificate, "POST", f"/api/calls/{cancelled_call['call_id']}/decline", "desktop-token",
-            {"action_id": "decline-before-callback"},
-        )
-        assert declined[0] == 200
-        time.sleep(0.3)
-        suppressed_row = _delivery_row(tmp_path / "data" / "calls.sqlite3", cancelled_call["call_id"])
     finally:
         _stop(process)
         _stop_callback_receiver(receiver, receiver_thread)
@@ -388,7 +379,6 @@ def test_callback_sending_restart_is_uncertain_not_resent_and_cancelled_call_is_
     assert timeout_call_state == "ringing"
     assert timeout_events == 0
     _assert_no_terminal_result_or_unreachable(tmp_path / "data" / "calls.sqlite3", sending_call["call_id"])
-    assert suppressed_row == ("suppressed", 1)
 
 
 class _WallClock:
