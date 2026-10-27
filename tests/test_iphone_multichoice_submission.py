@@ -122,7 +122,7 @@ def test_tls_iphone_multichoice_rejects_invalid_foreign_and_wrong_form_writers_w
         created = _call(port, certificate, "multi-security"); call_id = created["call_id"]; assert isinstance(call_id, str)
         owner_cookie, owner_csrf = _login(port, certificate); other_cookie, other_csrf = _login(port, certificate); owner = _headers(owner_cookie, owner_csrf, port)
         preaccept = _submit(port, certificate, call_id, "pre", ["Beta"], owner); assert _accept(port, certificate, call_id, owner)[0] == 200
-        bad = (_submit(port, certificate, call_id, "empty", [], owner), _submit(port, certificate, call_id, "dup", ["Beta", "Beta"], owner), _submit(port, certificate, call_id, "foreign", ["outside"], owner), _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "text", "user_input": "Beta"}, headers=owner), _submit(port, certificate, call_id, "other", ["Beta"], _headers(other_cookie, other_csrf, port)), _submit(port, certificate, call_id, "cross", ["Beta"], {"Cookie": owner_cookie, "X-CSRF-Token": owner_csrf, "Origin": "https://evil.example"}))
+        bad = (_submit(port, certificate, call_id, "not-list", {"choice": "Beta"}, owner), _submit(port, certificate, call_id, "non-string", ["Beta", 7], owner), _submit(port, certificate, call_id, "empty", [], owner), _submit(port, certificate, call_id, "dup", ["Beta", "Beta"], owner), _submit(port, certificate, call_id, "foreign", ["outside"], owner), _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "text", "user_input": "Beta"}, headers=owner), _submit(port, certificate, call_id, "other", ["Beta"], _headers(other_cookie, other_csrf, port)), _submit(port, certificate, call_id, "cross", ["Beta"], {"Cookie": owner_cookie, "X-CSRF-Token": owner_csrf, "Origin": "https://evil.example"}))
         with sqlite3.connect(database) as connection:
             state = connection.execute("SELECT state, owner_session_id FROM calls WHERE call_id = ?", (call_id,)).fetchone(); operations = connection.execute("SELECT count(*) FROM submission_operations WHERE call_id = ?", (call_id,)).fetchone()[0]; events = connection.execute("SELECT event_seq FROM events WHERE call_id = ? ORDER BY event_seq", (call_id,)).fetchall()
     finally:
@@ -130,7 +130,7 @@ def test_tls_iphone_multichoice_rejects_invalid_foreign_and_wrong_form_writers_w
     assert preaccept[0] in {400, 401, 403, 409}
     assert all(response[0] in {400, 401, 403, 404, 409} for response in bad)
     assert state is not None and state[0] == "accepted" and operations == 0 and events == [(1,)]
-    _opaque(bad[4][2], call_id)
+    _opaque(bad[6][2], call_id)
 
 
 def test_tls_multichoice_route_exclusion_and_expiry_settlement_are_authoritative(tmp_path: Path) -> None:
