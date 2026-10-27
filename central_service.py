@@ -244,6 +244,7 @@ _TOOL_SPECS = (
             "client_timeout_seconds": {"type": "integer"},
             "max_result_bytes": {"type": "integer"},
             "context_note": {"type": "string"},
+            "expected_task_version": {"type": "integer", "minimum": 0},
             "request_id": {"type": "string"},
         },
         ("task_title", "task_description", "request_id"),
@@ -537,6 +538,13 @@ class _McpGateway:
         call_id = safe_arguments.get("call_id")
         after_event_seq = safe_arguments.get("after_event_seq")
         if call_id is not None or after_event_seq is not None:
+            if spec.name == "assign_task_to_human" and any(
+                field in safe_arguments
+                for field in ("expected_task_version", "task_description", "context_note")
+            ):
+                return self._update_active_task_tool(
+                    rpc_id, safe_arguments, interaction_key, caller_id, request_id
+                )
             return self._continue_tool_call(
                 rpc_id,
                 spec,
@@ -583,6 +591,24 @@ class _McpGateway:
                 client_timeout_seconds,
             )
         return _rpc_result(rpc_id, {"content": [], "structuredContent": envelope})
+
+    def _update_active_task_tool(
+        self,
+        rpc_id: object,
+        arguments: dict[str, object],
+        interaction_key: str,
+        caller_id: str,
+        request_id: str,
+    ) -> dict[str, object]:
+        """Dispatch the explicit agent-only task update without turning it into a wait."""
+        result = self._coordinator.update_active_task(
+            caller_id, request_id, arguments.get(interaction_key), arguments.get("call_id"),
+            arguments.get("after_event_seq"), arguments.get("expected_task_version"),
+            arguments.get("task_description"), arguments.get("context_note"),
+        )
+        if result["status"] == "session_not_found":
+            return _rpc_error(rpc_id, -32602, "invalid params")
+        return _rpc_result(rpc_id, {"content": [], "structuredContent": result})
 
     def _read_interaction_result_tool(
         self, rpc_id: object, arguments: dict[str, object], caller_id: str
@@ -1098,7 +1124,8 @@ class _OperatorGateway:
                 payload["feedback_type"], payload["feedback_text"],
             )
         elif "status" in payload or "report" in payload:
-            if set(payload) != {"submission_id", "status", "report"}:
+            allowed_task_fields = {"submission_id", "status", "report", "task_version"}
+            if not set(payload).issubset(allowed_task_fields) or not {"submission_id", "status", "report"}.issubset(payload):
                 return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
             if payload["status"] == "in_progress":
                 task_progress_submission = True
@@ -1109,7 +1136,7 @@ class _OperatorGateway:
                 task_final_submission = True
                 result = self._coordinator.submit_terminal_task_final(
                     call_id, "iphone_web", session or "", submission_id,
-                    payload["status"], payload["report"],
+                    payload["status"], payload["report"], payload.get("task_version", 0),
                 )
         elif "selected_choices" in payload and "user_input" not in payload and "confirmed" not in payload:
             if self._coordinator.multiple_choice_options_for_call(call_id) is not None:
@@ -1471,12 +1498,13 @@ class _PublicHandler(BaseHTTPRequestHandler):
                 task_spec = _task_final_spec(state.get("message"))
                 if task_spec is not None:
                     title, description, context_note = task_spec
+                    task_version = state.get("task_version", 0)
                     controls = (
                         f'<h2>{html.escape(title)}</h2><p>{html.escape(description)}</p><p>{html.escape(context_note)}</p>'
                         f'<textarea data-task-report></textarea>'
                         f'<button data-task-progress="true" data-endpoint="{endpoint}/submissions">Still progressing</button>'
-                        f'<button data-task-final="completed" data-endpoint="{endpoint}/submissions">Completed</button>'
-                        f'<button data-task-final="failed" data-endpoint="{endpoint}/submissions">Failed</button>'
+                        f'<button data-task-final="completed" data-task-version="{html.escape(str(task_version), quote=True)}" data-endpoint="{endpoint}/submissions">Completed</button>'
+                        f'<button data-task-final="failed" data-task-version="{html.escape(str(task_version), quote=True)}" data-endpoint="{endpoint}/submissions">Failed</button>'
                     )
                     submission_script = (
                         "const progress=document.querySelector('button[data-task-progress]');"
@@ -1490,8 +1518,9 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         "const completed=document.querySelector('button[data-task-final=\"completed\"]');"
                         "completed.addEventListener('click',()=>{"
                         "const status=completed.dataset.taskFinal;"
+                        "const taskVersion=Number(completed.dataset.taskVersion);"
                         "const report=document.querySelector('textarea[data-task-report]').value;"
-                        "const body=JSON.stringify({submission_id:crypto.randomUUID(),status:status,report:report});"
+                        "const body=JSON.stringify({submission_id:crypto.randomUUID(),status:status,report:report,task_version:taskVersion});"
                         "fetch(completed.dataset.endpoint,{method:'POST',credentials: 'same-origin',"
                         "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},"
                         "body:body})"
@@ -1500,8 +1529,9 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         "const failed=document.querySelector('button[data-task-final=\"failed\"]');"
                         "failed.addEventListener('click',()=>{"
                         "const status=failed.dataset.taskFinal;"
+                        "const taskVersion=Number(failed.dataset.taskVersion);"
                         "const report=document.querySelector('textarea[data-task-report]').value;"
-                        "const body=JSON.stringify({submission_id:crypto.randomUUID(),status:status,report:report});"
+                        "const body=JSON.stringify({submission_id:crypto.randomUUID(),status:status,report:report,task_version:taskVersion});"
                         "fetch(failed.dataset.endpoint,{method:'POST',credentials: 'same-origin',"
                         "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},"
                         "body:body})"
