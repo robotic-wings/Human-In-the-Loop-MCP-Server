@@ -32,6 +32,11 @@ from urllib.request import urlopen
 from call_coordinator import AcceptCall, CallCoordinator, CreateCall
 
 
+_FEEDBACK_TYPES = {
+    "task_too_big": "The task is too large - break it into smaller steps",
+}
+
+
 class ConfigurationError(ValueError):
     """Raised when startup configuration cannot safely create the listener."""
 
@@ -988,6 +993,7 @@ class _OperatorGateway:
         self._record = record
         self._expected_host = expected_host
         self._sessions: dict[str, str] = {}
+        self._feedback_forms: set[tuple[str, str]] = set()
         self._lock = threading.RLock()
 
     def login(self, payload: object) -> tuple[HTTPStatus, dict[str, object], str | None]:
@@ -1014,6 +1020,9 @@ class _OperatorGateway:
         state = self._coordinator.operator_call_page(call_id)
         if state is not None:
             state["_page_session_matches_owner"] = state.get("owner_session_id") == session
+            if _is_feedback_message(state.get("message")) and state.get("_page_session_matches_owner"):
+                with self._lock:
+                    self._feedback_forms.add((session, call_id))
         return state, csrf
 
     def accept(
@@ -1052,7 +1061,30 @@ class _OperatorGateway:
         numeric_input = False
         multiline_input = False
         info_acknowledgement = False
-        if "selected_choices" in payload and "user_input" not in payload and "confirmed" not in payload:
+        feedback_submission = False
+        if "feedback_type" in payload or "feedback_text" in payload:
+            if set(payload) != {"submission_id", "feedback_type", "feedback_text"}:
+                return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
+            feedback_submission = True
+            with self._lock:
+                issued_form = (session or "", call_id) in self._feedback_forms
+            if not issued_form:
+                current = self._coordinator.operator_call_state(call_id)
+                if (
+                    current is not None
+                    and current.get("call_state") == "accepted"
+                    and current.get("owner_device_id") == "iphone_web"
+                    and current.get("owner_session_id") == session
+                ):
+                    current.pop("owner_device_id", None)
+                    current.pop("owner_session_id", None)
+                    current["status"] = current["call_state"]
+                    return HTTPStatus.CONFLICT, current
+            result = self._coordinator.submit_terminal_feedback(
+                call_id, "iphone_web", session or "", submission_id,
+                payload["feedback_type"], payload["feedback_text"],
+            )
+        elif "selected_choices" in payload and "user_input" not in payload and "confirmed" not in payload:
             if self._coordinator.multiple_choice_options_for_call(call_id) is not None:
                 result = self._coordinator.submit_terminal_multiple_choice(
                     call_id, "iphone_web", session or "", submission_id, payload["selected_choices"]
@@ -1100,6 +1132,8 @@ class _OperatorGateway:
         if result is None:
             # An authenticated operator may know a ringing call without owning
             # it; do not turn that into a content-bearing response.
+            if feedback_submission:
+                return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
             return HTTPStatus.CONFLICT, {"error": "cannot submit"}
         if result["status"] == "invalid_submission":
             return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
@@ -1112,6 +1146,7 @@ class _OperatorGateway:
                 or numeric_input
                 or multiline_input
                 or info_acknowledgement
+                or feedback_submission
             ):
                 return HTTPStatus.CONFLICT, result
             return HTTPStatus.CONFLICT, {"status": result["status"]}
@@ -1404,7 +1439,29 @@ class _PublicHandler(BaseHTTPRequestHandler):
                 multiline_default = _multiline_default(state.get("message"))
                 choice_options = _single_choice_options(state.get("message"))
                 multi_choice_options = _multiple_choice_options(state.get("message"))
-                if numeric_spec is not None:
+                if _is_feedback_message(state.get("message")):
+                    options = "".join(
+                        f'<option value="{html.escape(type_id, quote=True)}" data-label="{html.escape(label, quote=True)}">{html.escape(label)}</option>'
+                        for type_id, label in _FEEDBACK_TYPES.items()
+                    )
+                    controls = (
+                        f'<select data-feedback-type>{options}</select><textarea data-feedback-text></textarea>'
+                        f'<button data-feedback-send="true" data-endpoint="{endpoint}/submissions">Send</button>'
+                    )
+                    submission_script = (
+                        "const send=document.querySelector('button[data-feedback-send]');"
+                        "send.addEventListener('click',()=>{"
+                        "const endpoint=send.dataset.endpoint;"
+                        "const feedbackType=document.querySelector('select[data-feedback-type]').value;"
+                        "const feedbackText=document.querySelector('textarea[data-feedback-text]').value;"
+                        "const body=JSON.stringify({submission_id:crypto.randomUUID(),feedback_type:feedbackType,feedback_text:feedbackText});"
+                        "fetch(send.dataset.endpoint,{method:'POST',"
+                        "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},credentials: 'same-origin',"
+                        "body:body})"
+                        ".then((response)=>{if(response.ok)location.reload();});"
+                        "});"
+                    )
+                elif numeric_spec is not None:
                     input_type, default_value = numeric_spec
                     controls = (
                         f'<input data-input-type="{html.escape(input_type, quote=True)}" '
@@ -1834,7 +1891,7 @@ def _page_summary(message: object) -> str:
         arguments = decoded.get("arguments")
         if (
             (
-                decoded.get("tool") in {"show_confirmation_dialog", "show_info_message", "get_user_choice"}
+                decoded.get("tool") in {"show_confirmation_dialog", "show_info_message", "get_user_choice", "get_feedback_from_user"}
                 or _numeric_input_spec(message) is not None
                 or _multiline_default(message) is not None
             )
@@ -1867,6 +1924,16 @@ def _is_info_message(message: object) -> bool:
     except json.JSONDecodeError:
         return False
     return isinstance(request, dict) and request.get("tool") == "show_info_message"
+
+
+def _is_feedback_message(message: object) -> bool:
+    if not isinstance(message, str):
+        return False
+    try:
+        request = json.loads(message)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(request, dict) and request.get("tool") == "get_feedback_from_user"
 
 
 def _single_choice_options(message: object) -> list[str] | None:
