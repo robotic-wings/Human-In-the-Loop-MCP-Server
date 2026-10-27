@@ -109,7 +109,7 @@ class CallCoordinator:
             self._settle_all_expired(connection)
             active = connection.execute(
                 "SELECT 1 FROM calls WHERE operator_id = ? "
-                "AND state IN ('ringing', 'accepted') LIMIT 1",
+                "AND state IN ('ringing', 'accepted', 'in_progress') LIMIT 1",
                 (request.operator_id,),
             ).fetchone()
             if active is not None:
@@ -272,7 +272,7 @@ class CallCoordinator:
                 return None
             self._settle_if_expired(connection, row)
             row = self._call_or_raise(connection, call_id)
-            if row["state"] != "accepted":
+            if row["state"] not in {"accepted", "in_progress"}:
                 return self._current_result(connection, row)
             if (
                 row["owner_device_id"] != "iphone_web"
@@ -305,7 +305,7 @@ class CallCoordinator:
                 return None
             self._settle_if_expired(connection, row)
             row = self._call_or_raise(connection, row["call_id"])
-            if row["state"] not in {"ringing", "accepted"}:
+            if row["state"] not in {"ringing", "accepted", "in_progress"}:
                 return self._current_result(connection, row)
             return self._terminal_state_result(row)
 
@@ -1129,6 +1129,66 @@ class CallCoordinator:
             )
             return result
 
+    def submit_terminal_task_progress(
+        self, call_id: str, device_id: str, owner_session_id: str,
+        submission_id: str, report: object,
+    ) -> dict[str, Any] | None:
+        """Persist one nonterminal task progress event from its accepted owner."""
+        if (
+            not isinstance(submission_id, str) or not submission_id or len(submission_id) > 128
+            or not submission_id.isascii() or not isinstance(report, str)
+        ):
+            return {"success": False, "status": "invalid_submission"}
+        normalized_report = report.strip()
+        if not normalized_report:
+            return {"success": False, "status": "invalid_submission"}
+        payload = self._canonical({"status": "in_progress", "report": normalized_report})
+        with self._write_transaction() as connection:
+            try:
+                row = self._call_or_raise(connection, call_id)
+            except KeyError:
+                return None
+            routed = connection.execute(
+                "SELECT 1 FROM bark_deliveries WHERE call_id = ?", (call_id,)
+            ).fetchone()
+            if routed is None:
+                return None
+            if row["owner_device_id"] != device_id or row["owner_session_id"] != owner_session_id:
+                if self._is_terminal_disconnect_owner(connection, row, device_id, owner_session_id):
+                    return self._current_result(connection, row)
+                return None
+            if not self._is_task_request(row["message"]):
+                return {"success": False, "status": "invalid_submission"}
+            self._settle_if_expired(connection, row)
+            row = self._call_or_raise(connection, call_id)
+            replay = connection.execute(
+                "SELECT payload, result FROM submission_operations WHERE call_id = ? AND submission_id = ?",
+                (call_id, submission_id),
+            ).fetchone()
+            if replay is not None:
+                return self._decode(replay["result"]) if replay["payload"] == payload else self._conflict()
+            if row["state"] not in {"accepted", "in_progress"}:
+                return self._current_result(connection, row)
+            result = {
+                "success": True, "status": "in_progress", "call_state": "in_progress",
+                "reason": None, "human_action": True, "needs_continuation": True,
+                "interaction_id": row["interaction_id"], "task_id": row["interaction_id"],
+                "call_id": row["call_id"],
+                "event_seq": (self._event_seq(connection, call_id) or 0) + 1,
+                "handled_on": row["handled_on"], "terminal_platform": row["terminal_platform"],
+                "report": normalized_report,
+            }
+            connection.execute(
+                "UPDATE calls SET state = 'in_progress', version = version + 1 WHERE call_id = ?",
+                (call_id,),
+            )
+            self._add_event(connection, call_id, result)
+            connection.execute(
+                "INSERT INTO submission_operations (call_id, submission_id, payload, result) VALUES (?, ?, ?, ?)",
+                (call_id, submission_id, payload, self._canonical(result)),
+            )
+            return result
+
     def submit_terminal_numeric_input(
         self,
         call_id: str,
@@ -1492,7 +1552,7 @@ class CallCoordinator:
         if call_id is None:
             return connection.execute(
                 "SELECT * FROM calls WHERE desktop_route_device_id = ? "
-                "AND state IN ('ringing', 'accepted') ORDER BY created_at LIMIT 1",
+                "AND state IN ('ringing', 'accepted', 'in_progress') ORDER BY created_at LIMIT 1",
                 (device_id,),
             ).fetchone()
         if legacy_route_device_id == device_id:
@@ -1758,8 +1818,12 @@ class CallCoordinator:
             self._settle_if_expired(connection, row)
             row = self._call_or_raise(connection, call_id)
             result = self._continuation_result(connection, row, after_event_seq)
-            if result["status"] in {"opened", "heartbeat"}:
+            if result["status"] == "opened" or (
+                result["status"] == "heartbeat" and result.get("call_state") != "in_progress"
+            ):
                 self._start_agent_reconnect_grace(connection, call_id)
+            elif result["status"] == "in_progress":
+                self._start_progress_agent_reconnect_grace(connection, call_id, result)
             self._store_continuation_snapshot(
                 connection, caller_id, request_id, operation_payload, result
             )
@@ -1879,7 +1943,7 @@ class CallCoordinator:
             row = self._call_or_raise(connection, call_id)
             result = (
                 self._agent_cancel(connection, row)
-                if row["state"] in {"ringing", "accepted"}
+                if row["state"] in {"ringing", "accepted", "in_progress"}
                 else self._current_result(connection, row)
             )
             connection.execute(
@@ -2040,7 +2104,7 @@ class CallCoordinator:
 
     def _settle_all_expired(self, connection: sqlite3.Connection) -> list[dict[str, Any]]:
         rows = connection.execute(
-            "SELECT * FROM calls WHERE state IN ('ringing', 'accepted')"
+            "SELECT * FROM calls WHERE state IN ('ringing', 'accepted', 'in_progress')"
         ).fetchall()
         settled: list[dict[str, Any]] = []
         for row in rows:
@@ -2056,7 +2120,7 @@ class CallCoordinator:
             return self._settle_ringing_timeout(connection, row) or self._settle_agent_disconnect(
                 connection, row
             )
-        if row["state"] == "accepted":
+        if row["state"] in {"accepted", "in_progress"}:
             return self._settle_terminal_disconnect(connection, row) or self._settle_agent_disconnect(
                 connection, row
             )
@@ -2146,12 +2210,28 @@ class CallCoordinator:
         return result
 
     def _start_agent_reconnect_grace(
-        self, connection: sqlite3.Connection, call_id: str
+        self, connection: sqlite3.Connection, call_id: str, *, seconds: int = 30
     ) -> None:
-        deadline = self._now() + timedelta(seconds=30)
+        deadline = self._now() + timedelta(seconds=seconds)
         connection.execute(
             "UPDATE calls SET agent_reconnect_deadline = ? WHERE call_id = ?",
             (self._stamp(deadline), call_id),
+        )
+
+    def _start_progress_agent_reconnect_grace(
+        self, connection: sqlite3.Connection, call_id: str, result: dict[str, Any]
+    ) -> None:
+        """Start D11's longer grace once for each durably delivered progress event."""
+        event_seq = result.get("event_seq")
+        if not isinstance(event_seq, int):
+            return
+        row = self._call_or_raise(connection, call_id)
+        if row["agent_progress_event_seq"] == event_seq:
+            return
+        deadline = self._now() + timedelta(seconds=300)
+        connection.execute(
+            "UPDATE calls SET agent_reconnect_deadline = ?, agent_progress_event_seq = ? WHERE call_id = ?",
+            (self._stamp(deadline), event_seq, call_id),
         )
 
     def _refresh_terminal_liveness(
@@ -2180,7 +2260,7 @@ class CallCoordinator:
             interaction_id=row["interaction_id"],
             call_id=row["call_id"],
             ring_deadline=row["ring_deadline"],
-            needs_continuation=row["state"] == "accepted",
+            needs_continuation=row["state"] in {"accepted", "in_progress"},
             handled_on=row["handled_on"],
             terminal_platform=row["terminal_platform"],
             event_seq=self._event_seq(connection, row["call_id"]),
@@ -2278,7 +2358,7 @@ class CallCoordinator:
         event = self._event_after(connection, row["call_id"], after_event_seq)
         if event is not None:
             return self._decode(event["result"])
-        if row["state"] in {"declined", "not_accepted", "disconnected", "cancelled", "answered"}:
+        if row["state"] in {"declined", "not_accepted", "disconnected", "cancelled", "answered", "completed", "failed"}:
             return self._current_result(connection, row)
         return self._envelope(
             status="heartbeat",
@@ -2328,8 +2408,12 @@ class CallCoordinator:
         call_id: str,
         result: dict[str, Any],
     ) -> None:
-        if result["status"] in {"opened", "heartbeat"}:
+        if result["status"] == "opened" or (
+            result["status"] == "heartbeat" and result.get("call_state") != "in_progress"
+        ):
             self._start_agent_reconnect_grace(connection, call_id)
+        elif result["status"] == "in_progress":
+            self._start_progress_agent_reconnect_grace(connection, call_id, result)
         self._store_continuation_snapshot(
             connection, caller_id, request_id, operation_payload, result
         )
@@ -2369,7 +2453,7 @@ class CallCoordinator:
                 terminal_platform TEXT, desktop_route_device_id TEXT,
                 acted_on TEXT,
                 terminal_last_seen_at TEXT, terminal_disconnect_deadline TEXT,
-                agent_reconnect_deadline TEXT,
+                agent_reconnect_deadline TEXT, agent_progress_event_seq INTEGER,
                 wait_leg_deadline TEXT, wait_request_id TEXT,
                 draft_body TEXT, draft_version INTEGER NOT NULL DEFAULT 0,
                 task_version INTEGER NOT NULL DEFAULT 0
@@ -2396,6 +2480,10 @@ class CallCoordinator:
             CREATE TABLE IF NOT EXISTS submission_operations (
                 call_id TEXT NOT NULL, submission_id TEXT NOT NULL, payload TEXT NOT NULL,
                 result TEXT NOT NULL, PRIMARY KEY (call_id, submission_id),
+                FOREIGN KEY (call_id) REFERENCES calls(call_id)
+            );
+            CREATE TABLE IF NOT EXISTS results (
+                result_id TEXT PRIMARY KEY, call_id TEXT NOT NULL, result TEXT NOT NULL,
                 FOREIGN KEY (call_id) REFERENCES calls(call_id)
             );
             CREATE TABLE IF NOT EXISTS attachments (
@@ -2431,6 +2519,8 @@ class CallCoordinator:
             self._connection.execute("ALTER TABLE calls ADD COLUMN terminal_disconnect_deadline TEXT")
         if "agent_reconnect_deadline" not in columns:
             self._connection.execute("ALTER TABLE calls ADD COLUMN agent_reconnect_deadline TEXT")
+        if "agent_progress_event_seq" not in columns:
+            self._connection.execute("ALTER TABLE calls ADD COLUMN agent_progress_event_seq INTEGER")
         if "wait_leg_deadline" not in columns:
             self._connection.execute("ALTER TABLE calls ADD COLUMN wait_leg_deadline TEXT")
         if "wait_request_id" not in columns:
