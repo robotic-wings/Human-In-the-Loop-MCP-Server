@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from html.parser import HTMLParser
@@ -297,6 +298,23 @@ def test_tls_expired_accepted_iphone_numeric_input_settles_disconnect_before_sub
     assert _structured(continuation) == late[2]
     assert settled == ("disconnected", None)
     assert foreign[0] in {400, 401, 403, 404, 409}
+    assert isinstance(foreign[2], dict)
+    assert set(foreign[2]).issubset({"success", "error", "message", "code"})
+    opaque_foreign = json.dumps(foreign[2], sort_keys=True).lower()
+    for forbidden in (
+        call_id.lower(),
+        "status",
+        "call_state",
+        "reason",
+        "result",
+        "user_input",
+        "handled_on",
+        "terminal_platform",
+        "disconnected",
+        "terminal_disconnected",
+        "iphone_web",
+    ):
+        assert forbidden not in opaque_foreign
     assert state == ("disconnected", "iphone_web", None, "iphone_web")
     assert operations == 0
     assert '"user_input"' not in result
