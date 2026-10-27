@@ -32,6 +32,10 @@ def _submit(port: int, certificate: Path, call_id: str, submission_id: str, stat
     return _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": submission_id, "status": status, "report": report}, headers=headers)
 
 
+def _heartbeat(port: int, certificate: Path, call_id: str, headers: dict[str, str]):
+    return _request(port, certificate, "POST", f"/api/calls/{call_id}/heartbeat", body={}, headers=headers)
+
+
 def _continuation_for_task(request_id: str, task_id: str, call_id: str, cursor: int) -> dict[str, object]:
     request = _continuation(request_id, task_id, call_id, cursor)
     arguments = request["params"]["arguments"]
@@ -74,6 +78,11 @@ def test_tls_accepted_iphone_task_progress_persists_replays_and_keeps_page_writa
         page_csrf = _page(_request(port, certificate, "GET", f"/calls/{call_id}", headers={"Cookie": cookie})[2], call_id); protected = _headers(cookie, page_csrf, port)
         first = _submit(port, certificate, call_id, "progress-1", "in_progress", "  Waiting for access.  ", protected); replay = _submit(port, certificate, call_id, "progress-1", "in_progress", "Waiting for access.", protected); conflict = _submit(port, certificate, call_id, "progress-1", "in_progress", "Different", protected)
         _, event, _ = _post(port, certificate, _continuation_for_task("progress-event", task_id, call_id, 1), "test-token-alpha")
+        with sqlite3.connect(database) as connection:
+            before_heartbeat = connection.execute("SELECT terminal_last_seen_at, terminal_disconnect_deadline, agent_reconnect_deadline FROM calls WHERE call_id = ?", (call_id,)).fetchone()
+        heartbeat = _heartbeat(port, certificate, call_id, protected)
+        with sqlite3.connect(database) as connection:
+            after_heartbeat = connection.execute("SELECT terminal_last_seen_at, terminal_disconnect_deadline, agent_reconnect_deadline FROM calls WHERE call_id = ?", (call_id,)).fetchone()
         page_after = _request(port, certificate, "GET", f"/calls/{call_id}", headers={"Cookie": cookie})
         with sqlite3.connect(database) as connection:
             state = connection.execute("SELECT state, owner_device_id, owner_session_id, handled_on, terminal_platform, agent_reconnect_deadline FROM calls WHERE call_id = ?", (call_id,)).fetchone(); events = connection.execute("SELECT event_seq FROM events WHERE call_id = ? ORDER BY event_seq", (call_id,)).fetchall(); operations = connection.execute("SELECT count(*) FROM submission_operations WHERE call_id = ?", (call_id,)).fetchone()[0]; results = connection.execute("SELECT count(*) FROM results WHERE call_id = ?", (call_id,)).fetchone()[0]
@@ -81,6 +90,8 @@ def test_tls_accepted_iphone_task_progress_persists_replays_and_keeps_page_writa
     assert first[0] == replay[0] == 200 and first[2] == replay[2] and conflict[0] == 409 and isinstance(first[2], dict)
     assert first[2]["status"] == first[2]["call_state"] == "in_progress" and first[2]["report"] == "Waiting for access." and first[2]["human_action"] is True and first[2]["task_id"] == first[2]["interaction_id"] == task_id and first[2].get("result_id") is None and first[2].get("resubmittable") is not True
     assert _structured(event) == first[2] and page_after[0] == 200 and _page(page_after[2], call_id)
+    assert heartbeat[0] == 200 and isinstance(heartbeat[2], dict) and heartbeat[2]["call_state"] == "in_progress"
+    assert before_heartbeat is not None and after_heartbeat is not None and after_heartbeat[0] > before_heartbeat[0] and after_heartbeat[1] > before_heartbeat[1] and after_heartbeat[2] == before_heartbeat[2]
     assert state[:5] == ("in_progress", "iphone_web", state[2], "iphone_web", "ios") and state[5] is not None and events == [(1,), (2,)] and operations == 1 and results == 0
 
 
@@ -92,11 +103,12 @@ def test_tls_task_progress_reconnect_grace_is_300_seconds_and_replay_does_not_ex
         _, delivered, _ = _post(port, certificate, _continuation_for_task("progress-deliver", task_id, call_id, 1), "test-token-alpha")
         with sqlite3.connect(database) as connection: first_deadline = connection.execute("SELECT agent_reconnect_deadline FROM calls WHERE call_id = ?", (call_id,)).fetchone()[0]
         _, replayed, _ = _post(port, certificate, _continuation_for_task("progress-replay", task_id, call_id, 1), "test-token-alpha")
-        with sqlite3.connect(database) as connection: second_deadline = connection.execute("SELECT agent_reconnect_deadline FROM calls WHERE call_id = ?", (call_id,)).fetchone()[0]; connection.execute("UPDATE calls SET agent_reconnect_deadline = ? WHERE call_id = ?", ((datetime.now(UTC) + timedelta(seconds=31)).isoformat(), call_id)); connection.commit()
+        with sqlite3.connect(database) as connection: second_deadline = connection.execute("SELECT agent_reconnect_deadline FROM calls WHERE call_id = ?", (call_id,)).fetchone()[0]
         _, waiting, _ = _post(port, certificate, _continuation_for_task("progress-waiting", task_id, call_id, 2), "test-token-alpha")
+        with sqlite3.connect(database) as connection: third_deadline = connection.execute("SELECT agent_reconnect_deadline FROM calls WHERE call_id = ?", (call_id,)).fetchone()[0]
     finally: _stop(process)
-    assert _structured(delivered)["status"] == "in_progress" and _structured(replayed) == _structured(delivered)
-    assert first_deadline == second_deadline and first_deadline is not None and datetime.fromisoformat(first_deadline) - datetime.now(UTC) > timedelta(seconds=240)
+    assert _structured(delivered)["status"] == "in_progress" and _structured(delivered)["event_seq"] == 2 and _structured(replayed) == _structured(delivered)
+    assert first_deadline == second_deadline == third_deadline and first_deadline is not None and datetime.fromisoformat(first_deadline) - datetime.now(UTC) > timedelta(seconds=240)
     assert _structured(waiting)["status"] in {"heartbeat", "waiting"}
 
 
@@ -106,7 +118,8 @@ def test_tls_task_progress_rejects_invalid_foreign_and_expired_agent_releases_bu
         created = _call(port, certificate, "progress-security"); call_id, task_id = created["call_id"], created["interaction_id"]; assert isinstance(call_id, str) and isinstance(task_id, str)
         owner_cookie, owner_csrf = _login(port, certificate); other_cookie, other_csrf = _login(port, certificate); owner = _headers(owner_cookie, owner_csrf, port); assert _accept(port, certificate, call_id, owner)[0] == 200
         with sqlite3.connect(database) as connection: before = connection.execute("SELECT state, owner_device_id, owner_session_id FROM calls WHERE call_id = ?", (call_id,)).fetchone(); events = connection.execute("SELECT event_seq FROM events WHERE call_id = ?", (call_id,)).fetchall()
-        bad = [_submit(port, certificate, call_id, "empty", "in_progress", "   ", owner), _submit(port, certificate, call_id, "wrong", "other", "x", owner), _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "mixed", "status": "in_progress", "report": "x", "confirmed": False}, headers=owner), _submit(port, certificate, call_id, "foreign", "in_progress", "x", _headers(other_cookie, other_csrf, port))]
+        cross_site = dict(owner); cross_site["Origin"] = "https://evil.example"
+        bad = [_submit(port, certificate, call_id, "empty", "in_progress", "   ", owner), _submit(port, certificate, call_id, "wrong", "other", "x", owner), _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "mixed", "status": "in_progress", "report": "x", "confirmed": False}, headers=owner), _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "cross-site", "status": "in_progress", "report": "x"}, headers=cross_site), _submit(port, certificate, call_id, "foreign", "in_progress", "x", _headers(other_cookie, other_csrf, port))]
         with sqlite3.connect(database) as connection: after = connection.execute("SELECT state, owner_device_id, owner_session_id FROM calls WHERE call_id = ?", (call_id,)).fetchone(); operations = connection.execute("SELECT count(*) FROM submission_operations WHERE call_id = ?", (call_id,)).fetchone()[0]; after_events = connection.execute("SELECT event_seq FROM events WHERE call_id = ?", (call_id,)).fetchall(); connection.execute("UPDATE calls SET state = 'in_progress', agent_reconnect_deadline = ? WHERE call_id = ?", ((datetime.now(UTC) - timedelta(seconds=1)).isoformat(), call_id)); connection.commit()
         _stop(process); process = _start(config); _wait_for_listener(process, port); _, terminal, _ = _post(port, certificate, _continuation_for_task("progress-expired", task_id, call_id, 1), "test-token-alpha"); next_call = _call(port, certificate, "progress-after-expiry")
     finally: _stop(process)
