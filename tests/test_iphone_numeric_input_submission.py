@@ -18,17 +18,20 @@ from test_mcp_continuation import _continuation
 from test_mcp_wait_leg import _with_timeout
 
 
-def _numeric_call(port: int, certificate: Path, request_id: str, input_type: str) -> dict[str, object]:
+def _numeric_call(
+    port: int, certificate: Path, request_id: str, input_type: str, default_value: str | None = " 7 "
+) -> dict[str, object]:
     request = _with_timeout(request_id, 2)
     request["params"]["name"] = "get_user_input"
     request["params"]["arguments"] = {
         "title": "Numeric value",
         "prompt": "<script>enter a numeric value</script>",
-        "default_value": " 7 ",
         "input_type": input_type,
         "request_id": request_id,
         "client_timeout_seconds": 2,
     }
+    if default_value is not None:
+        request["params"]["arguments"]["default_value"] = default_value
     _, response, _ = _post(port, certificate, request, "test-token-alpha")
     return _structured(response)
 
@@ -60,14 +63,16 @@ class _NumericPageParser(HTMLParser):
             self.endpoint = values["data-endpoint"]
 
 
-def _parsed_numeric_page(html: object, call_id: str, input_type: str) -> tuple[str, str]:
+def _parsed_numeric_page(
+    html: object, call_id: str, input_type: str, expected_default: str = " 7 "
+) -> tuple[str, str]:
     source = str(html)
     parser = _NumericPageParser()
     parser.feed(source)
     assert parser.endpoint == f"/api/calls/{call_id}/submissions"
     assert isinstance(parser.csrf, str) and parser.csrf
     assert parser.input_type == input_type
-    assert parser.default == " 7 "
+    assert parser.default == expected_default
     assert "<script>enter a numeric value</script>" not in source
     assert "&lt;script&gt;enter a numeric value&lt;/script&gt;" in source
     assert "crypto.randomUUID()" in source
@@ -134,6 +139,51 @@ def test_tls_accepted_iphone_numeric_input_is_typed_replayable_and_agent_readabl
     assert state == ("answered", "iphone_web", "ios", None)
     assert [event[0] for event in events] == [1, 2]
     assert f'"user_input":{typed}' in events[-1][1]
+
+
+@pytest.mark.parametrize(
+    ("input_type", "raw", "typed", "submission_id"),
+    [("integer", " 8 ", 8, "integer-no-default"), ("float", " 2.25 ", 2.25, "float-no-default")],
+)
+def test_tls_accepted_iphone_numeric_input_without_default_renders_empty_control_and_submits_typed_result(
+    tmp_path: Path, input_type: str, raw: str, typed: int | float, submission_id: str
+) -> None:
+    port = _free_port()
+    config, certificate = _write_operator_config(tmp_path, port)
+    _configure_phone_route(config)
+    process = _start(config)
+    _wait_for_listener(process, port)
+    try:
+        created = _numeric_call(port, certificate, f"numeric-no-default-{input_type}", input_type, default_value=None)
+        call_id, interaction_id = created["call_id"], created["interaction_id"]
+        assert isinstance(call_id, str) and isinstance(interaction_id, str)
+        cookie, csrf = _login(port, certificate)
+        headers = _headers(cookie, csrf, port)
+        assert _accept(port, certificate, call_id, headers)[0] == 200
+        owner_page = _request(port, certificate, "GET", f"/calls/{call_id}", headers={"Cookie": cookie})
+        endpoint, rendered_csrf = _parsed_numeric_page(owner_page[2], call_id, input_type, expected_default="")
+        submitted = _request(
+            port,
+            certificate,
+            "POST",
+            endpoint,
+            body={"submission_id": submission_id, "user_input": raw},
+            headers=_headers(cookie, rendered_csrf, port),
+        )
+        _, continuation, _ = _post(
+            port, certificate, _continuation(f"numeric-no-default-event-{input_type}", interaction_id, call_id, 1), "test-token-alpha"
+        )
+    finally:
+        _stop(process)
+
+    assert owner_page[0] == submitted[0] == 200
+    assert isinstance(submitted[2], dict)
+    assert submitted[2]["status"] == submitted[2]["call_state"] == "answered"
+    assert submitted[2]["input_type"] == input_type
+    assert submitted[2]["user_input"] == typed
+    assert submitted[2]["handled_on"] == "iphone_web"
+    assert submitted[2]["terminal_platform"] == "ios"
+    assert _structured(continuation) == submitted[2]
 
 
 def test_tls_iphone_numeric_input_rejects_invalid_types_and_untrusted_writers_without_mutation(tmp_path: Path) -> None:
