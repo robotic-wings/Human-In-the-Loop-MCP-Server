@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
@@ -47,12 +48,18 @@ def test_tls_accepted_iphone_text_and_multiline_drafts_hydrate_and_survive_resta
         page = _request(port, cert, "GET", f"/calls/{text_id}", headers={"Cookie": cookie})
         _stop(process); process = _start(config); _wait_for_listener(process, port)
         recovered = _draft(port, cert, text_id, "GET", headers={"Cookie": cookie})
+        submitted = _request(port, cert, "POST", f"/api/calls/{text_id}/submissions", body={"submission_id": "hydrated-text-submit", "user_input": "text draft"}, headers=headers)
     finally:
         _stop(process)
     assert first_get[0] == 200 and isinstance(first_get[2], dict) and first_get[2]["body"] is None
     assert saved[0] == 200 and isinstance(saved[2], dict) and saved[2]["draft_version"] == 1
-    assert page[0] == 200 and 'data-draft-input="text"' in str(page[2]) and "text draft" in str(page[2]) and 'data-draft-status="saved"' in str(page[2]).lower()
+    text_page = str(page[2])
+    assert page[0] == 200 and 'data-draft-input="text"' in text_page and "text draft" in text_page and 'data-draft-status="saved"' in text_page.lower()
+    # The persisted value belongs in the actual final-answer control, not an unrelated draft scratchpad.
+    assert re.search(r'<textarea(?=[^>]*name="user_input")(?=[^>]*data-draft-input="text")[^>]*>text draft</textarea>', text_page)
+    assert re.search(r'textarea\[name=user_input\].*?fetch\(.*?/submissions', text_page, re.DOTALL)
     assert recovered[0] == 200 and isinstance(recovered[2], dict) and recovered[2]["body"] == "text draft"
+    assert submitted[0] == 200 and isinstance(submitted[2], dict) and submitted[2]["user_input"] == "text draft"
 
     # Multiline is a separate interaction because the first accepted call remains busy.
     port = _free_port(); config, cert = _write_operator_config(tmp_path / "multi", port); _configure_phone_route(config); process = _start(config); _wait_for_listener(process, port)
