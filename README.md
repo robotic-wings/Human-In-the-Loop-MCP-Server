@@ -1,598 +1,132 @@
 # Human-In-the-Loop MCP Server
 
-![](https://badge.mcpx.dev?type=server 'MCP Server')
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![PyPI version](https://badge.fury.io/py/hitl-mcp-server.svg)](https://badge.fury.io/py/hitl-mcp-server)
+This artifact provides the GUI-free central Human-in-the-Loop service. It
+accepts authenticated MCP requests over HTTPS at `/mcp`, persists calls and
+results in SQLite, serves the phone web interface from the same HTTPS listener,
+and coordinates configured notification routes.
 
-A powerful **Model Context Protocol (MCP) Server** that enables AI assistants like Claude to interact with humans through intuitive GUI dialogs. This server bridges the gap between automated AI processes and human decision-making by providing real-time user input tools, choices, confirmations, and feedback mechanisms.
+## What is shipped
 
-## 🚀 Features
+The packaged wheel contains:
 
-### 💬 Interactive Dialog Tools
-- **Text Input**: Get text, numbers, or other data from users with validation
-- **Multiple Choice**: Present options for single or multiple selections  
-- **Multi-line Input**: Collect longer text content, code, or detailed descriptions
-- **Confirmation Dialogs**: Ask for yes/no decisions before proceeding with actions
-- **Information Messages**: Display notifications, status updates, and results
-- **Delegate a Task to a Human**: Hand off one action the assistant can't do itself (a physical-world action is the common case) and wait (long-running) for the human to report **Completed / Failed / Still-progressing**, with an optional written note and file/image attachments. Starts with a non-focus-stealing **ringing notification** (so it doesn't interrupt), survives client tool-call timeouts via a heartbeat protocol, detects assistant disconnection, and records every interaction (inputs, choices, confirmations, and delegated tasks) to a local **Logs** archive.
-- **Health Check**: Monitor server status and GUI availability
+- `hitl-central-service`, the only console entry point;
+- `central_service.py`, the HTTPS/MCP and web entry point; and
+- `call_coordinator.py`, the SQLite-backed call coordinator.
 
-### 🎨 Modern Cross-Platform GUI
-- **Windows**: Modern Windows 11-style interface with beautiful styling, hover effects, and enhanced visual design
-- **macOS**: Native macOS experience with SF Pro Display fonts and proper window management
-- **Linux**: Ubuntu-compatible GUI with modern styling and system fonts
+The independent desktop terminal is not shipped by this artifact. This artifact
+does not provide a local GUI, a management console, a local MCP server, stdio,
+or a fallback to local interaction. Legacy source files are not supported
+runtime entry points.
 
-### ⚡ Advanced Features
-- **Non-blocking Operation**: All dialogs run in separate threads to prevent blocking
-- **Timeout Protection**: Configurable 5-minute timeouts prevent hanging operations
-- **Platform Detection**: Automatic optimization for each operating system
-- **Modern UI Design**: Beautiful interface with smooth animations and hover effects
-- **Error Handling**: Comprehensive error reporting and graceful recovery
-- **Keyboard Navigation**: Full keyboard shortcuts support (Enter/Escape)
+## Start the central HTTPS service
 
-## 📦 Installation & Setup
-
-### Quick Install with uvx (Recommended)
-
-The easiest way to use this MCP server is with `uvx`:
+Install the distributed wheel in an isolated Python environment, supply trusted
+TLS material and protected credential files, then start the service with an
+explicit JSON configuration file:
 
 ```bash
-# Install and run directly
-uvx hitl-mcp-server
-
-# Or use the underscore version
-uvx hitl_mcp_server
+hitl-central-service --config <CENTRAL_SERVICE_CONFIG.json>
 ```
 
-### Manual Installation
+The service has no default listener. The command requires `--config`; a
+no-argument launch and the legacy `--stdio`, `--local`, and `--service`
+modes are rejected with a non-zero exit.
 
-1. **Install from PyPI**:
-   ```bash
-   pip install hitl-mcp-server
-   ```
+## Configuration
 
-2. **Run the server**:
-   ```bash
-   hitl-mcp-server
-   # or
-   hitl_mcp_server
-   ```
-
-### Development Installation
-
-1. **Clone the repository**:
-   ```bash
-   git clone https://github.com/GongRzhe/Human-In-the-Loop-MCP-Server.git
-   cd Human-In-the-Loop-MCP-Server
-   ```
-
-2. **Install in development mode**:
-   ```bash
-   pip install -e .
-   ```
-
-## 🔧 Claude Desktop Configuration
-
-To use this server with Claude Desktop, add the following configuration to your `claude_desktop_config.json`:
-
-### Using uvx (Recommended)
+`<CENTRAL_SERVICE_CONFIG.json>` must be a JSON object. Replace every marked
+placeholder with environment-specific values. Do not put credential values in
+the configuration file, command line, source control, or notifications.
 
 ```json
 {
-  "mcpServers": {
-    "human-in-the-loop": {
-      "command": "uvx",
-      "args": ["hitl-mcp-server"]
-    }
-  }
+  "listen_host": "<LISTEN_ADDRESS>",
+  "listen_port": 8443,
+  "web_base_url": "https://<WEB_HOST>:8443",
+  "data_dir": "<CENTRAL_DATA_DIRECTORY>",
+  "https_certfile": "<PROTECTED_TLS_CERTIFICATE_PATH>",
+  "https_keyfile": "<PROTECTED_TLS_PRIVATE_KEY_PATH>",
+  "agent_credentials_file": "<PROTECTED_AGENT_CREDENTIALS_JSON_PATH>",
+  "terminal_credentials_file": "<PROTECTED_TERMINAL_CREDENTIALS_JSON_PATH>",
+  "operator_credentials_file": "<PROTECTED_OPERATOR_CREDENTIALS_JSON_PATH>",
+  "eligible_desktop_device_ids": ["<CONFIGURED_DESKTOP_DEVICE_ID>"],
+  "bark_enabled": false
 }
 ```
 
-### Using pip installation
-
-```json
-{
-  "mcpServers": {
-    "human-in-the-loop": {
-      "command": "hitl-mcp-server",
-      "args": []
-    }
-  }
-}
-```
-
-### Configuration File Locations
-
-- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
-- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
-- **Linux**: `~/.config/Claude/claude_desktop_config.json`
-
-### Important Note for macOS Users
-
-**Note:** You may need to allow Python to control your computer in **System Preferences > Security & Privacy > Accessibility** for the GUI dialogs to work properly.
-
-
-After updating the configuration, restart Claude Desktop for the changes to take effect.
-
-### Running over HTTP (optional)
-
-By default the server uses **stdio** (the MCP client launches it as a subprocess). To instead serve over **HTTP** on a port, set `HUMAN_LOOP_HTTP_PORT`:
-
-```bash
-HUMAN_LOOP_HTTP_PORT=8000 python human_loop_server.py
-# endpoint: http://127.0.0.1:8000/mcp   (bind address via HUMAN_LOOP_HTTP_HOST, default 127.0.0.1)
-```
-
-Then point a URL-based MCP client at `http://127.0.0.1:8000/mcp`. Notes:
-- HTTP mode is long-running — stop it with Ctrl+C (it does not exit on stdin EOF like stdio does).
-- The GUI dialogs still appear on **this machine's** desktop, so HTTP is mainly useful when the client runs on the same machine but connects by URL; a remote client's user won't see the local pop-ups.
-- Without the env var, behavior is unchanged (stdio).
-
-#### HTTPS / TLS (required by newer clients)
-
-Some clients — including recent **Claude Desktop** — only accept **HTTPS** URL connectors, and (being Electron/Chromium) they validate the certificate against your **system trust store**. A bare self-signed cert is rejected with *"This Connection Is Not Private" / `ERR_CERT_AUTHORITY_INVALID`*. You must **provide your own** PEM certificate + private key that the client trusts.
-
-**Setup:** in the **Management Console → Server tab**, tick **Enable HTTPS** and point the **Certificate** and **Private key** fields at your PEM files (the **Browse…** buttons help), then **Install / Update**. The endpoint becomes `https://host:port/mcp`.
-
-**Getting a trusted cert** (the console does *not* generate one for you):
-- **Local/LAN:** [`mkcert`](https://github.com/FiloSottile/mkcert) is the easiest — `mkcert -install` once, then e.g. `mkcert 127.0.0.1 192.168.0.102 localhost` produces a `.pem` pair trusted on this machine. Point the fields at those files.
-- **Public domain:** use a real CA (e.g. Let's Encrypt).
-
-**Serving on multiple IPs.** Set **Bind host** to `0.0.0.0` (the default) to serve on every interface at once. Your certificate's **SAN list must cover each address clients connect to** (e.g. `127.0.0.1` and your LAN IP) — a single multi-SAN cert is valid on all of them, no per-IP listener needed. When bound to `0.0.0.0`, the Server tab lists a `https://…/mcp` endpoint for each reachable address.
-
-To run the server directly instead of via the console, set the TLS env vars alongside the port:
-
-```bash
-HUMAN_LOOP_HTTP_PORT=8000 \
-HUMAN_LOOP_HTTPS=1 \
-HUMAN_LOOP_HTTPS_CERT=/path/to/server.crt \
-HUMAN_LOOP_HTTPS_KEY=/path/to/server.key \
-python human_loop_server.py
-# endpoint: https://127.0.0.1:8000/mcp
-```
-
-If `HUMAN_LOOP_HTTPS=1` but the cert/key file is missing, the server refuses to start with a clear message (exit code 2) rather than serving plaintext.
-
-### Running as a background service (cross-platform)
-
-The **Management Console → Server tab → Install / Update** registers the server as a per-user background service that **auto-starts at every login** with no terminal window. Because the server pops GUI dialogs, it must run in your **graphical login session** on every OS (never a headless Windows Service / macOS LaunchDaemon), so each platform uses its user-session autostart mechanism:
-
-| OS | Mechanism | Location | No-window trick |
-|----|-----------|----------|-----------------|
-| **macOS** | LaunchAgent (launchd) | `~/Library/LaunchAgents/com.human-loop.hitl.plist` | accessory activation policy → no Dock icon |
-| **Linux** | systemd `--user` service | `~/.config/systemd/user/human-loop-hitl.service` | runs detached; no terminal |
-| **Windows** | Startup-folder launcher | `…\Start Menu\Programs\Startup\human-loop-hitl.vbs` | launched via `pythonw.exe` → no console |
-
-All three just run `python human_loop_server.py --service`; in `--service` mode the server reads host/port/HTTPS from `~/.human_loop_config.json` (so the service definition stays trivial and settings live in one place). Changing a setting in the console and clicking **Install / Update** rewrites the definition and restarts the service. Default MCP behavior is unchanged: launched **without** `--service` (e.g. by Claude Desktop over stdio), the server still runs stdio as before.
-
-The service logic lives in `service_manager.py` (stdlib-only). macOS is fully exercised; the Linux/Windows backends follow each platform's standard pattern.
-
-## 🛠️ Available Tools
-
-> **All interactive tools share one lifecycle.** Every tool below (and `assign_task_to_human`) first rings a small, **non-focus-stealing notification toast** (View / Cancel) instead of stealing focus, then waits with a **heartbeat** so a slow human never trips your client's tool-call timeout. Each accepts two extra optional parameters:
-> - `client_timeout_seconds` (int): your own per-tool-call timeout. It must be at least `2`; lower values return `status: "invalid_client_timeout"`. For accepted values, the server returns `status: "heartbeat"` (nobody has answered yet) or `status: "opened"` (the human clicked View) before this deadline. On either, **re-call the same tool with the returned `interaction_id` and do not reply to the user in between.** Omit to use the server's configured default. If the GUI is still starting after its readiness wait, the call instead returns `status: "gui_starting"`, `retryable: true`; retry the call.
-> - `interaction_id` (str): leave empty to start; pass back the id from a `heartbeat`/`opened` response to keep the same dialog alive.
->
-> The human's final answer arrives with `needs_continuation: false` and the tool's usual fields. Clicking **Cancel** on the notification returns the tool's cancelled/declined result.
-
-### 1. `get_user_input`
-Get single-line text, numbers, or other data from users.
-
-**Parameters:**
-- `title` (str): Dialog window title
-- `prompt` (str): Question/prompt text  
-- `default_value` (str): Pre-filled value (optional)
-- `input_type` (str): "text", "integer", or "float" (default: "text")
-- `client_timeout_seconds` (int, optional), `interaction_id` (str, optional): the shared heartbeat protocol above.
-
-**Example Usage:**
-```python
-result = await get_user_input(
-    title="Project Setup",
-    prompt="Enter your project name:",
-    default_value="my-project",
-    input_type="text"
-)
-```
-
-### 2. `get_user_choice`
-Present multiple options for user selection.
-
-**Parameters:**
-- `title` (str): Dialog window title
-- `prompt` (str): Question/prompt text
-- `choices` (List[str]): Available options
-- `allow_multiple` (bool): Allow multiple selections (default: false)
-- `client_timeout_seconds` (int, optional), `interaction_id` (str, optional): the shared heartbeat protocol above.
-
-**Example Usage:**
-```python
-result = await get_user_choice(
-    title="Framework Selection",
-    prompt="Choose your preferred framework:",
-    choices=["React", "Vue", "Angular", "Svelte"],
-    allow_multiple=False
-)
-```
-
-### 3. `get_multiline_input`
-Collect longer text content, code, or detailed descriptions.
-
-**Parameters:**
-- `title` (str): Dialog window title
-- `prompt` (str): Question/prompt text
-- `default_value` (str): Pre-filled text (optional)
-- `client_timeout_seconds` (int, optional), `interaction_id` (str, optional): the shared heartbeat protocol above.
-
-**Example Usage:**
-```python
-result = await get_multiline_input(
-    title="Code Review",
-    prompt="Please provide your detailed feedback:",
-    default_value=""
-)
-```
-
-### 4. `show_confirmation_dialog`
-Ask for yes/no confirmation before proceeding.
-
-**Parameters:**
-- `title` (str): Dialog window title
-- `message` (str): Confirmation message
-- `client_timeout_seconds` (int, optional), `interaction_id` (str, optional): the shared heartbeat protocol above.
-
-**Example Usage:**
-```python
-result = await show_confirmation_dialog(
-    title="Delete Confirmation",
-    message="Are you sure you want to delete these 5 files? This action cannot be undone."
-)
-```
-
-### 5. `show_info_message`
-Display information, notifications, or status updates.
-
-**Parameters:**
-- `title` (str): Dialog window title
-- `message` (str): Information message
-- `client_timeout_seconds` (int, optional), `interaction_id` (str, optional): the shared heartbeat protocol above.
-
-**Example Usage:**
-```python
-result = await show_info_message(
-    title="Process Complete",
-    message="Successfully processed 1,247 records in 2.3 seconds!"
-)
-```
-
-### 6. `assign_task_to_human`
-Delegate **one atomic action the assistant can't do itself** to a human and wait — potentially for a long time — for them to report back, optionally with a written note and file/image attachments. A physical-world action is the common case, but the defining trait is just that the assistant can't do it — anything requiring a person (their hands, presence, judgment, credentials, or access the assistant lacks) qualifies.
-
-**Scope — what this tool is (and is NOT) for.** The human's report describes *task execution*, so:
-- **Not for questions / information.** Don't use it to ask the human anything (a date, a status, a preference) — use `get_user_input` / `get_multiline_input` / `get_user_choice`. The report is a completion status, not an answer.
-- **One atomic action per task.** Don't bundle multiple steps ("survey AND photograph AND check soil") into one call — assign them as separate sequential tasks, adjusting each from the previous report (step-by-step direction is the point).
-- **A work order, not a chat message.** Keep `task_description` to a single actionable instruction, not background + questions + a checklist.
-
-The server also returns a non-blocking `advisory` field when a `task_description` looks like it may be violating these (a numbered list, multiple questions, or unusually long).
-
-**Parameters:**
-- `task_title` (str): Short title of the task.
-- `task_description` (str): Detailed instructions for the human.
-- `task_id` (str, optional): Leave empty to **start** a new task. Pass back the previous call's `task_id` to **continue** after a heartbeat or interim update. A task-window result with `reason: "assistant_disconnected"` is also recoverable: pass its original `task_id` to reopen it with the autosaved draft and attachments.
-- `client_timeout_seconds` (int, default `240`): **Your own per-tool-call timeout.** It must be at least `2`; lower values return `status: "invalid_client_timeout"`. Claude Desktop hard-codes ~240s, so pass `240`. Claude Code has no timeout, so pass a large value like `3600`.
-- `max_result_bytes` (int, default `1000000`): **Your client's max tool-result size, in bytes.** Claude Desktop rejects results over ~1 MB, so pass `1000000`; Claude Code allows much larger (configurable) results, so pass a big value (e.g. `30000000`). The note itself must fit this limit. Attachments that push the result over the remaining budget are submitted as path references rather than inline content, so attachment-only overflow is not rejected or lost.
-- `context_note` (str, optional): Extra context shown to the human.
-
-**Ringing notification first (doesn't interrupt).** A task does **not** immediately pop a full window. Instead a small **notification toast** appears in the top-right corner **without stealing focus**, and a classic telephone ringtone (`notify.wav`) loops to get attention:
-- **View** → stops the ring and opens the full task window immediately. The tool returns `status: "opened"` — treat it like a heartbeat (re-call with the same `task_id`, don't reply to the user).
-- **Cancel** → stops the ring; the task is reported **failed** (`status: "failed"`, `reason: "declined_via_notification"`).
-The ring loops until the user clicks (or the assistant disconnects, in which case the toast auto-closes). Continuing an *in-progress* task reopens the window directly **without** re-ringing — unless a long time has passed since the human last acted (a "follow-up"), in which case it rings again.
-
-**One window = one submission.** Whenever the human clicks a button, the current note + attachments are sent to the AI and **the window closes**. The only difference between the buttons is whether the task is finished:
-- **✅ Completed** / **❌ Failed** — terminal; the task ends.
-- **⏳ Still progressing** — a formal interim update; the task is *not* finished. The AI decides whether to reopen a fresh window (by calling again with the same `task_id`, optionally replying via `context_note`) or to finish. (An empty interim update is rejected in the UI to avoid accidental blank submissions.)
-
-**Long-running heartbeat protocol (important):**
-Claude Desktop enforces a hard ~4-minute per-tool-call timeout that cannot be disabled from the server. To keep the human's dialog alive indefinitely, the server returns a **heartbeat** shortly before your `client_timeout_seconds` elapses:
-
-- `status: "heartbeat"` (`human_action: false`) → the human hasn't submitted anything yet (or hasn't clicked the notification). **Do not respond to the user or reason about the task — immediately call the tool again with the same `task_id`.** The same window/toast (and everything typed) stays intact; a countdown warns the human a few seconds before each sync so they can pause.
-- `status: "opened"` (`human_action: false`) → the human clicked **View** on the notification and the task window is now open. Also a keepalive — re-call with the same `task_id`, don't reply.
-- `status: "in_progress"` (`human_action: true`) → a genuine interim update; **the window has closed** and the task isn't finished. Process it, then decide: re-call with the same `task_id` to reopen a fresh window, or finish.
-- `status: "completed"` / `"failed"` (`human_action: true`) → the human's report (`resubmittable: true`). The session is **kept open for your review** — not destroyed. If the deliverable is insufficient (or `attachments_omitted_for_size` is true because an attachment was too big to inline under `max_result_bytes`), you may call again with the same `task_id` and an updated `task_description` to request a re-submission; if satisfied, just stop (the session is reaped automatically).
-- `status: "cancelled"` without `reason: "assistant_disconnected"` → terminal (`needs_continuation: false`); the `task_id` is gone. A task-window result with `reason: "assistant_disconnected"` is recoverable with its original `task_id`.
-
-For accepted timeouts (at least `2` seconds), the single open window is **reused** across heartbeats (never re-created), and the heartbeat leg ends before your `client_timeout_seconds` deadline.
-
-**Liveness & disconnect safety (so no zombie windows):**
-The window continuously shows its connection state — `Assistant connected · next check-in in m:ss (task <id> · opened <time>)` — refreshed on every heartbeat, and displays the short `task_id` + open time so duplicate windows are easy to tell apart. If the assistant stops checking in (conversation ended, client died, or it forgot to re-call), the window shows `The assistant may have disconnected…` and, after a further grace period, **auto-saves any draft and attachment list and closes itself**. Re-call with that original `task_id` to reopen the task with the saved draft and attachments; the task-window result carries `reason: "assistant_disconnected"`.
-
-Human submissions with attachments are returned as **content blocks**: images inline (the model can see them) and other files as embedded resources. The task window shows a **live submission-size counter** (text + attachments vs your `max_result_bytes`). A note that alone exceeds the budget blocks submission until shortened. When only attachments exceed the remaining budget, submission stays available and those attachments are returned as path references instead of inline content (and are still saved in full to the Logs). Every submission is also archived to the **Logs** (see below).
-
-**Example Usage:**
-```python
-# First call — starts the task and opens the dialog
-res = await assign_task_to_human(
-    task_title="Reboot the staging server",
-    task_description="Please reboot staging and confirm the app comes back up.",
-    client_timeout_seconds=240,   # Claude Desktop; use 3600 for Claude Code
-)
-# If res["status"] == "heartbeat": call again with res["task_id"] (no user-facing reply)
-# When res is a content list with status "completed": you're done.
-```
-
-### 7. `health_check`
-Check server status and GUI availability.
-
-**Example Usage:**
-```python
-status = await health_check()
-# Returns detailed platform and functionality information
-```
-
-## 🖥️ Management Console
-
-A standalone, tabbed GUI (`management_console.py`) is the operator's control panel. Run it with:
-
-```bash
-python management_console.py    # or, if installed: hitl-management-console
-```
-
-Tabs:
-- **Logs** — browse, open attachments in, and delete the recorded interactions: every input/choice/confirmation/info call and every delegated task (see below).
-- **User Profile** — your name, role, responsibilities, and how you'd like the AI to communicate with you. The server surfaces this through channels the model actually reads: the MCP **`initialize` instructions** and the description of a dedicated **`get_operator_profile`** tool (tool descriptions are always in the model's context), plus a callable tool that returns it. (It is *not* only in the guidance prompt — MCP prompts are user-invoked and most clients never auto-load them.) Leaving role/responsibilities empty means "can be assigned any task." Because instructions/tool descriptions are read at server startup, **take the Server Offline then Online after editing your profile** to refresh what the AI sees.
-- **Server** — configure the HTTP(S) endpoint (port, bind host, TLS cert) and **Install / Update** the server as a **background OS service** that auto-starts at every login with no terminal window. Tick **Enable HTTPS** to serve TLS (required by newer clients like Claude Desktop) and point the **Certificate** / **Private key** fields at your own PEM files. The service runs independently of the console — closing the console does **not** stop it; use **Uninstall** to remove it, or **View log** to debug. (Point a URL-based MCP client at the shown `http(s)://host:port/mcp` endpoint; dialogs pop on this machine's desktop.) See [Running as a background service](#running-as-a-background-service-cross-platform) for how it's registered on each OS.
-- **Task Options** — default task timeout, default max result size, and whether file/image attachments are enabled. The timeout/size defaults are **fallbacks**: used only when the AI doesn't pass its own value.
-- **Notification** — pick the incoming-task ringtone (a `.wav`, or the bundled `notify.wav`), preview it, or mute. You can also enable Bark notifications and set their destination URL.
-
-#### Bark notifications
-
-Bark notifications are disabled by default (`bark_enabled: false`), and the Bark URL is empty (`bark_url: ""`). To configure them, open **HITL Settings → Notification**, enter your own full `http://` or `https://` Bark URL including its device-key path, select **Enable Bark notifications**, and click **Save**. The URL is saved in your local `~/.human_loop_config.json` file (or the path selected by `HUMAN_LOOP_CONFIG`); keep it private. Bark enablement is independent of the ringtone **Mute** setting.
-
-The server starts a Bark request asynchronously when an interactive tool creates a new ringing toast. It also sends one when a dormant task creates a new toast after the existing three-minute idle threshold. Heartbeat and `opened` continuations, and immediate same-ID reopens that do not create a toast, do not send another request. The toast title and preview are URL-encoded into the Bark request.
-
-Delivery is best-effort. Each async request has an absolute 2.5-second total attempt deadline measured from scheduling. It covers the cancellable HTTP request, waiting for response headers, and closing the response stream; the response body is not read. There are no retries, and failures do not change the GUI or MCP result. This is not a hard-real-time guarantee for every OS networking call: asyncio/AnyIO cancellation cannot forcibly terminate an OS resolver call already running in the shared default resolver executor, so that resolver call can continue after the Bark attempt is cancelled. Resolution uses the shared executor; this limitation does not mean a per-push worker is abandoned or created.
-
-Settings persist to `~/.human_loop_config.json` (override with `HUMAN_LOOP_CONFIG`). The server reads this file live, so most changes apply without restarting it. Environment variables still win over the config file where both apply.
-
-> **Roadmap (not yet implemented):** the config schema is versioned and structured to grow toward multi-operator, enterprise use — per-user login, an operator `secret_key` the AI must present to call in, and organization "super accounts" that control which settings each user may change.
-
-## 📤 Logs
-
-**Every** human-in-the-loop interaction is archived to disk — not just delegated tasks. That means each `get_user_input` / `get_user_choice` / `get_multiline_input` / `show_confirmation_dialog` / `show_info_message` call (the prompt shown and the human's answer), plus every `assign_task_to_human` submission (the AI's command + description, the human's note, and copies of all attachments). Nothing is lost when a window is cleared or closed.
-
-- **Location:** `~/.human_loop_logs/` by default, or set the `HUMAN_LOOP_LOGS_DIR` environment variable. (The legacy `~/.human_loop_outbox/` / `HUMAN_LOOP_OUTBOX_DIR` are still honored, so existing archives keep working.)
-- **Layout:** one directory per interaction, each containing an `entry.json` (with `tool`, `kind`, `status`, the prompt, and the response) and an `attachments/` folder with copies of any files.
-- Browse/open/delete entries in the **Logs** tab of the Management Console (above).
-
-## 📋 Response Format
-
-All tools return structured JSON responses:
-
-```json
-{
-    "success": true,
-    "user_input": "User's response text",
-    "cancelled": false,
-    "platform": "windows",
-    "input_type": "text"
-}
-```
-
-**Common Response Fields:**
-- `success` (bool): Whether the operation completed successfully
-- `cancelled` (bool): Whether the user cancelled the dialog
-- `platform` (str): Operating system platform
-- `error` (str): Error message if operation failed
-- `status` (str, intermediate): `heartbeat` or `opened` while waiting (see the heartbeat protocol above); absent on the final answer
-- `needs_continuation` (bool): `true` on a `heartbeat`/`opened` response (re-call with the same `interaction_id`); `false` on the final answer
-- `interaction_id` (str): the id to pass back to continue the same dialog
-
-**Tool-Specific Fields:**
-- **get_user_input**: `user_input`, `input_type`
-- **get_user_choice**: `selected_choice`, `selected_choices`, `allow_multiple`
-- **get_multiline_input**: `user_input`, `character_count`, `line_count`
-- **show_confirmation_dialog**: `confirmed`, `response`
-- **show_info_message**: `acknowledged`
-- **assign_task_to_human**: `status` (`heartbeat` / `opened` / `in_progress` / `completed` / `failed` / `cancelled` / `session_not_found` / `expired`), `human_action`, `needs_continuation`, `task_id`. Human submissions are returned as a content list (summary text + inline images/files) rather than a plain dict.
-
-## 🧭 Recommended System Prompt
-
-Give the AI a "commander" persona so it drives the whole mission itself and does all user interaction through the HITL tools. Fill in the two bracketed values to match your client's limits (the same ones you set in the Management Console's **Task Options** tab).
+`listen_host`, `listen_port`, `web_base_url`, `data_dir`,
+`https_certfile`, and `https_keyfile` are required. `web_base_url` must be
+an HTTPS URL and is the authoritative source for phone-notification links; the
+service never infers it from request headers or the bound listener.
+
+The service creates its SQLite database and attachment archive below
+`data_dir`. Keep that directory and all credential files outside the repository
+and readable only by the service identity. The credential-file settings refer to
+separate protected JSON files for Agent, terminal, and operator credentials.
+An MCP deployment must provide Agent credentials, because calls to `/mcp` use
+Bearer authentication.
+
+## TLS and MCP clients
+
+The central service always listens with HTTPS. Supply a certificate and private
+key whose identity matches `<WEB_HOST>` (or the configured IP address), and
+configure every MCP, terminal, and phone client to trust the issuing authority.
+Do not disable certificate validation. Missing or invalid TLS material, or a
+non-HTTPS `web_base_url`, is a startup error; the service never falls back to
+plaintext HTTP.
+
+Point an HTTP(S)-capable MCP client to the central endpoint and send its
+protected Agent credential:
 
 ```text
-You are a top-tier mastermind and commander, exceptionally skilled at personally
-directing and personally carrying out the missions the user entrusts to you. You can
-obtain information from the user, present information to the user, and hand off the
-concrete tasks you cannot do yourself for the user to perform. You can accept MCP tool
-results no larger than [SPECIFY SIZE HERE] bytes, and you will set the max_result_bytes
-argument to this value whenever you call assign_task_to_human; your MCP tool-call timeout
-is [SPECIFY TIMEOUT HERE] seconds.
-
-You follow the ReAct paradigm, but while reasoning you also plan holistically and think
-long-term so that the entire mission gets completed. After receiving a user request, you
-think about what to do next, then call a tool (a search tool, a HITL tool, or another
-tool); then, combining the prior context with the result this tool returned, you decide
-what to do next, and loop like this. Your text output is for your own internal thinking
-only — all interaction with the user happens through the HITL tools. Only when the mission
-is complete, or the user asks you to stop, may your text output stop.
+https://<WEB_HOST>:8443/mcp
+Authorization: Bearer <AGENT_TOKEN_FROM_PROTECTED_CREDENTIAL_FILE>
 ```
 
-## 🧠 Best Practices for AI Integration
+The MCP client's exact configuration syntax is client-specific. It must issue
+HTTPS requests to `/mcp`; it must not launch this project as a
+`command`/`args` subprocess.
 
-### When to Use Human-in-the-Loop Tools
+## Data and operations
 
-1. **Ambiguous Requirements** - When user instructions are unclear
-2. **Decision Points** - When you need user preference between valid alternatives
-3. **Creative Input** - For subjective choices like design or content style
-4. **Sensitive Operations** - Before executing potentially destructive actions
-5. **Missing Information** - When you need specific details not provided
-6. **Quality Feedback** - To get user validation on intermediate results
+Call records, events, drafts, immutable results, and uploaded attachments are
+central-service archives under `data_dir`. They survive a central-service
+restart and are distinct from runtime logs. The service never treats a
+desktop-terminal local path as a stored attachment.
 
-### Example Integration Patterns
+This artifact does not install an OS background service or include an in-app
+management console. Process supervision, certificate issuance, credential
+provisioning, deployment, migration, and archive-retention decisions are
+outside this repository's startup instructions.
 
-#### File Operations
-```python
-# Get target directory
-location = await get_user_input(
-    title="Backup Location",
-    prompt="Enter backup directory path:",
-    default_value="~/backups"
-)
+## Troubleshooting
 
-# Choose backup type
-backup_type = await get_user_choice(
-    title="Backup Options",
-    prompt="Select backup type:",
-    choices=["Full Backup", "Incremental", "Differential"]
-)
+- A missing `--config` argument, invalid JSON, invalid TLS paths, or a
+  plaintext `web_base_url` causes an explicit startup error before a listener
+  is opened.
+- Verify that the configured HTTPS endpoint has a certificate trusted by the
+  MCP client and that the endpoint address matches the certificate identity.
+- Verify that the service identity can read the configured credential files and
+  write `data_dir`.
+- Do not attempt `python human_loop_server.py`, `management_console.py`, or
+  the former `hitl-management-console` entry point; they are not shipped
+  runtime entry points for this artifact.
 
-# Confirm before proceeding
-confirmed = await show_confirmation_dialog(
-    title="Confirm Backup",
-    message=f"Create {backup_type['selected_choice']} backup to {location['user_input']}?"
-)
+## Development
 
-if confirmed['confirmed']:
-    # Perform backup
-    await show_info_message("Success", "Backup completed successfully!")
-```
-
-#### Content Creation
-```python
-# Get content requirements
-requirements = await get_multiline_input(
-    title="Content Requirements",
-    prompt="Describe your content requirements in detail:"
-)
-
-# Choose tone and style
-tone = await get_user_choice(
-    title="Content Style",
-    prompt="Select desired tone:",
-    choices=["Professional", "Casual", "Friendly", "Technical"]
-)
-
-# Generate and show results
-# ... content generation logic ...
-await show_info_message("Content Ready", "Your content has been generated successfully!")
-```
-
-## 🔍 Troubleshooting
-
-### Common Issues
-
-**GUI Not Appearing**
-- Verify you're running in a desktop environment (not headless server)
-- Check if tkinter is installed: `python -c "import tkinter"`
-- Run health check: `health_check()` tool to diagnose issues
-
-**Permission Errors (macOS)**
-- Grant accessibility permissions in System Preferences > Security & Privacy > Accessibility
-- Allow Python to control your computer
-- Restart terminal after granting permissions
-
-**Import Errors**
-- Ensure package is installed: `pip install hitl-mcp-server`
-- Check Python version compatibility (>=3.8 required)
-- Verify virtual environment activation if using one
-
-**Claude Desktop Integration Issues**
-- Check configuration file syntax and location
-- Restart Claude Desktop after configuration changes
-- Verify uvx is installed: `pip install uvx`
-- Test server manually: `uvx hitl-mcp-server`
-
-**Dialog Timeout**
-- Default timeout is 5 minutes (300 seconds)
-- Dialogs will return with cancelled=true if user doesn't respond
-- Ensure user is present when dialogs are triggered
-
-### Debug Mode
-
-Enable detailed logging by running the server with environment variable:
-```bash
-HITL_DEBUG=1 uvx hitl-mcp-server
-```
-
-## 🏗️ Development
-
-### Project Structure
 ```
 Human-In-the-Loop-MCP-Server/
-├── human_loop_server.py       # Main server implementation
-├── management_console.py      # Tabbed operator console (Logs, Profile, Server, …)
-├── human_loop_config.py       # Shared config store (read by server + console)
-├── service_manager.py         # Cross-platform background-service install (launchd/systemd/Startup)
-├── notify.wav                # Default notification ringtone
-├── pyproject.toml            # Package configuration
-├── README.md                 # Documentation
-├── LICENSE                   # MIT License
-├── .gitignore               # Git ignore rules
+├── central_service.py          # HTTPS central-service entry point
+├── call_coordinator.py         # SQLite-backed call coordination
+├── pyproject.toml              # Package configuration and console script
+├── README.md                   # Documentation
+├── LICENSE                     # MIT License
+└── tests/                      # Automated tests
 ```
 
-### Contributing
+Run the central-service startup and installed-artifact tests before changing
+the documented launch contract.
 
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature-name`
-3. Make your changes with proper testing
-4. Follow code style guidelines (Black, Ruff)
-5. Add type hints and docstrings
-6. Submit a pull request with detailed description
+## License
 
-### Code Quality
-
-- **Formatting**: Black (line length: 88)
-- **Linting**: Ruff with comprehensive rule set
-- **Type Checking**: MyPy with strict configuration
-- **Testing**: Pytest for unit and integration tests
-
-## 🌍 Platform Support
-
-### Windows
-- Windows 10/11 with modern UI styling
-- Enhanced visual design with hover effects
-- Segoe UI and Consolas font integration
-- Full keyboard navigation support
-
-### macOS
-- Native macOS experience
-- SF Pro Display system fonts
-- Proper window management and focus
-- Accessibility permission handling
-
-### Linux
-- Ubuntu/Debian compatible
-- Modern styling with system fonts
-- Cross-distribution GUI support
-- Minimal dependency requirements
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🤝 Acknowledgments
-
-- Built with [FastMCP](https://github.com/jlowin/fastmcp) framework
-- Uses [Pydantic](https://pydantic-docs.helpmanual.io/) for data validation
-- Cross-platform GUI powered by tkinter
-- Inspired by the need for human-AI collaboration
-
-## 🔗 Links
-
-- **PyPI Package**: [https://pypi.org/project/hitl-mcp-server/](https://pypi.org/project/hitl-mcp-server/)
-- **Repository**: [https://github.com/GongRzhe/Human-In-the-Loop-MCP-Server](https://github.com/GongRzhe/Human-In-the-Loop-MCP-Server)
-- **Issues**: [Report bugs or request features](https://github.com/GongRzhe/Human-In-the-Loop-MCP-Server/issues)
-- **MCP Protocol**: [Learn about Model Context Protocol](https://modelcontextprotocol.io/)
-
-## 📊 Usage Statistics
-
-- **Cross-Platform**: Windows, macOS, Linux
-- **Python Support**: 3.8, 3.9, 3.10, 3.11, 3.12+
-- **GUI Framework**: tkinter (built-in with Python)
-- **Thread Safety**: Full concurrent operation support
-- **Response Time**: < 100ms dialog initialization
-- **Memory Usage**: < 50MB typical operation
-
----
-
-**Made with ❤️ for the AI community - Bridging humans and AI through intuitive interaction**
+This project is licensed under the MIT License; see [LICENSE](LICENSE).
