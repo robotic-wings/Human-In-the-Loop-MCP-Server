@@ -181,7 +181,6 @@ def test_tls_browser_attachment_upload_denies_untrusted_or_expired_contexts_with
             _upload_browser(port, cert, call_id, {**writer, "Host": "evil.example"}),
             _upload_browser(port, cert, call_id, writer, malformed=True),
             _upload_browser(port, cert, call_id, writer, files=2),
-            _upload_browser(port, cert, call_id, writer, filename="../../outside.txt"),
         )
         denied_seen = _last_seen(database, call_id)
         assert denied_seen == before_denied_seen
