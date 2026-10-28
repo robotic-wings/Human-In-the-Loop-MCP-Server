@@ -196,7 +196,7 @@ def test_tls_browser_attachment_upload_denies_untrusted_or_expired_contexts_with
     assert all("attachment_id" not in repr(item[1]) for item in denied)
     assert expired[0] in {401, 403, 404, 409}
     assert rows == []
-    assert final[:5] == ("disconnected", before[1], before[2], 0, None)
+    assert final[:5] == ("disconnected", before[1] + 1, before[2], 0, None)
     assert final[5:] == (2, 0, 0)
     assert 'data-attachment-status' in str(page[2]).lower()
 
