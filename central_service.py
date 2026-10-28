@@ -1271,6 +1271,54 @@ class _OperatorGateway:
             return HTTPStatus.BAD_REQUEST, result
         return HTTPStatus.CONFLICT, result
 
+    def upload_attachment(
+        self, session: str | None, csrf: str | None, origin: str | None, host: str | None,
+        call_id: str, writer_token: str | None, original_name: str,
+        media_type: str, content: bytes,
+    ) -> tuple[HTTPStatus, dict[str, object]]:
+        if (
+            not self._session_matches(session, csrf)
+            or origin != f"https://{self._expected_host}"
+            or host != self._expected_host
+            or not isinstance(session, str)
+            or not self._coordinator.browser_writer_matches(call_id, session, writer_token)
+        ):
+            return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+        result = self._coordinator.upload_iphone_attachment(
+            call_id, session, original_name, media_type, content
+        )
+        return self._attachment_response(result)
+
+    def reject_attachment_submission_limit(
+        self, session: str | None, csrf: str | None, origin: str | None, host: str | None,
+        call_id: str, writer_token: str | None,
+    ) -> tuple[HTTPStatus, dict[str, object]]:
+        if (
+            not self._session_matches(session, csrf)
+            or origin != f"https://{self._expected_host}"
+            or host != self._expected_host
+            or not isinstance(session, str)
+            or not self._coordinator.browser_writer_matches(call_id, session, writer_token)
+        ):
+            return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+        return self._attachment_response(
+            self._coordinator.reject_iphone_attachment_submission_limit(call_id, session)
+        )
+
+    @staticmethod
+    def _attachment_response(
+        result: dict[str, object] | None,
+    ) -> tuple[HTTPStatus, dict[str, object]]:
+        if result is None:
+            return HTTPStatus.NOT_FOUND, {"error": "not found"}
+        if result.get("status") == "invalid_attachment":
+            return HTTPStatus.BAD_REQUEST, result
+        if result.get("status") == "attachment_rejected":
+            return HTTPStatus.REQUEST_ENTITY_TOO_LARGE, result
+        if result.get("status") != "uploaded":
+            return HTTPStatus.CONFLICT, {"success": False, "status": result.get("status")}
+        return HTTPStatus.OK, result
+
     def accept(
         self, session: str | None, csrf: str | None, origin: str | None, host: str | None,
         call_id: str, action_id: object,
@@ -1672,6 +1720,25 @@ class _PublicHandler(BaseHTTPRequestHandler):
             )
             self._send_json(status, response)
             return
+        web_attachment_id = self._terminal_attachment_call_id(path)
+        if operator is not None and web_attachment_id is not None:
+            body_ok, attachment = self._browser_attachment_body()
+            if not body_ok:
+                return
+            if attachment is None:
+                status, response = operator.reject_attachment_submission_limit(
+                    self._operator_session(), self.headers.get("X-CSRF-Token"), self.headers.get("Origin"),
+                    self.headers.get("Host"), web_attachment_id, self.headers.get("X-Writer-Token"),
+                )
+            else:
+                original_name, media_type, content = attachment
+                status, response = operator.upload_attachment(
+                    self._operator_session(), self.headers.get("X-CSRF-Token"), self.headers.get("Origin"),
+                    self.headers.get("Host"), web_attachment_id, self.headers.get("X-Writer-Token"),
+                    original_name, media_type, content,
+                )
+            self._send_json(status, response)
+            return
         web_accept_id = self._web_accept_call_id(path)
         if operator is not None and web_accept_id is not None:
             body_ok, payload = self._terminal_request_body()
@@ -2058,6 +2125,25 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         "button.addEventListener('click',async()=>{const textarea=document.querySelector('textarea[name=user_input]');"
                         "const user_input=textarea.value;const response=await fetch(button.dataset.endpoint,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({submission_id:crypto.randomUUID(),user_input:user_input})});if(response.ok)location.reload();}));"
                     )
+                attachment_controls = (
+                    '<form data-attachment-form enctype="multipart/form-data">'
+                    '<input type="file" data-attachment-file></form>'
+                    '<p data-attachment-status="saved">No attachment selected.</p>'
+                    '<ul data-attachment-list></ul>'
+                    '<button data-attachment-upload>Upload file</button>'
+                )
+                attachment_script = (
+                    "const attachmentFile=document.querySelector('input[data-attachment-file]');"
+                    "const attachmentStatus=document.querySelector('[data-attachment-status]');"
+                    "const attachmentList=document.querySelector('[data-attachment-list]');"
+                    "document.querySelector('button[data-attachment-upload]').addEventListener('click',async(event)=>{"
+                    "const file=attachmentFile.files[0];if(!file){return;}const form=new FormData();form.append('file',file,file.name);"
+                    f"const response=await fetch('{endpoint}/attachments',{{method:'POST',credentials:'same-origin',headers:{{'X-Writer-Token':writerToken}},body:form}});"
+                    "if(response.ok){const uploaded=await response.json();const item=document.createElement('li');item.textContent=uploaded.attachment.name+' ('+uploaded.attachment.byte_count+' bytes)';attachmentList.append(item);attachmentStatus.setAttribute('data-attachment-status','saved');attachmentStatus.textContent='saved';}"
+                    "else{attachmentStatus.outerHTML='<p data-attachment-status=\"failed\">Upload failed.</p>';}});"
+                )
+                controls += attachment_controls
+                submission_script += attachment_script
                 heartbeat_script = (
                     f"const heartbeatEndpoint='{endpoint}/heartbeat';"
                     "const heartbeatTimer=setInterval(async()=>{"
@@ -2304,6 +2390,50 @@ class _PublicHandler(BaseHTTPRequestHandler):
             if not filename or not media_type:
                 raise ValueError
             return True, (fields["owner_session_id"], filename, media_type, content)
+        except (UnicodeDecodeError, UnicodeEncodeError, ValueError):
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid request"})
+            return False, None
+
+    def _browser_attachment_body(self) -> tuple[bool, tuple[str, str, bytes] | None]:
+        """Decode exactly one browser file; ownership comes only from its cookie."""
+        content_type = self.headers.get("Content-Type", "")
+        marker = "boundary="
+        if not content_type.startswith("multipart/form-data;") or marker not in content_type:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid request"})
+            return False, None
+        boundary = content_type.split(marker, 1)[1].strip().strip('"')
+        try:
+            content_length = int(self.headers.get("Content-Length", ""))
+            terminal = self._terminal_gateway()
+            maximum = (
+                terminal.attachment_max_submission_bytes + _MULTIPART_OVERHEAD_BYTES
+                if terminal is not None else _DEFAULT_ATTACHMENT_MAX_SUBMISSION_BYTES + _MULTIPART_OVERHEAD_BYTES
+            )
+            if not boundary or content_length < 0:
+                raise ValueError
+            if content_length > maximum:
+                self.rfile.read(min(content_length, _MULTIPART_OVERHEAD_BYTES))
+                return True, None
+            raw = self.rfile.read(content_length)
+            file_part: tuple[str, str, bytes] | None = None
+            delimiter = b"--" + boundary.encode("ascii")
+            for part in raw.split(delimiter)[1:]:
+                if part in {b"", b"--\r\n", b"--"}:
+                    continue
+                if not part.startswith(b"\r\n"):
+                    raise ValueError
+                header_bytes, body = part[2:].split(b"\r\n\r\n", 1)
+                body = body.removesuffix(b"\r\n")
+                headers = header_bytes.decode("utf-8").split("\r\n")
+                disposition = next((line for line in headers if line.lower().startswith("content-disposition:")), "")
+                if 'name="file"' not in disposition or 'filename="' not in disposition or file_part is not None:
+                    raise ValueError
+                filename = disposition.split('filename="', 1)[1].split('"', 1)[0]
+                media_type = next((line.split(":", 1)[1].strip() for line in headers if line.lower().startswith("content-type:")), "application/octet-stream")
+                file_part = (filename, media_type, body)
+            if file_part is None or not file_part[0] or not file_part[1]:
+                raise ValueError
+            return True, file_part
         except (UnicodeDecodeError, UnicodeEncodeError, ValueError):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid request"})
             return False, None
