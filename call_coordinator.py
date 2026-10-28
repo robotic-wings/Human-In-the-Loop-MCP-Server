@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import hashlib
 import base64
+import hmac
+import secrets
 import sqlite3
 import threading
 import uuid
@@ -410,6 +412,88 @@ class CallCoordinator:
                 return self._ownership_conflict()
             self._refresh_terminal_liveness(connection, call_id)
             return self._current_result(connection, self._call_or_raise(connection, call_id))
+
+    def browser_writer(
+        self, call_id: str, session_id: str, page_id: object, action_id: object,
+        *, takeover: bool = False,
+    ) -> dict[str, Any] | None:
+        """Acquire or replace the one durable writable page for an iPhone call."""
+        if not all(isinstance(value, str) and value for value in (session_id, page_id, action_id)):
+            return {"success": False, "status": "invalid_writer"}
+        with self._write_transaction() as connection:
+            row = self._iphone_writer_call(connection, call_id, session_id)
+            if row is None:
+                return None
+            lease = connection.execute(
+                "SELECT page_id, writer_token FROM browser_writers WHERE call_id = ?",
+                (call_id,),
+            ).fetchone()
+            if lease is not None and lease["page_id"] != page_id and not takeover:
+                return {"success": True, "writable": False, "writer_token": None, "page_id": page_id}
+            if lease is not None and lease["page_id"] == page_id and not takeover:
+                return {"success": True, "writable": True, "writer_token": lease["writer_token"], "page_id": page_id}
+            token = secrets.token_urlsafe(32)
+            connection.execute(
+                "INSERT INTO browser_writers (call_id, session_id, page_id, writer_token) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(call_id) DO UPDATE SET session_id = excluded.session_id, page_id = excluded.page_id, writer_token = excluded.writer_token",
+                (call_id, session_id, page_id, token),
+            )
+            return {"success": True, "writable": True, "writer_token": token, "page_id": page_id}
+
+    def browser_writer_status(
+        self, call_id: str, session_id: str, page_id: object, writer_token: object,
+    ) -> dict[str, Any] | None:
+        """Return writable status only for the exact durable page authority."""
+        if not all(isinstance(value, str) and value for value in (session_id, page_id, writer_token)):
+            return {"success": False, "status": "invalid_writer"}
+        with self._write_transaction() as connection:
+            if self._iphone_writer_call(connection, call_id, session_id) is None:
+                return None
+            lease = connection.execute(
+                "SELECT session_id, page_id, writer_token FROM browser_writers WHERE call_id = ?", (call_id,)
+            ).fetchone()
+            if lease is None or not (
+                lease["session_id"] == session_id and lease["page_id"] == page_id
+                and hmac.compare_digest(lease["writer_token"], writer_token)
+            ):
+                return {"success": False, "status": "writer_conflict"}
+            return {"success": True, "writable": True, "writer_token": lease["writer_token"], "page_id": page_id}
+
+    def browser_writer_matches(self, call_id: str, session_id: str, writer_token: object) -> bool:
+        """Gate browser writes without preempting terminal replay/expiry settlement."""
+        if not isinstance(writer_token, str) or not writer_token:
+            return False
+        with self._write_transaction() as connection:
+            # A lease can only be created while the call is accepted and
+            # phone-routed.  Once it exists, retain its authority long enough
+            # for the underlying submission/cancel operation to replay a
+            # durable terminal result or settle an expiry itself.
+            lease = connection.execute(
+                "SELECT session_id, writer_token FROM browser_writers "
+                "WHERE call_id = ? AND session_id = ?",
+                (call_id, session_id),
+            ).fetchone()
+            return bool(lease is not None and hmac.compare_digest(lease["writer_token"], writer_token))
+
+    def _iphone_writer_call(
+        self, connection: sqlite3.Connection, call_id: str, session_id: str,
+    ) -> sqlite3.Row | None:
+        """Settle first, then prove accepted phone-route ownership for a writer lease."""
+        try:
+            row = self._call_or_raise(connection, call_id)
+        except KeyError:
+            return None
+        if connection.execute("SELECT 1 FROM bark_deliveries WHERE call_id = ?", (call_id,)).fetchone() is None:
+            return None
+        self._settle_if_expired(connection, row)
+        row = self._call_or_raise(connection, call_id)
+        if (
+            row["state"] not in {"accepted", "in_progress"}
+            or row["owner_device_id"] != "iphone_web"
+            or row["owner_session_id"] != session_id
+        ):
+            return None
+        return row
 
     def create_operator_session(self, session_id: str, csrf: str, lifetime_seconds: int) -> None:
         expires_at = self._stamp(self._now() + timedelta(seconds=lifetime_seconds))
@@ -2772,6 +2856,10 @@ class CallCoordinator:
             );
             CREATE TABLE IF NOT EXISTS operator_sessions (
                 session_id TEXT PRIMARY KEY, csrf TEXT NOT NULL, expires_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS browser_writers (
+                call_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, page_id TEXT NOT NULL,
+                writer_token TEXT NOT NULL, FOREIGN KEY (call_id) REFERENCES calls(call_id)
             );
             """
         )
