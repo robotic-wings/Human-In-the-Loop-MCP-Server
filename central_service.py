@@ -1133,6 +1133,28 @@ class _OperatorGateway:
             return None
         return self._coordinator.operator_call_state(call_id)
 
+    def logout(
+        self, session: str | None, csrf: str | None, origin: str | None, host: str | None,
+    ) -> tuple[HTTPStatus, dict[str, object]]:
+        """Invalidate only the authenticated browser session after CSRF checks."""
+        if (
+            not self._session_matches(session, csrf)
+            or origin != f"https://{self._expected_host}"
+            or host != self._expected_host
+            or not isinstance(session, str)
+        ):
+            return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+        # Delete the durable authority first.  A process restart cannot revive
+        # this cookie after the response has been sent.
+        if not self._coordinator.delete_operator_session(session):
+            return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+        with self._lock:
+            self._sessions.pop(session, None)
+            self._feedback_forms = {
+                form for form in self._feedback_forms if form[0] != session
+            }
+        return HTTPStatus.OK, {"status": "logged_out"}
+
     def page(self, session: str | None, call_id: str) -> tuple[dict[str, object] | None, str | None]:
         """Return the authenticated page view and its CSRF value without new state."""
         csrf = self._csrf_for_session(session)
@@ -1471,6 +1493,22 @@ class _PublicHandler(BaseHTTPRequestHandler):
                 )
             else:
                 self._send_json(status, response)
+            return
+        if operator is not None and path == "/api/operator/logout":
+            body_ok, _ = self._terminal_request_body()
+            if not body_ok:
+                return
+            status, response = operator.logout(
+                self._operator_session(), self.headers.get("X-CSRF-Token"), self.headers.get("Origin"),
+                self.headers.get("Host"),
+            )
+            self._send_json(
+                status, response,
+                cookie=(
+                    "operator_session=; Max-Age=0; Secure; HttpOnly; "
+                    "SameSite=Strict; Path=/"
+                ) if status == HTTPStatus.OK else None,
+            )
             return
         web_accept_id = self._web_accept_call_id(path)
         if operator is not None and web_accept_id is not None:

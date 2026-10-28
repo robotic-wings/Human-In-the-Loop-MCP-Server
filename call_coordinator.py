@@ -427,6 +427,14 @@ class CallCoordinator:
             ).fetchone()
             return row["csrf"] if row is not None else None
 
+    def delete_operator_session(self, session_id: str) -> bool:
+        """Remove exactly one browser session without touching call state."""
+        with self._write_transaction() as connection:
+            deleted = connection.execute(
+                "DELETE FROM operator_sessions WHERE session_id = ?", (session_id,)
+            )
+            return deleted.rowcount == 1
+
     def terminal_state(self, device_id: str, call_id: str | None = None) -> dict[str, Any] | None:
         with self._write_transaction() as connection:
             row = self._routed_terminal_call(connection, device_id, call_id)
