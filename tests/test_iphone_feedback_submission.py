@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 
 from test_central_mcp_gateway import _free_port, _post, _start, _stop, _structured, _wait_for_listener
+from test_iphone_browser_drafts import _writer_headers
 from test_iphone_web_acceptance import _login, _request, _write_operator_config
 from test_iphone_web_decline import _configure_phone_route, _headers
 from test_mcp_continuation import _continuation
@@ -77,7 +78,7 @@ def test_tls_accepted_iphone_feedback_page_persists_canonical_replays_and_delive
         created = _call(port, certificate, "feedback-answer"); call_id, interaction_id = created["call_id"], created["interaction_id"]; assert isinstance(call_id, str) and isinstance(interaction_id, str)
         cookie, csrf = _login(port, certificate); headers = _headers(cookie, csrf, port); assert _accept(port, certificate, call_id, headers)[0] == 200
         with sqlite3.connect(database) as connection: read_before = connection.execute("SELECT state, owner_device_id, owner_session_id, version FROM calls WHERE call_id = ?", (call_id,)).fetchone(); read_events = connection.execute("SELECT event_seq FROM events WHERE call_id = ?", (call_id,)).fetchall()
-        _, page_csrf = _page(_request(port, certificate, "GET", f"/calls/{call_id}", headers={"Cookie": cookie})[2], call_id); protected = _headers(cookie, page_csrf, port)
+        _, page_csrf = _page(_request(port, certificate, "GET", f"/calls/{call_id}", headers={"Cookie": cookie})[2], call_id); protected = _writer_headers(port, certificate, call_id, _headers(cookie, page_csrf, port), "feedback-submit")
         with sqlite3.connect(database) as connection: assert connection.execute("SELECT state, owner_device_id, owner_session_id, version FROM calls WHERE call_id = ?", (call_id,)).fetchone() == read_before; assert connection.execute("SELECT event_seq FROM events WHERE call_id = ?", (call_id,)).fetchall() == read_events
         first = _submit(port, certificate, call_id, "feedback-1", TYPE_ID, "  Please split this task.  ", protected); replay = _submit(port, certificate, call_id, "feedback-1", TYPE_ID, "Please split this task.", protected); conflict = _submit(port, certificate, call_id, "feedback-1", "other", "Please split this task.", protected)
         _, continuation, _ = _post(port, certificate, _continuation("feedback-event", interaction_id, call_id, 1), "test-token-alpha")
@@ -92,9 +93,9 @@ def test_tls_accepted_iphone_feedback_page_persists_canonical_replays_and_delive
 def test_tls_iphone_feedback_rejects_invalid_foreign_route_and_expiry_without_mutation(tmp_path: Path) -> None:
     port = _free_port(); config, certificate = _write_operator_config(tmp_path, port); _configure_phone_route(config); database = tmp_path / "data" / "calls.sqlite3"; process = _start(config); _wait_for_listener(process, port)
     try:
-        created = _call(port, certificate, "feedback-security"); call_id = created["call_id"]; assert isinstance(call_id, str); owner_cookie, owner_csrf = _login(port, certificate); other_cookie, other_csrf = _login(port, certificate); owner = _headers(owner_cookie, owner_csrf, port); assert _accept(port, certificate, call_id, owner)[0] == 200
+        created = _call(port, certificate, "feedback-security"); call_id = created["call_id"]; assert isinstance(call_id, str); owner_cookie, owner_csrf = _login(port, certificate); other_cookie, other_csrf = _login(port, certificate); owner = _headers(owner_cookie, owner_csrf, port); assert _accept(port, certificate, call_id, owner)[0] == 200; writer = _writer_headers(port, certificate, call_id, owner, "feedback-security")
         with sqlite3.connect(database) as connection: before = connection.execute("SELECT state, owner_device_id, owner_session_id FROM calls WHERE call_id = ?", (call_id,)).fetchone(); events = connection.execute("SELECT event_seq FROM events WHERE call_id = ?", (call_id,)).fetchall()
-        bad = [_submit(port, certificate, call_id, "unknown", "unknown", "x", owner), _submit(port, certificate, call_id, "blank", TYPE_ID, "   ", owner), _submit(port, certificate, call_id, "type", TYPE_ID, 1, owner), _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "label", "feedback_type": TYPE_ID, "feedback_type_label": "Other", "feedback_text": "x"}, headers=owner), _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "mixed", "feedback_type": TYPE_ID, "feedback_text": "x", "confirmed": False}, headers=owner), _submit(port, certificate, call_id, "foreign", TYPE_ID, "x", _headers(other_cookie, other_csrf, port))]
+        bad = [_submit(port, certificate, call_id, "tokenless", TYPE_ID, "x", owner), _submit(port, certificate, call_id, "unknown", "unknown", "x", writer), _submit(port, certificate, call_id, "blank", TYPE_ID, "   ", writer), _submit(port, certificate, call_id, "type", TYPE_ID, 1, writer), _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "label", "feedback_type": TYPE_ID, "feedback_type_label": "Other", "feedback_text": "x"}, headers=writer), _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "mixed", "feedback_type": TYPE_ID, "feedback_text": "x", "confirmed": False}, headers=writer), _submit(port, certificate, call_id, "foreign", TYPE_ID, "x", _headers(other_cookie, other_csrf, port))]
         with sqlite3.connect(database) as connection: after = connection.execute("SELECT state, owner_device_id, owner_session_id FROM calls WHERE call_id = ?", (call_id,)).fetchone(); operations = connection.execute("SELECT count(*) FROM submission_operations WHERE call_id = ?", (call_id,)).fetchone()[0]; after_events = connection.execute("SELECT event_seq FROM events WHERE call_id = ?", (call_id,)).fetchall()
     finally: _stop(process)
     assert all(item[0] in {400, 401, 403, 404, 409} for item in bad) and after == before and operations == 0 and after_events == events == [(1,)]
@@ -110,7 +111,7 @@ def test_tls_feedback_route_exclusion_and_restart_expiry_release_busy(tmp_path: 
     assert denied[0] in {400, 401, 403, 404, 409}
     port = _free_port(); config, certificate = _write_operator_config(tmp_path / "expiry", port); _configure_phone_route(config); database = tmp_path / "expiry" / "data" / "calls.sqlite3"; process = _start(config); _wait_for_listener(process, port)
     try:
-        created = _call(port, certificate, "feedback-expiry"); call_id, interaction_id = created["call_id"], created["interaction_id"]; assert isinstance(call_id, str) and isinstance(interaction_id, str); cookie, csrf = _login(port, certificate); headers = _headers(cookie, csrf, port); assert _accept(port, certificate, call_id, headers)[0] == 200
+        created = _call(port, certificate, "feedback-expiry"); call_id, interaction_id = created["call_id"], created["interaction_id"]; assert isinstance(call_id, str) and isinstance(interaction_id, str); cookie, csrf = _login(port, certificate); headers = _headers(cookie, csrf, port); assert _accept(port, certificate, call_id, headers)[0] == 200; headers = _writer_headers(port, certificate, call_id, headers, "feedback-expiry")
         with sqlite3.connect(database) as connection: connection.execute("UPDATE calls SET terminal_last_seen_at = ?, terminal_disconnect_deadline = ? WHERE call_id = ?", ((datetime.now(UTC) - timedelta(seconds=181)).isoformat(), (datetime.now(UTC) - timedelta(seconds=1)).isoformat(), call_id)); connection.commit()
         _stop(process); process = _start(config); _wait_for_listener(process, port); late = _submit(port, certificate, call_id, "late", TYPE_ID, "x", headers); _, event, _ = _post(port, certificate, _continuation("feedback-terminal", interaction_id, call_id, 1), "test-token-alpha"); next_call = _call(port, certificate, "feedback-after-expiry")
         with sqlite3.connect(database) as connection: state = connection.execute("SELECT state FROM calls WHERE call_id = ?", (call_id,)).fetchone(); operations = connection.execute("SELECT count(*) FROM submission_operations WHERE call_id = ?", (call_id,)).fetchone()[0]
@@ -133,7 +134,7 @@ def test_tls_iphone_feedback_accept_and_submission_race_has_one_authoritative_tr
             events = connection.execute("SELECT event_seq, result FROM events WHERE call_id = ? ORDER BY event_seq", (call_id,)).fetchall()
             operations = connection.execute("SELECT count(*) FROM submission_operations WHERE call_id = ?", (call_id,)).fetchone()[0]
     finally: _stop(process)
-    assert accepted[0] == 200 and submitted[0] in {400, 409, 200}
+    assert accepted[0] == 200 and submitted[0] in {400, 403, 409}
     if submitted[0] == 200:
         assert state == ("answered", "iphone_web", "ios") and operations == 1
         assert [event[0] for event in events] == [1, 2]
@@ -146,14 +147,14 @@ def test_tls_iphone_feedback_accept_and_submission_race_has_one_authoritative_tr
             assert submitted[2]["status"] == submitted[2]["call_state"] == "accepted"
             assert submitted[2]["handled_on"] == "iphone_web" and submitted[2]["terminal_platform"] == "ios"
         else:
-            assert submitted[0] == 400
+            assert submitted[0] in {400, 403}
 
 
 def test_tls_accepted_iphone_feedback_late_submission_returns_current_state(tmp_path: Path) -> None:
     port = _free_port(); config, certificate = _write_operator_config(tmp_path, port); _configure_phone_route(config); database = tmp_path / "data" / "calls.sqlite3"; process = _start(config); _wait_for_listener(process, port)
     try:
         created = _call(port, certificate, "feedback-late-after-accept"); call_id = created["call_id"]; assert isinstance(call_id, str)
-        cookie, csrf = _login(port, certificate); headers = _headers(cookie, csrf, port); assert _accept(port, certificate, call_id, headers)[0] == 200
+        cookie, csrf = _login(port, certificate); headers = _headers(cookie, csrf, port); assert _accept(port, certificate, call_id, headers)[0] == 200; headers = _writer_headers(port, certificate, call_id, headers, "feedback-late")
         late = _submit(port, certificate, call_id, "feedback-late-after-accept", TYPE_ID, "Late feedback", headers)
         with sqlite3.connect(database) as connection:
             state = connection.execute("SELECT state, handled_on, terminal_platform FROM calls WHERE call_id = ?", (call_id,)).fetchone()
