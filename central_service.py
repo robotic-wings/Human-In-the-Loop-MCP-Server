@@ -1961,6 +1961,13 @@ class _PublicHandler(BaseHTTPRequestHandler):
             )
         elif call_state in {"accepted", "in_progress"}:
             if state.get("owner_device_id") == "iphone_web" and state.get("_page_session_matches_owner"):
+                # This is deliberately a page-local warning rather than a
+                # liveness mechanism: only an authenticated owner heartbeat
+                # may refresh the durable deadline.
+                owner_liveness_warning = (
+                    '<p data-owner-liveness-warning>Keeping this page in the background or locking the phone can interrupt '
+                    'session liveness. If it does not recover, the service ends the call.</p>'
+                )
                 writer_controls = (
                     '<p data-writer-status="loading">Acquiring write access.</p>'
                     '<button data-writer-takeover disabled>Take over editing</button>'
@@ -2232,7 +2239,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
                     if isinstance(item, dict)
                 )
                 attachment_controls = attachment_controls.replace('<ul data-attachment-list></ul>', f'<ul data-attachment-list>{pending_items}</ul>')
-                controls += attachment_controls
+                controls = owner_liveness_warning + controls + attachment_controls
                 submission_script += attachment_script
                 heartbeat_script = (
                     f"const heartbeatEndpoint='{endpoint}/heartbeat';"
