@@ -55,7 +55,8 @@ class _Page(HTMLParser):
         values = {key: value or "" for key, value in attrs}
         if tag == "meta" and values.get("name") == "X-CSRF-Token": self.csrf = values.get("content")
         if tag == "textarea" and values.get("data-input-kind") == "multiline": self.textarea = values; self._in_textarea = True
-        if values.get("data-endpoint"): self.endpoint = values["data-endpoint"]
+        if tag == "button" and "data-multiline-input" in values:
+            self.endpoint = values.get("data-endpoint")
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "textarea": self._in_textarea = False
