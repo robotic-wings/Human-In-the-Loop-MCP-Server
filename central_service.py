@@ -2070,11 +2070,24 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         f'<option value="{html.escape(type_id, quote=True)}" data-label="{html.escape(label, quote=True)}">{html.escape(label)}</option>'
                         for type_id, label in _FEEDBACK_TYPES.items()
                     )
+                    draft = state.get("_draft")
+                    draft_body = draft.get("body") if isinstance(draft, dict) else None
+                    draft_version = draft.get("draft_version", 0) if isinstance(draft, dict) else 0
+                    initial_feedback = draft_body if isinstance(draft_body, str) else ""
                     controls = (
-                        f'<select data-feedback-type>{options}</select><textarea data-feedback-text></textarea>'
+                        f'<select data-feedback-type>{options}</select><textarea data-feedback-text data-draft-input="feedback" '
+                        f'data-draft-version="{html.escape(str(draft_version), quote=True)}">'
+                        f'{html.escape(initial_feedback, quote=False)}</textarea>'
+                        '<p data-draft-status="saved">Saved</p>'
+                        f'<button data-draft-save data-endpoint="{endpoint}/draft">Save draft</button>'
                         f'<button data-feedback-send="true" data-endpoint="{endpoint}/submissions">Send</button>'
                     )
                     submission_script = (
+                        "const draftInput=document.querySelector('textarea[data-feedback-text][data-draft-input=feedback]');"
+                        "const draftStatus=document.querySelector('[data-draft-status]');"
+                        "const draftSave=document.querySelector('button[data-draft-save]');"
+                        "draftInput.addEventListener('input',()=>{draftStatus.dataset.draftStatus='not-synced';draftStatus.textContent='not-synced';});"
+                        "draftSave.addEventListener('click',async()=>{const response=await fetch(draftSave.dataset.endpoint,{method:'PUT',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({body:draftInput.value,expected_draft_version:Number(draftInput.dataset.draftVersion)})});if(response.ok){const saved=await response.json();draftInput.dataset.draftVersion=String(saved.draft_version);draftStatus.dataset.draftStatus='saved';draftStatus.textContent='saved';}else{draftStatus.dataset.draftStatus='not-synced';draftStatus.textContent='draft conflict; not-synced';}});"
                         "const send=document.querySelector('button[data-feedback-send]');"
                         "send.addEventListener('click',()=>{"
                         "const endpoint=send.dataset.endpoint;"
