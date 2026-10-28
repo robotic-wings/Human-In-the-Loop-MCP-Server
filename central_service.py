@@ -503,6 +503,19 @@ def _create_operator(config: ServiceConfig, operator_id: str) -> None:
         raise
 
 
+_HUMAN_LOOP_PROMPT_GUIDANCE = """# Central human-loop MCP protocol
+
+Use the authenticated HTTPS `/mcp` endpoint. It is the only supported transport: stdio and local fallback modes are not supported.
+
+Start an interaction with the relevant tool call. Its first response identifies the durable `interaction_id` and `call_id`. Every continuation and event read must use that same pair together with the last successfully received `after_event_seq`; do not create another call to continue waiting.
+
+Human acceptance produces an `opened` event. Human task progress produces an `in_progress` event. A human answer, completion, failure, decline, timeout, cancellation, or disconnect produces the final event/result. These non-heartbeat events have monotonically increasing `event_seq` values and are durable, so an unacknowledged event can be replayed after a lost response by reusing the cursor.
+
+A `heartbeat` reports current waiting state but creates no event and does not advance `event_seq`. `needs_continuation:true` means either the interaction is still waiting or another durable readable event remains after the current cursor; it does not by itself mean a new call should be created. A final result with no unread event has `needs_continuation:false`.
+
+Final statuses and their structured results are durable. Reading or replaying an event never re-notifies the human or creates another interaction. Malformed or rejected requests continue to return the established structured JSON-RPC or authentication errors."""
+
+
 class _McpGateway:
     def __init__(
         self, coordinator: CallCoordinator, credentials: dict[str, str], desktop_route_device_id: str | None = None,
@@ -540,9 +553,48 @@ class _McpGateway:
             )
         if method == "tools/list":
             return _rpc_result(request_id, {"tools": _tool_definitions()})
+        if method == "prompts/list":
+            return self._list_prompts(request_id, payload.get("params"))
+        if method == "prompts/get":
+            return self._get_prompt(request_id, payload.get("params"))
         if method == "tools/call":
             return self._call_tool(request_id, payload.get("params"), caller_id)
         return _rpc_error(request_id, -32601, "method not found")
+
+    def _list_prompts(self, rpc_id: object, params: object) -> dict[str, object]:
+        """Expose the fixed central protocol guidance without touching call state."""
+        if not isinstance(params, dict):
+            return _rpc_error(rpc_id, -32602, "invalid params")
+        return _rpc_result(
+            rpc_id,
+            {
+                "prompts": [
+                    {
+                        "name": "get_human_loop_prompt",
+                        "description": "Central HTTP(S) human-loop protocol guidance.",
+                    }
+                ]
+            },
+        )
+
+    def _get_prompt(self, rpc_id: object, params: object) -> dict[str, object]:
+        if (
+            not isinstance(params, dict)
+            or params.get("name") != "get_human_loop_prompt"
+            or set(params) != {"name"}
+        ):
+            return _rpc_error(rpc_id, -32602, "invalid params")
+        return _rpc_result(
+            rpc_id,
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": {"type": "text", "text": _HUMAN_LOOP_PROMPT_GUIDANCE},
+                    }
+                ]
+            },
+        )
 
     def may_wait_for_tool_response(self, payload: object) -> bool:
         """Return whether this request can enter a bounded agent wait leg.
