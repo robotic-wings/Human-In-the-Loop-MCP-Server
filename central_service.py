@@ -2125,17 +2125,20 @@ class _PublicHandler(BaseHTTPRequestHandler):
                     controls = (
                         f'<input data-input-type="{html.escape(input_type, quote=True)}" '
                         f'value="{html.escape(default_value, quote=True)}">'
+                        '<p data-numeric-status="ready">Ready to submit</p>'
                         f'<button data-numeric-input data-endpoint="{endpoint}/submissions">Submit</button>'
                     )
                     submission_script = (
                         "document.querySelectorAll('button[data-numeric-input]').forEach((button)=>"
                         "button.addEventListener('click',()=>{"
                         "const input=document.querySelector('input[data-input-type]');"
+                        "const numericStatus=document.querySelector('[data-numeric-status]');"
                         "const user_input=input.value;"
                         "fetch(button.dataset.endpoint,{method:'POST',credentials:'same-origin',"
                         "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},"
                         "body:JSON.stringify({submission_id:crypto.randomUUID(),user_input:user_input})})"
-                        ".then((response)=>{if(response.ok)location.reload();});"
+                        ".then((response)=>{if(response.ok)location.reload();return response;})"
+                        ".then((response)=>{if(response.ok){}else{numericStatus.dataset.numericStatus='not-submitted';numericStatus.textContent='not-submitted: conflict or unavailable';}});"
                         "}));"
                     )
                 elif multiline_default is not None:
