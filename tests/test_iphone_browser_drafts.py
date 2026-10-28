@@ -24,6 +24,17 @@ def _draft(port: int, cert: Path, call_id: str, method: str, *, body: dict[str, 
     return _request(port, cert, method, f"/api/calls/{call_id}/draft", body=body, headers=headers)
 
 
+def _writer_headers(port: int, cert: Path, call_id: str, headers: dict[str, str], page_id: str) -> dict[str, str]:
+    status, _, body = _request(
+        port, cert, "POST", f"/api/calls/{call_id}/writer/acquire",
+        body={"page_id": page_id, "action_id": f"fixture-writer-{page_id}"}, headers=headers,
+    )
+    assert status == 200 and isinstance(body, dict) and body.get("writable") is True
+    token = body.get("writer_token")
+    assert isinstance(token, str) and token
+    return {**headers, "X-Writer-Token": token}
+
+
 def _snapshot(db: Path, call_id: str) -> tuple[object, ...]:
     with sqlite3.connect(db) as connection:
         call = connection.execute("SELECT state, version, task_version, draft_version, draft_body FROM calls WHERE call_id = ?", (call_id,)).fetchone()
@@ -42,13 +53,14 @@ def test_tls_accepted_iphone_text_and_multiline_drafts_hydrate_and_survive_resta
         assert isinstance(text_id, str)
         cookie, csrf = _login(port, cert); headers = _headers(cookie, csrf, port)
         _accept(port, cert, text_id, headers)
+        writer = _writer_headers(port, cert, text_id, headers, "text-hydrate")
         # A second accepted call is not permitted by busy-line policy; use its own service instance below.
         first_get = _draft(port, cert, text_id, "GET", headers={"Cookie": cookie})
-        saved = _draft(port, cert, text_id, "PUT", body={"body": "text draft", "expected_draft_version": 0}, headers=headers)
+        saved = _draft(port, cert, text_id, "PUT", body={"body": "text draft", "expected_draft_version": 0}, headers=writer)
         page = _request(port, cert, "GET", f"/calls/{text_id}", headers={"Cookie": cookie})
         _stop(process); process = _start(config); _wait_for_listener(process, port)
         recovered = _draft(port, cert, text_id, "GET", headers={"Cookie": cookie})
-        submitted = _request(port, cert, "POST", f"/api/calls/{text_id}/submissions", body={"submission_id": "hydrated-text-submit", "user_input": "text draft"}, headers=headers)
+        submitted = _request(port, cert, "POST", f"/api/calls/{text_id}/submissions", body={"submission_id": "hydrated-text-submit", "user_input": "text draft"}, headers=writer)
     finally:
         _stop(process)
     assert first_get[0] == 200 and isinstance(first_get[2], dict) and first_get[2]["body"] is None
@@ -75,8 +87,8 @@ def test_tls_accepted_iphone_text_and_multiline_drafts_hydrate_and_survive_resta
     try:
         created = _multiline_call(port, cert, "browser-draft-multi")
         call_id = created["call_id"]; assert isinstance(call_id, str)
-        cookie, csrf = _login(port, cert); headers = _headers(cookie, csrf, port); _accept(port, cert, call_id, headers)
-        saved = _draft(port, cert, call_id, "PUT", body={"body": "line one\nline two", "expected_draft_version": 0}, headers=headers)
+        cookie, csrf = _login(port, cert); headers = _headers(cookie, csrf, port); _accept(port, cert, call_id, headers); writer = _writer_headers(port, cert, call_id, headers, "multiline-hydrate")
+        saved = _draft(port, cert, call_id, "PUT", body={"body": "line one\nline two", "expected_draft_version": 0}, headers=writer)
         page = _request(port, cert, "GET", f"/calls/{call_id}", headers={"Cookie": cookie})
     finally:
         _stop(process)
@@ -91,15 +103,15 @@ def test_tls_iphone_browser_draft_cas_concurrency_limit_and_nonterminal_state(tm
     port = _free_port(); config, cert = _write_operator_config(tmp_path, port); _configure_phone_route(config); db = tmp_path / "data" / "calls.sqlite3"; process = _start(config); _wait_for_listener(process, port)
     try:
         created = _create_call(port, cert, "browser-draft-cas"); call_id = created["call_id"]; assert isinstance(call_id, str)
-        cookie, csrf = _login(port, cert); headers = _headers(cookie, csrf, port); _accept(port, cert, call_id, headers)
+        cookie, csrf = _login(port, cert); headers = _headers(cookie, csrf, port); _accept(port, cert, call_id, headers); writer = _writer_headers(port, cert, call_id, headers, "draft-cas")
         before = _snapshot(db, call_id)
-        first = _draft(port, cert, call_id, "PUT", body={"body": "winner", "expected_draft_version": 0}, headers=headers)
-        stale = _draft(port, cert, call_id, "PUT", body={"body": "stale", "expected_draft_version": 0}, headers=headers)
+        first = _draft(port, cert, call_id, "PUT", body={"body": "winner", "expected_draft_version": 0}, headers=writer)
+        stale = _draft(port, cert, call_id, "PUT", body={"body": "stale", "expected_draft_version": 0}, headers=writer)
         with ThreadPoolExecutor(max_workers=2) as pool:
-            raced = [pool.submit(_draft, port, cert, call_id, "PUT", body={"body": item, "expected_draft_version": 1}, headers=headers) for item in ("left", "right")]
+            raced = [pool.submit(_draft, port, cert, call_id, "PUT", body={"body": item, "expected_draft_version": 1}, headers=writer) for item in ("left", "right")]
             race = [item.result() for item in raced]
-        boundary = _draft(port, cert, call_id, "PUT", body={"body": "x" * 256, "expected_draft_version": 2}, headers=headers)
-        oversized = _draft(port, cert, call_id, "PUT", body={"body": "x" * 257, "expected_draft_version": 3}, headers=headers)
+        boundary = _draft(port, cert, call_id, "PUT", body={"body": "x" * 256, "expected_draft_version": 2}, headers=writer)
+        oversized = _draft(port, cert, call_id, "PUT", body={"body": "x" * 257, "expected_draft_version": 3}, headers=writer)
         after = _snapshot(db, call_id)
         _, busy, _ = _post(port, cert, {"jsonrpc": "2.0", "id": "busy", "method": "tools/call", "params": {"name": "get_user_input", "arguments": {"title": "new", "prompt": "new", "request_id": "browser-draft-busy", "client_timeout_seconds": 2}}}, "test-token-alpha")
     finally:
@@ -117,10 +129,11 @@ def test_tls_iphone_browser_drafts_deny_nonowners_bad_context_route_preaccept_ex
         created = _create_call(port, cert, "browser-draft-deny"); call_id = created["call_id"]; assert isinstance(call_id, str)
         owner_cookie, owner_csrf = _login(port, cert); other_cookie, other_csrf = _login(port, cert); owner = _headers(owner_cookie, owner_csrf, port)
         preaccept = _draft(port, cert, call_id, "PUT", body={"body": "no", "expected_draft_version": 0}, headers=owner)
-        _accept(port, cert, call_id, owner)
+        _accept(port, cert, call_id, owner); owner_writer = _writer_headers(port, cert, call_id, owner, "draft-owner")
         denied = (
             _draft(port, cert, call_id, "GET", headers={"Cookie": other_cookie}),
             _draft(port, cert, call_id, "PUT", body={"body": "no", "expected_draft_version": 0}, headers=_headers(other_cookie, other_csrf, port)),
+            _draft(port, cert, call_id, "PUT", body={"body": "no", "expected_draft_version": 0}, headers=owner),
             _draft(port, cert, call_id, "PUT", body={"body": "no", "expected_draft_version": 0}, headers={"Cookie": owner_cookie, "X-CSRF-Token": owner_csrf, "Origin": "https://evil.example"}),
             _draft(port, cert, call_id, "PUT", body={"body": "no", "expected_draft_version": 0}, headers={**owner, "Host": "evil.example"}),
             _draft(port, cert, call_id, "GET", headers={"Authorization": "Bearer terminal-secret"}),
