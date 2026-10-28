@@ -1166,12 +1166,13 @@ class _OperatorGateway:
 
     def __init__(
         self, coordinator: CallCoordinator, record: dict[str, object], expected_host: str,
-        session_seconds: int,
+        session_seconds: int, iphone_route_enabled: bool,
     ) -> None:
         self._coordinator = coordinator
         self._record = record
         self._expected_host = expected_host
         self._session_seconds = session_seconds
+        self._iphone_route_enabled = iphone_route_enabled
         self._sessions: dict[str, str] = {}
         self._feedback_forms: set[tuple[str, str]] = set()
         self._lock = threading.RLock()
@@ -1232,6 +1233,7 @@ class _OperatorGateway:
             return None, None
         state = self._coordinator.operator_call_page(call_id)
         if state is not None:
+            state["_iphone_route_enabled"] = self._iphone_route_enabled
             state["_page_session_matches_owner"] = state.get("owner_session_id") == session
             if (
                 state.get("_page_session_matches_owner")
@@ -1959,6 +1961,19 @@ class _PublicHandler(BaseHTTPRequestHandler):
                 "const updateRingingCountdown=()=>{const remaining=Math.max(0,Math.ceil((ringDeadline-Date.now())/1000));ringingDeadlineElement.dataset.remainingSeconds=String(remaining);ringingCountdown.textContent=String(remaining);if(remaining===0){clearInterval(ringingCountdownTimer);disableRingingControls();pollRingingState();}};"
                 "updateRingingCountdown();ringingCountdownTimer=setInterval(updateRingingCountdown,250);ringingPollTimer=setInterval(pollRingingState,2000);"
             )
+        elif (
+            state.get("handled_on") == "desktop"
+            and state.get("_iphone_route_enabled")
+            and call_state in {"accepted", "in_progress"}
+        ):
+            # A late phone page may describe the durable desktop ownership,
+            # but deliberately offers no browser ownership or submission path.
+            controls = "<p>Desktop is processing this call.</p>"
+        elif state.get("handled_on") == "desktop" and state.get("_iphone_route_enabled"):
+            # The result has already been persisted by the desktop.  This is
+            # informational only; it must not imply that this browser submitted
+            # anything or can reopen the completed call.
+            controls = "<p>Desktop handled this call.</p>"
         elif call_state in {"accepted", "in_progress"}:
             if state.get("owner_device_id") == "iphone_web" and state.get("_page_session_matches_owner"):
                 # This is deliberately a page-local warning rather than a
@@ -3095,7 +3110,7 @@ def _serve(config: ServiceConfig) -> None:
         operator_gateway = (
             _OperatorGateway(
                 coordinator, operator_record, urlsplit(config.web_base_url).netloc,
-                config.operator_session_seconds,
+                config.operator_session_seconds, config.bark_enabled,
             )
             if operator_record is not None
             else None
