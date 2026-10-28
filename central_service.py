@@ -1187,10 +1187,21 @@ class _OperatorGateway:
             self._sessions[session] = csrf
         return HTTPStatus.OK, {"csrf_token": csrf}, session
 
-    def read(self, session: str | None, call_id: str) -> dict[str, object] | None:
+    def read(
+        self, session: str | None, host: str | None, call_id: str,
+    ) -> tuple[HTTPStatus, dict[str, object] | None]:
+        """Read the browser call projection without granting any authority."""
+        # Host is an input to the authenticated browser boundary too.  A
+        # session cookie alone must not make a request bearing a forged Host
+        # header a valid same-origin call read.
+        if host != self._expected_host:
+            return HTTPStatus.FORBIDDEN, None
         if not self._session_exists(session):
-            return None
-        return self._coordinator.operator_call_state(call_id)
+            return HTTPStatus.UNAUTHORIZED, None
+        state = self._coordinator.operator_call_state(call_id)
+        if state is None:
+            return HTTPStatus.NOT_FOUND, None
+        return HTTPStatus.OK, state
 
     def logout(
         self, session: str | None, csrf: str | None, origin: str | None, host: str | None,
@@ -1636,11 +1647,13 @@ class _PublicHandler(BaseHTTPRequestHandler):
                 state, csrf = operator.page(self._operator_session(), web_call_id)
                 self._send_html(self._operator_call_page(web_call_id, state, csrf))
                 return
-            state = operator.read(self._operator_session(), web_call_id)
+            status, state = operator.read(
+                self._operator_session(), self.headers.get("Host"), web_call_id,
+            )
             if state is None:
-                self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+                self._send_json(status, {"error": "not found"})
             else:
-                self._send_json(HTTPStatus.OK, {"call": state})
+                self._send_json(status, {"call": state})
             return
         draft_call_id = self._terminal_draft_call_id(path)
         if draft_call_id is not None:
@@ -1906,6 +1919,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
         csrf_value = html.escape(csrf, quote=True)
         controls = ""
         heartbeat_script = ""
+        authoritative_poll_script = ""
         submission_script = ""
         writer_script = ""
         writer_controls = ""
@@ -2185,13 +2199,35 @@ class _PublicHandler(BaseHTTPRequestHandler):
                     "document.querySelector('[data-state]').textContent='Connection lost.';}"
                     "},10000);"
                 )
+                # Polling only observes the server's durable projection.  It
+                # neither re-acquires the browser writer nor replaces the
+                # separate heartbeat that proves an active owner is alive.
+                authoritative_poll_script = (
+                    f"const authoritativeStateEndpoint='{endpoint}';"
+                    f"const renderedCallVersion='{html.escape(str(state.get('version', '')), quote=True)}';"
+                    f"const renderedCallState='{escaped_state}';"
+                    "const reconcileAuthoritativeCallState=(authoritative)=>{"
+                    "const nextState=String(authoritative.state||authoritative.call_state||'unknown');"
+                    "const nextVersion=String(authoritative.version??'');"
+                    "const ownershipChanged=(authoritative.owner_device_id!=='iphone_web'||authoritative.owner_session_id===null);"
+                    "const terminalState=['desktop','answered','declined','disconnected','cancelled','completed','failed'];"
+                    "if(nextState!==renderedCallState||nextVersion!==renderedCallVersion||ownershipChanged||terminalState.includes(nextState)){"
+                    "setWriterState(false);clearInterval(authoritativePollTimer);location.reload();}"
+                    "};"
+                    "const authoritativePollTimer=setInterval(async()=>{try{"
+                    "const response=await fetch(authoritativeStateEndpoint,{method:'GET',credentials:'same-origin'});"
+                    "if(!response.ok){clearInterval(authoritativePollTimer);document.querySelector('[data-state]').textContent='Connection/state unavailable.';return;}"
+                    "const payload=await response.json();if(!payload||!payload.call){clearInterval(authoritativePollTimer);document.querySelector('[data-state]').textContent='Connection/state unavailable.';return;}"
+                    "reconcileAuthoritativeCallState(payload.call);}catch(_error){clearInterval(authoritativePollTimer);document.querySelector('[data-state]').textContent='Connection/state unavailable.';}"
+                    "},2000);"
+                )
             else:
                 controls = "<p>Another device is handling this call.</p>"
         else:
             controls = f"<p>Call is {escaped_state}.</p>"
         return (
             "<!doctype html><meta charset=utf-8><title>Operator call</title><main>"
-            f"<p>{message}</p><p data-state=\"{escaped_state}\">{escaped_state}</p>{writer_controls}{controls}"
+            f"<p>{message}</p><p data-state=\"{escaped_state}\" data-version=\"{html.escape(str(state.get('version', '')), quote=True)}\">{escaped_state}</p>{writer_controls}{controls}"
             f"<meta name=\"X-CSRF-Token\" content=\"{csrf_value}\">"
             "<script>"
             "const csrf=document.querySelector('meta[name=\"X-CSRF-Token\"]').content;"
@@ -2204,6 +2240,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
             "if(response.ok)location.reload();"
             "}));"
             f"{submission_script}"
+            f"{authoritative_poll_script}"
             f"{heartbeat_script}"
             "</script>"
             f"<a href=\"{endpoint}\">Refresh</a></main>"
