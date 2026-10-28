@@ -1396,7 +1396,7 @@ class _OperatorGateway:
                 payload["feedback_type"], payload["feedback_text"],
             )
         elif "status" in payload or "report" in payload:
-            allowed_task_fields = {"submission_id", "status", "report", "task_version", "feedback_requested"}
+            allowed_task_fields = {"submission_id", "status", "report", "task_version", "feedback_requested", "attachment_ids"}
             if not set(payload).issubset(allowed_task_fields) or not {"submission_id", "status", "report"}.issubset(payload):
                 return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
             if payload["status"] == "in_progress":
@@ -1407,11 +1407,17 @@ class _OperatorGateway:
                     call_id, "iphone_web", session or "", submission_id, payload["report"],
                 )
             else:
+                attachment_ids = payload.get("attachment_ids")
+                if attachment_ids is not None and (
+                    not isinstance(attachment_ids, list)
+                    or any(not isinstance(item, str) or not item for item in attachment_ids)
+                ):
+                    return HTTPStatus.BAD_REQUEST, {"success": False, "status": "invalid_submission"}
                 task_final_submission = True
                 result = self._coordinator.submit_terminal_task_final(
                     call_id, "iphone_web", session or "", submission_id,
                     payload["status"], payload["report"], payload.get("task_version", 0),
-                    payload.get("feedback_requested", False),
+                    payload.get("feedback_requested", False), attachment_ids,
                 )
         elif "selected_choices" in payload and "user_input" not in payload and "confirmed" not in payload:
             if self._coordinator.multiple_choice_options_for_call(call_id) is not None:
@@ -1478,6 +1484,8 @@ class _OperatorGateway:
                 return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
             return HTTPStatus.CONFLICT, {"error": "cannot submit"}
         if result["status"] == "invalid_submission":
+            if task_final_submission:
+                return HTTPStatus.BAD_REQUEST, result
             return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
         if result["status"] == "request_conflict":
             return HTTPStatus.CONFLICT, result
@@ -1999,9 +2007,9 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         ".then((response)=>{if(response.ok)location.reload();});"
                         "});"
                         "const normalCompleted=document.querySelector('button[data-task-final=\"completed\"]');"
-                        "normalCompleted.addEventListener('click',()=>{const status=normalCompleted.dataset.taskFinal;const report=document.querySelector('textarea[data-task-report]').value;const body=JSON.stringify({submission_id:crypto.randomUUID(),status:status,report:report,task_version:Number(normalCompleted.dataset.taskVersion)});fetch(normalCompleted.dataset.endpoint,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:body}).then((response)=>{if(response.ok)location.reload();});});"
+                        "normalCompleted.addEventListener('click',()=>{const status=normalCompleted.dataset.taskFinal;const report=document.querySelector('textarea[data-task-report]').value;const body=JSON.stringify({submission_id:crypto.randomUUID(),status:status,report:report,task_version:Number(normalCompleted.dataset.taskVersion),attachment_ids:pendingAttachmentIds});fetch(normalCompleted.dataset.endpoint,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:body}).then((response)=>{if(response.ok)location.reload();});});"
                         "const normalFailed=document.querySelector('button[data-task-final=\"failed\"]');"
-                        "normalFailed.addEventListener('click',()=>{const status=normalFailed.dataset.taskFinal;const report=document.querySelector('textarea[data-task-report]').value;const body=JSON.stringify({submission_id:crypto.randomUUID(),status:status,report:report,task_version:Number(normalFailed.dataset.taskVersion)});fetch(normalFailed.dataset.endpoint,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:body}).then((response)=>{if(response.ok)location.reload();});});"
+                        "normalFailed.addEventListener('click',()=>{const status=normalFailed.dataset.taskFinal;const report=document.querySelector('textarea[data-task-report]').value;const body=JSON.stringify({submission_id:crypto.randomUUID(),status:status,report:report,task_version:Number(normalFailed.dataset.taskVersion),attachment_ids:pendingAttachmentIds});fetch(normalFailed.dataset.endpoint,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:body}).then((response)=>{if(response.ok)location.reload();});});"
                         "document.querySelector('button[data-task-cancel]').addEventListener('click',()=>{"
                         "fetch(document.querySelector('button[data-task-cancel]').dataset.endpoint,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({action_id:crypto.randomUUID(),cancelled:true})}).then((response)=>{if(response.ok)location.reload();});"
                         "});"
@@ -2010,7 +2018,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         "const status=completed.dataset.taskFeedbackExit;"
                         "const taskVersion=Number(completed.dataset.taskVersion);"
                         "const report=document.querySelector('textarea[data-task-report]').value;"
-                        "const body=JSON.stringify({submission_id:crypto.randomUUID(),status:status,report:report,task_version:taskVersion,feedback_requested:true});"
+                        "const body=JSON.stringify({submission_id:crypto.randomUUID(),status:status,report:report,task_version:taskVersion,feedback_requested:true,attachment_ids:pendingAttachmentIds});"
                         "fetch(completed.dataset.endpoint,{method:'POST',credentials: 'same-origin',"
                         "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},"
                         "body:body})"
@@ -2021,7 +2029,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         "const status=failed.dataset.taskFeedbackExit;"
                         "const taskVersion=Number(failed.dataset.taskVersion);"
                         "const report=document.querySelector('textarea[data-task-report]').value;"
-                        "const body=JSON.stringify({submission_id:crypto.randomUUID(),status:status,report:report,task_version:taskVersion,feedback_requested:true});"
+                        "const body=JSON.stringify({submission_id:crypto.randomUUID(),status:status,report:report,task_version:taskVersion,feedback_requested:true,attachment_ids:pendingAttachmentIds});"
                         "fetch(failed.dataset.endpoint,{method:'POST',credentials: 'same-origin',"
                         "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},"
                         "body:body})"
