@@ -198,7 +198,9 @@ def test_tls_browser_attachment_upload_denies_untrusted_or_expired_contexts_with
     assert rows == []
     assert final[:5] == ("disconnected", before[1] + 1, before[2], 0, None)
     assert final[5:] == (2, 0, 0)
-    assert 'data-attachment-status' in str(page[2]).lower()
+    expired_page = str(page[2]).lower()
+    assert 'data-state="disconnected"' in expired_page
+    assert 'type="file"' not in expired_page and 'data-attachment-status' not in expired_page
 
 
 def test_tls_browser_attachment_upload_rejects_ringing_and_route_excluded_without_liveness_or_storage_mutation(tmp_path: Path) -> None:
