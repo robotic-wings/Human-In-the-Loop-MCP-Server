@@ -227,4 +227,4 @@ def test_tls_browser_text_attachment_references_reject_missing_csrf_foreign_ring
     finally:
         _stop(process)
     assert expired[0] in {400, 401, 403, 404, 409}
-    assert after[0] == "disconnected" and after[5:] == (1, 0, 0)
+    assert after[0] == "disconnected" and after[5:] == (2, 0, 0)
