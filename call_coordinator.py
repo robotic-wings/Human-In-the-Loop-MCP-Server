@@ -411,11 +411,12 @@ class CallCoordinator:
             self._refresh_terminal_liveness(connection, call_id)
             return self._current_result(connection, self._call_or_raise(connection, call_id))
 
-    def create_operator_session(self, session_id: str, csrf: str) -> None:
+    def create_operator_session(self, session_id: str, csrf: str, lifetime_seconds: int) -> None:
+        expires_at = self._stamp(self._now() + timedelta(seconds=lifetime_seconds))
         with self._write_transaction() as connection:
             connection.execute(
-                "INSERT INTO operator_sessions (session_id, csrf) VALUES (?, ?)",
-                (session_id, csrf),
+                "INSERT INTO operator_sessions (session_id, csrf, expires_at) VALUES (?, ?, ?)",
+                (session_id, csrf, expires_at),
             )
 
     def operator_session_csrf(self, session_id: str | None) -> str | None:
@@ -423,9 +424,20 @@ class CallCoordinator:
             return None
         with self._write_transaction() as connection:
             row = connection.execute(
-                "SELECT csrf FROM operator_sessions WHERE session_id = ?", (session_id,)
+                "SELECT csrf, expires_at FROM operator_sessions WHERE session_id = ?", (session_id,)
             ).fetchone()
-            return row["csrf"] if row is not None else None
+            if row is None:
+                return None
+            # Rows from before absolute browser-session expiry are deliberately
+            # fail-closed: neither a cache nor a restart may grant authority.
+            try:
+                expired = row["expires_at"] is None or self._parse_stamp(row["expires_at"]) <= self._now()
+            except (TypeError, ValueError):
+                expired = True
+            if expired:
+                connection.execute("DELETE FROM operator_sessions WHERE session_id = ?", (session_id,))
+                return None
+            return row["csrf"]
 
     def delete_operator_session(self, session_id: str) -> bool:
         """Remove exactly one browser session without touching call state."""
@@ -2746,13 +2758,18 @@ class CallCoordinator:
                 FOREIGN KEY (call_id) REFERENCES calls(call_id)
             );
             CREATE TABLE IF NOT EXISTS operator_sessions (
-                session_id TEXT PRIMARY KEY, csrf TEXT NOT NULL
+                session_id TEXT PRIMARY KEY, csrf TEXT NOT NULL, expires_at TEXT
             );
             """
         )
         columns = {
             row["name"] for row in self._connection.execute("PRAGMA table_info(calls)")
         }
+        session_columns = {
+            row["name"] for row in self._connection.execute("PRAGMA table_info(operator_sessions)")
+        }
+        if "expires_at" not in session_columns:
+            self._connection.execute("ALTER TABLE operator_sessions ADD COLUMN expires_at TEXT")
         if "desktop_route_device_id" not in columns:
             self._connection.execute("ALTER TABLE calls ADD COLUMN desktop_route_device_id TEXT")
         if "acted_on" not in columns:

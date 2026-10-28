@@ -61,6 +61,7 @@ class ServiceConfig:
     bark_url: str | None
     terminal_callback_ca_file: Path | None
     operator_credentials_file: Path | None
+    operator_session_seconds: int
 
 
 _DEFAULT_ATTACHMENT_MAX_FILE_BYTES = 20 * 1024 * 1024
@@ -166,6 +167,7 @@ def _load_config(config_path: Path) -> ServiceConfig:
             raise ConfigurationError("config terminal callback CA file must exist")
     else:
         raise ConfigurationError("config terminal_callback_ca_file must be a non-empty path")
+    operator_session_seconds = _positive_integer(raw, "operator_session_seconds", 30 * 24 * 60 * 60)
     return ServiceConfig(
         host,
         port,
@@ -183,6 +185,7 @@ def _load_config(config_path: Path) -> ServiceConfig:
         bark_url,
         terminal_callback_ca_file,
         operator_credentials_file,
+        operator_session_seconds,
     )
 
 
@@ -1109,10 +1112,14 @@ class _TerminalGateway:
 class _OperatorGateway:
     """Small server-side operator session boundary for the phone call page."""
 
-    def __init__(self, coordinator: CallCoordinator, record: dict[str, object], expected_host: str) -> None:
+    def __init__(
+        self, coordinator: CallCoordinator, record: dict[str, object], expected_host: str,
+        session_seconds: int,
+    ) -> None:
         self._coordinator = coordinator
         self._record = record
         self._expected_host = expected_host
+        self._session_seconds = session_seconds
         self._sessions: dict[str, str] = {}
         self._feedback_forms: set[tuple[str, str]] = set()
         self._lock = threading.RLock()
@@ -1123,7 +1130,7 @@ class _OperatorGateway:
             return HTTPStatus.UNAUTHORIZED, {"error": "invalid credentials"}, None
         session = secrets.token_urlsafe(32)
         csrf = secrets.token_urlsafe(32)
-        self._coordinator.create_operator_session(session, csrf)
+        self._coordinator.create_operator_session(session, csrf, self._session_seconds)
         with self._lock:
             self._sessions[session] = csrf
         return HTTPStatus.OK, {"csrf_token": csrf}, session
@@ -1383,6 +1390,10 @@ class _OperatorGateway:
     def _session_exists(self, session: str | None) -> bool:
         return self._csrf_for_session(session) is not None
 
+    @property
+    def session_seconds(self) -> int:
+        return self._session_seconds
+
     def _session_matches(self, session: str | None, csrf: str | None) -> bool:
         expected = self._csrf_for_session(session)
         return isinstance(csrf, str) and expected is not None and hmac.compare_digest(expected, csrf)
@@ -1390,13 +1401,16 @@ class _OperatorGateway:
     def _csrf_for_session(self, session: str | None) -> str | None:
         if not isinstance(session, str):
             return None
-        with self._lock:
-            cached = self._sessions.get(session)
-        if cached is not None:
-            return cached
+        # The persistent deadline is authoritative.  Never let a process-local
+        # CSRF cache outlive a session record whose absolute expiry has passed.
         persisted = self._coordinator.operator_session_csrf(session)
-        if persisted is not None:
-            with self._lock:
+        with self._lock:
+            if persisted is None:
+                self._sessions.pop(session, None)
+                self._feedback_forms = {
+                    form for form in self._feedback_forms if form[0] != session
+                }
+            else:
                 self._sessions[session] = persisted
         return persisted
 
@@ -1489,7 +1503,10 @@ class _PublicHandler(BaseHTTPRequestHandler):
             if session is not None:
                 self._send_json(
                     status, response,
-                    cookie=f"operator_session={session}; Secure; HttpOnly; SameSite=Strict; Path=/",
+                    cookie=(
+                        f"operator_session={session}; Max-Age={operator.session_seconds}; "
+                        "Secure; HttpOnly; SameSite=Strict; Path=/"
+                    ),
                 )
             else:
                 self._send_json(status, response)
@@ -2582,7 +2599,10 @@ def _serve(config: ServiceConfig) -> None:
             attachment_max_submission_bytes=config.attachment_max_submission_bytes,
         )
         operator_gateway = (
-            _OperatorGateway(coordinator, operator_record, urlsplit(config.web_base_url).netloc)
+            _OperatorGateway(
+                coordinator, operator_record, urlsplit(config.web_base_url).netloc,
+                config.operator_session_seconds,
+            )
             if operator_record is not None
             else None
         )
