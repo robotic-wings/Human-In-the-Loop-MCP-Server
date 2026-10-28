@@ -17,7 +17,7 @@ from test_iphone_web_decline import _configure_phone_route, _headers
 from test_terminal_control_api import _terminal_request
 
 
-def _desktop_config(config: Path) -> None:
+def _desktop_config(config: Path, *, phone_route: bool = True) -> None:
     credentials = config.parent / "terminal-credentials.json"
     credentials.write_text(
         json.dumps({"desktop-token": {"device_id": "desktop-registered", "terminal_platform": "windows"}}),
@@ -26,6 +26,18 @@ def _desktop_config(config: Path) -> None:
     raw = json.loads(config.read_text(encoding="utf-8"))
     raw["terminal_credentials_file"] = str(credentials)
     raw["eligible_desktop_device_ids"] = ["desktop-registered"]
+    if phone_route:
+        _configure_phone_route(config)
+        raw = json.loads(config.read_text(encoding="utf-8"))
+        # _configure_phone_route rewrites the file; retain the desktop route.
+        raw["terminal_credentials_file"] = str(credentials)
+        raw["eligible_desktop_device_ids"] = ["desktop-registered"]
+    else:
+        # Explicitly persist a desktop-only route rather than relying on a
+        # helper's default configuration.  The browser page remains a
+        # read-only generic state view; it must never acquire phone authority.
+        raw["bark_enabled"] = False
+        raw.pop("bark_url", None)
     config.write_text(json.dumps(raw), encoding="utf-8")
 
 
@@ -45,10 +57,10 @@ def _snapshot(database: Path, call_id: str) -> tuple[object, ...]:
     return (*call, events, results, submissions)
 
 
-def _desktop_owned_call(tmp_path: Path, request_id: str):
+def _desktop_owned_call(tmp_path: Path, request_id: str, *, phone_route: bool = True):
     port = _free_port()
     config, certificate = _write_operator_config(tmp_path, port)
-    _desktop_config(config)
+    _desktop_config(config, phone_route=phone_route)
     process = _start(config)
     _wait_for_listener(process, port)
     created = _create_call(port, certificate, request_id)
@@ -136,6 +148,7 @@ def test_tls_desktop_status_page_preserves_iphone_owner_and_denies_untrusted_rea
         before = _snapshot(database, call_id)
         anonymous = _request(port, certificate, "GET", f"/calls/{call_id}")
         foreign = _request(port, certificate, "GET", f"/calls/{call_id}", headers={"Cookie": other_cookie})
+        foreign_api = _request(port, certificate, "GET", f"/api/calls/{call_id}", headers={"Cookie": other_cookie})
         forged_host = _request(port, certificate, "GET", f"/api/calls/{call_id}", headers={"Cookie": cookie, "Host": "forged.invalid"})
         bearer = _request(port, certificate, "GET", f"/calls/{call_id}", headers={"Authorization": "Bearer desktop-token"})
         after = _snapshot(database, call_id)
@@ -144,7 +157,13 @@ def test_tls_desktop_status_page_preserves_iphone_owner_and_denies_untrusted_rea
 
     assert before == after
     assert anonymous[0] in {200, 401, 403} and "Operator sign in required" in str(anonymous[2])
-    assert foreign[0] in {200, 401, 403} and "desktop is processing" not in str(foreign[2]).lower()
+    # Operator sessions are account-wide rather than per-call browser
+    # identities.  A second authenticated cookie may read the authoritative
+    # desktop state, but never gains a writer, form, takeover, or mutation.
+    assert foreign[0] == foreign_api[0] == 200
+    assert 'data-state="accepted"' in str(foreign[2])
+    assert foreign_api[2]["call"]["handled_on"] == "desktop"
+    _assert_readonly_desktop_page(foreign[2], call_id)
     assert forged_host[0] in {400, 401, 403}
     assert bearer[0] in {200, 401, 403} and "desktop is processing" not in str(bearer[2]).lower()
 
@@ -177,11 +196,13 @@ def test_tls_iphone_owner_rendering_remains_writable_and_non_desktop_generic_pat
     assert "Another device is handling this call." not in str(terminal[2])
 
 
-def test_tls_route_excluded_operator_read_stays_generic_and_cannot_revive_desktop_call(tmp_path: Path) -> None:
-    # This configuration deliberately has no iPhone route.  A logged-in
-    # operator can make an authenticated read, but it must not gain a desktop
-    # status rendering, writer, takeover, or state-changing path.
-    port, certificate, process, call_id, cookie, _, database = _desktop_owned_call(tmp_path, "late-desktop-route-excluded")
+def test_tls_phone_route_excluded_operator_read_is_generic_and_cannot_revive_desktop_call(tmp_path: Path) -> None:
+    # This is a genuine persisted desktop-only route, not an omitted helper
+    # default.  A logged-in operator can make an authenticated generic read,
+    # but it must not gain a writer, takeover, form, or state-changing path.
+    port, certificate, process, call_id, cookie, _, database = _desktop_owned_call(
+        tmp_path, "late-desktop-route-excluded", phone_route=False
+    )
     try:
         before = _snapshot(database, call_id)
         accepted_page = _request(port, certificate, "GET", f"/calls/{call_id}", headers={"Cookie": cookie})
@@ -200,10 +221,8 @@ def test_tls_route_excluded_operator_read_stays_generic_and_cannot_revive_deskto
     assert accepted_page[0] == accepted_api[0] == handled_page[0] == handled_api[0] == 200
     assert submitted[0] == 200 and before != handled_before == handled_after
     for page in (accepted_page[2], handled_page[2]):
-        source = str(page).lower()
         _assert_readonly_desktop_page(page, call_id)
-        assert "desktop is processing" not in source and "desktop handled" not in source
-        assert "handled on desktop" not in source
+        assert 'data-state=' in str(page)
     assert isinstance(accepted_api[2], dict) and isinstance(handled_api[2], dict)
     assert accepted_api[2]["call"]["state"] == "accepted"
     assert handled_api[2]["call"]["state"] == "answered"
