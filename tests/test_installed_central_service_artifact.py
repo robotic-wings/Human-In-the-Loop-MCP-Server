@@ -183,6 +183,18 @@ def _mcp_tools_list(port: int, certfile: Path) -> tuple[int, dict[str, object]]:
         connection.close()
 
 
+def _plaintext_http_bytes(port: int) -> bytes:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=2) as connection:
+            connection.settimeout(2)
+            connection.sendall(
+                b"GET /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+            )
+            return connection.recv(128)
+    except OSError:
+        return b""
+
+
 def test_installed_distribution_ships_only_central_service_artifact(
     installed_artifact: tuple[Path, Path],
 ) -> None:
@@ -207,6 +219,19 @@ def test_installed_distribution_ships_only_central_service_artifact(
     assert imported.returncode == 0, imported.stdout + imported.stderr
     assert str(ROOT) not in imported.stdout
 
+    for legacy_module in ("human_loop_server", "management_console"):
+        rejected = subprocess.run(
+            [str(_venv_python(environment)), "-c", f"import {legacy_module}"],
+            cwd=environment.parent,
+            env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        assert rejected.returncode != 0
+        assert "ModuleNotFoundError" in rejected.stderr
+
 
 def test_installed_central_service_uses_configured_tls_sqlite_and_authenticated_mcp(
     installed_artifact: tuple[Path, Path], tmp_path: Path
@@ -227,6 +252,7 @@ def test_installed_central_service_uses_configured_tls_sqlite_and_authenticated_
         status, body = _mcp_tools_list(port, certfile)
         assert status == 200
         assert "result" in body
+        assert not _plaintext_http_bytes(port).startswith(b"HTTP/")
         assert (data_dir / "calls.sqlite3").is_file()
     finally:
         _stop(process)
