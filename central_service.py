@@ -2206,16 +2206,21 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         "}));"
                     )
                 elif _is_info_message(state.get("message")):
-                    controls = f'<button data-acknowledged="true" data-endpoint="{endpoint}/submissions">OK</button>'
+                    controls = (
+                        '<p data-acknowledgement-status="ready">Ready to acknowledge</p>'
+                        f'<button data-acknowledged="true" data-endpoint="{endpoint}/submissions">OK</button>'
+                    )
                     submission_script = (
                         "document.querySelectorAll('button[data-acknowledged]').forEach((button)=>"
                         "button.addEventListener('click',()=>{"
+                        "const acknowledgementStatus=document.querySelector('[data-acknowledgement-status]');"
                         "const acknowledged=button.dataset.acknowledged==='true';"
                         "const body=JSON.stringify({submission_id:crypto.randomUUID(),acknowledged:acknowledged});"
                         "fetch(button.dataset.endpoint,{method:'POST',credentials:'same-origin',"
                         "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},"
                         "body:body})"
-                        ".then((response)=>{if(response.ok)location.reload();});"
+                        ".then((response)=>{if(response.ok)location.reload();return response;})"
+                        ".then((response)=>{if(response.ok){}else{acknowledgementStatus.dataset.acknowledgementStatus='not-submitted';acknowledgementStatus.textContent='not-submitted: conflict or unavailable';}});"
                         "}));"
                     )
                 elif _is_confirmation_message(state.get("message")):
