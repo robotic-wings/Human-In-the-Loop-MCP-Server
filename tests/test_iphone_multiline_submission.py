@@ -36,6 +36,17 @@ def _submit(port: int, certificate: Path, call_id: str, submission_id: str, user
     return _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": submission_id, "user_input": user_input}, headers=headers)
 
 
+def _writer_headers(port: int, certificate: Path, call_id: str, headers: dict[str, str], page_id: str) -> dict[str, str]:
+    status, _, body = _request(
+        port, certificate, "POST", f"/api/calls/{call_id}/writer/acquire",
+        body={"page_id": page_id, "action_id": f"fixture-writer-{page_id}"}, headers=headers,
+    )
+    assert status == 200 and isinstance(body, dict) and body.get("writable") is True
+    token = body.get("writer_token")
+    assert isinstance(token, str) and token
+    return {**headers, "X-Writer-Token": token}
+
+
 class _Page(HTMLParser):
     def __init__(self) -> None:
         super().__init__(); self.csrf: str | None = None; self.endpoint: str | None = None; self.textarea: dict[str, str] | None = None; self._in_textarea = False; self.textarea_value = ""
@@ -75,8 +86,9 @@ def test_tls_accepted_iphone_multiline_trims_replays_and_delivers_agent_result(t
     port = _free_port(); config, certificate = _write_operator_config(tmp_path, port); _configure_phone_route(config); database = tmp_path / "data" / "calls.sqlite3"; process = _start(config); _wait_for_listener(process, port)
     try:
         created = _call(port, certificate, "multiline-answer"); call_id, interaction_id = created["call_id"], created["interaction_id"]; assert isinstance(call_id, str) and isinstance(interaction_id, str)
-        cookie, csrf = _login(port, certificate); headers = _headers(cookie, csrf, port); assert _accept(port, certificate, call_id, headers)[0] == 200
+        cookie, csrf = _login(port, certificate); headers = _headers(cookie, csrf, port); assert _accept(port, certificate, call_id, headers)[0] == 200; writer = _writer_headers(port, certificate, call_id, headers, "multiline-submit")
         endpoint, page_csrf = _page(_request(port, certificate, "GET", f"/calls/{call_id}", headers={"Cookie": cookie})[2], call_id); protected = _headers(cookie, page_csrf, port)
+        protected = {**protected, "X-Writer-Token": writer["X-Writer-Token"]}
         first = _submit(port, certificate, call_id, "multiline-1", "  " + NORMALIZED + "  ", protected); replay = _submit(port, certificate, call_id, "multiline-1", NORMALIZED, protected); conflict = _submit(port, certificate, call_id, "multiline-1", "different", protected)
         _, continuation, _ = _post(port, certificate, _continuation("multiline-event", interaction_id, call_id, 1), "test-token-alpha")
         with sqlite3.connect(database) as connection:
@@ -98,11 +110,11 @@ def test_tls_iphone_multiline_rejects_invalid_foreign_and_wrong_form_writers_wit
     try:
         created = _call(port, certificate, "multiline-security"); call_id = created["call_id"]; assert isinstance(call_id, str)
         owner_cookie, owner_csrf = _login(port, certificate); other_cookie, other_csrf = _login(port, certificate); owner = _headers(owner_cookie, owner_csrf, port)
-        preaccept = _submit(port, certificate, call_id, "pre", "text", owner); assert _accept(port, certificate, call_id, owner)[0] == 200
+        preaccept = _submit(port, certificate, call_id, "pre", "text", owner); assert _accept(port, certificate, call_id, owner)[0] == 200; owner_writer = _writer_headers(port, certificate, call_id, owner, "multiline-owner")
         with sqlite3.connect(database) as connection:
             accepted_state = connection.execute("SELECT state, owner_device_id, owner_session_id, handled_on, terminal_platform FROM calls WHERE call_id = ?", (call_id,)).fetchone()
             opened = connection.execute("SELECT event_seq FROM events WHERE call_id = ? ORDER BY event_seq", (call_id,)).fetchall()
-        bad = (_submit(port, certificate, call_id, "empty", " \n ", owner), _submit(port, certificate, call_id, "non-string", ["text"], owner), _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "choice", "selected_choices": ["Beta"]}, headers=owner), _submit(port, certificate, call_id, "other", "text", _headers(other_cookie, other_csrf, port)), _submit(port, certificate, call_id, "cross", "text", {"Cookie": owner_cookie, "X-CSRF-Token": owner_csrf, "Origin": "https://evil.example"}))
+        bad = (_submit(port, certificate, call_id, "empty", " \n ", owner_writer), _submit(port, certificate, call_id, "non-string", ["text"], owner_writer), _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "choice", "selected_choices": ["Beta"]}, headers=owner_writer), _submit(port, certificate, call_id, "missing-writer", "text", owner), _submit(port, certificate, call_id, "other", "text", _headers(other_cookie, other_csrf, port)), _submit(port, certificate, call_id, "cross", "text", {"Cookie": owner_cookie, "X-CSRF-Token": owner_csrf, "Origin": "https://evil.example"}))
         with sqlite3.connect(database) as connection: state = connection.execute("SELECT state, owner_device_id, owner_session_id, handled_on, terminal_platform FROM calls WHERE call_id = ?", (call_id,)).fetchone(); operations = connection.execute("SELECT count(*) FROM submission_operations WHERE call_id = ?", (call_id,)).fetchone()[0]; events = connection.execute("SELECT event_seq FROM events WHERE call_id = ? ORDER BY event_seq", (call_id,)).fetchall()
     finally:
         _stop(process)
@@ -123,7 +135,7 @@ def test_tls_multiline_route_expiry_and_accept_submit_race_are_authoritative(tmp
 
     port = _free_port(); config, certificate = _write_operator_config(tmp_path / "expiry", port); _configure_phone_route(config); database = tmp_path / "expiry" / "data" / "calls.sqlite3"; process = _start(config); _wait_for_listener(process, port)
     try:
-        created = _call(port, certificate, "multiline-expiry"); call_id, interaction_id = created["call_id"], created["interaction_id"]; assert isinstance(call_id, str) and isinstance(interaction_id, str); cookie, csrf = _login(port, certificate); headers = _headers(cookie, csrf, port); assert _accept(port, certificate, call_id, headers)[0] == 200
+        created = _call(port, certificate, "multiline-expiry"); call_id, interaction_id = created["call_id"], created["interaction_id"]; assert isinstance(call_id, str) and isinstance(interaction_id, str); cookie, csrf = _login(port, certificate); headers = _headers(cookie, csrf, port); assert _accept(port, certificate, call_id, headers)[0] == 200; headers = _writer_headers(port, certificate, call_id, headers, "multiline-expiry")
         with sqlite3.connect(database) as connection: connection.execute("UPDATE calls SET terminal_last_seen_at = ?, terminal_disconnect_deadline = ? WHERE call_id = ?", ((datetime.now(UTC) - timedelta(seconds=181)).isoformat(), (datetime.now(UTC) - timedelta(seconds=1)).isoformat(), call_id)); connection.commit()
         _stop(process); process = _start(config); _wait_for_listener(process, port); late = _submit(port, certificate, call_id, "late", "text", headers); _, event, _ = _post(port, certificate, _continuation("multiline-terminal", interaction_id, call_id, 1), "test-token-alpha"); next_call = _call(port, certificate, "multiline-after-expiry")
         with sqlite3.connect(database) as connection: state = connection.execute("SELECT state FROM calls WHERE call_id = ?", (call_id,)).fetchone(); operations = connection.execute("SELECT count(*) FROM submission_operations WHERE call_id = ?", (call_id,)).fetchone()[0]
