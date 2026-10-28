@@ -1322,7 +1322,7 @@ class CallCoordinator:
     def submit_terminal_task_final(
         self, call_id: str, device_id: str, owner_session_id: str,
         submission_id: str, status: object, report: object, task_version: object = 0,
-        feedback_requested: object = False,
+        feedback_requested: object = False, attachment_ids: object = None,
     ) -> dict[str, Any] | None:
         """Persist one completed or failed terminal report from its task owner."""
         if (
@@ -1334,14 +1334,24 @@ class CallCoordinator:
             or isinstance(task_version, bool)
             or task_version < 0
             or not isinstance(feedback_requested, bool)
+            or (
+                attachment_ids is not None
+                and (
+                    not isinstance(attachment_ids, list)
+                    or any(not isinstance(attachment_id, str) or not attachment_id for attachment_id in attachment_ids)
+                    or len(set(attachment_ids)) != len(attachment_ids)
+                )
+            )
         ):
             return {"success": False, "status": "invalid_submission"}
         normalized_report = report.strip()
         if not normalized_report:
             return {"success": False, "status": "invalid_submission"}
+        has_attachment_ids = attachment_ids is not None
+        attachment_ids = [] if attachment_ids is None else attachment_ids
         payload = self._canonical({
             "status": status, "report": normalized_report, "task_version": task_version,
-            "feedback_requested": feedback_requested,
+            "feedback_requested": feedback_requested, "attachment_ids": attachment_ids,
         })
         with self._write_transaction() as connection:
             try:
@@ -1375,6 +1385,18 @@ class CallCoordinator:
                     "call_state": row["state"], "task_version": row["task_version"],
                     "needs_continuation": False,
                 }
+            if attachment_ids:
+                found = connection.execute(
+                    "SELECT attachment_id FROM attachments WHERE call_id = ? "
+                    "AND attachment_id IN (%s)" % ", ".join("?" for _ in attachment_ids),
+                    (call_id, *attachment_ids),
+                ).fetchall()
+                if {item["attachment_id"] for item in found} != set(attachment_ids):
+                    return {
+                        "success": False,
+                        "status": "invalid_attachment_reference",
+                        "needs_continuation": False,
+                    }
             result = {
                 "success": True, "status": status, "call_state": status,
                 "reason": None, "human_action": True, "needs_continuation": False,
@@ -1386,6 +1408,8 @@ class CallCoordinator:
             }
             if feedback_requested:
                 result["feedback_requested"] = True
+            if has_attachment_ids:
+                result["attachment_ids"] = attachment_ids
             connection.execute("UPDATE calls SET state = ?, version = version + 1 WHERE call_id = ?", (status, call_id))
             self._add_event(connection, call_id, result)
             connection.execute(
@@ -1619,6 +1643,8 @@ class CallCoordinator:
             if result is None:
                 return self._not_found_read()
             body = result.get("user_input")
+            if not isinstance(body, str):
+                body = result.get("report")
             if not isinstance(body, str) or cursor > len(body):
                 return self._not_found_read()
             attachments = self._result_attachments(row["call_id"], result)
