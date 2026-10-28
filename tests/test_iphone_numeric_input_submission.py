@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from test_central_mcp_gateway import _free_port, _post, _start, _stop, _structured, _wait_for_listener
+from test_iphone_browser_drafts import _writer_headers
 from test_iphone_web_acceptance import _login, _request, _write_operator_config
 from test_iphone_web_decline import _configure_phone_route, _headers
 from test_mcp_continuation import _continuation
@@ -60,7 +61,7 @@ class _NumericPageParser(HTMLParser):
         if tag == "input" and values.get("data-input-type") in {"integer", "float"}:
             self.input_type = values.get("data-input-type")
             self.default = values.get("value")
-        if values.get("data-endpoint"):
+        if tag == "button" and "data-numeric-input" in values and values.get("data-endpoint"):
             self.endpoint = values["data-endpoint"]
 
 
@@ -112,7 +113,7 @@ def test_tls_accepted_iphone_numeric_input_is_typed_replayable_and_agent_readabl
         assert _accept(port, certificate, call_id, headers)[0] == 200
         owner_page = _request(port, certificate, "GET", f"/calls/{call_id}", headers={"Cookie": cookie})
         endpoint, rendered_csrf = _parsed_numeric_page(owner_page[2], call_id, input_type)
-        rendered_headers = _headers(cookie, rendered_csrf, port)
+        rendered_headers = _writer_headers(port, certificate, call_id, _headers(cookie, rendered_csrf, port), f"numeric-{input_type}")
         first = _request(port, certificate, "POST", endpoint, body={"submission_id": submission_id, "user_input": raw}, headers=rendered_headers)
         replay = _request(port, certificate, "POST", endpoint, body={"submission_id": submission_id, "user_input": str(typed)}, headers=rendered_headers)
         conflict = _request(port, certificate, "POST", endpoint, body={"submission_id": submission_id, "user_input": "99"}, headers=rendered_headers)
@@ -163,13 +164,14 @@ def test_tls_accepted_iphone_numeric_input_without_default_renders_empty_control
         assert _accept(port, certificate, call_id, headers)[0] == 200
         owner_page = _request(port, certificate, "GET", f"/calls/{call_id}", headers={"Cookie": cookie})
         endpoint, rendered_csrf = _parsed_numeric_page(owner_page[2], call_id, input_type, expected_default="")
+        rendered_headers = _writer_headers(port, certificate, call_id, _headers(cookie, rendered_csrf, port), f"numeric-no-default-{input_type}")
         submitted = _request(
             port,
             certificate,
             "POST",
             endpoint,
             body={"submission_id": submission_id, "user_input": raw},
-            headers=_headers(cookie, rendered_csrf, port),
+            headers=rendered_headers,
         )
         _, continuation, _ = _post(
             port, certificate, _continuation(f"numeric-no-default-event-{input_type}", interaction_id, call_id, 1), "test-token-alpha"
@@ -203,13 +205,15 @@ def test_tls_iphone_numeric_input_rejects_invalid_types_and_untrusted_writers_wi
         headers = _headers(owner_cookie, owner_csrf, port)
         preaccept = _submit(port, certificate, call_id, "preaccept", "42", headers)
         assert _accept(port, certificate, call_id, headers)[0] == 200
+        writer = _writer_headers(port, certificate, call_id, headers, "numeric-security")
         with sqlite3.connect(database) as connection:
             accepted_state = connection.execute("SELECT state, owner_device_id, owner_session_id, handled_on, terminal_platform FROM calls WHERE call_id = ?", (call_id,)).fetchone()
             opened = connection.execute("SELECT event_seq, result FROM events WHERE call_id = ? ORDER BY event_seq", (call_id,)).fetchall()
-        blank = _submit(port, certificate, call_id, "blank", "   ", headers)
-        unparseable = _submit(port, certificate, call_id, "bad", "forty two", headers)
-        foreign_payload = _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "confirm", "confirmed": False}, headers=headers)
-        choice_payload = _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "choice", "selected_choices": ["Beta"]}, headers=headers)
+        tokenless = _submit(port, certificate, call_id, "tokenless", "42", headers)
+        blank = _submit(port, certificate, call_id, "blank", "   ", writer)
+        unparseable = _submit(port, certificate, call_id, "bad", "forty two", writer)
+        foreign_payload = _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "confirm", "confirmed": False}, headers=writer)
+        choice_payload = _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "choice", "selected_choices": ["Beta"]}, headers=writer)
         foreign = _submit(port, certificate, call_id, "foreign", "42", {"Cookie": owner_cookie, "X-CSRF-Token": owner_csrf, "Origin": "https://evil.example"})
         other = _submit(port, certificate, call_id, "other", "42", _headers(other_cookie, other_csrf, port))
         with sqlite3.connect(database) as connection:
@@ -220,6 +224,7 @@ def test_tls_iphone_numeric_input_rejects_invalid_types_and_untrusted_writers_wi
         _stop(process)
 
     assert preaccept[0] in {400, 401, 403, 409}
+    assert tokenless[0] == 403
     assert blank[0] == unparseable[0] == foreign_payload[0] == choice_payload[0] == 400
     assert foreign[0] in {400, 403}
     assert other[0] in {400, 401, 403, 404, 409}
@@ -268,6 +273,7 @@ def test_tls_expired_accepted_iphone_numeric_input_settles_disconnect_before_sub
         cookie, csrf = _login(port, certificate)
         headers = _headers(cookie, csrf, port)
         assert _accept(port, certificate, call_id, headers)[0] == 200
+        writer = _writer_headers(port, certificate, call_id, headers, "numeric-expiry")
         with sqlite3.connect(database) as connection:
             connection.execute("UPDATE calls SET terminal_last_seen_at = ?, terminal_disconnect_deadline = ? WHERE call_id = ?", ((datetime.now(UTC) - timedelta(seconds=181)).isoformat(), (datetime.now(UTC) - timedelta(seconds=1)).isoformat(), call_id))
             connection.commit()
@@ -279,7 +285,7 @@ def test_tls_expired_accepted_iphone_numeric_input_settles_disconnect_before_sub
         _wait_for_listener(process, port)
         with sqlite3.connect(database) as connection:
             settled = connection.execute("SELECT state, owner_session_id FROM calls WHERE call_id = ?", (call_id,)).fetchone()
-        late = _submit(port, certificate, call_id, "expired-numeric", " 3.5 ", headers)
+        late = _submit(port, certificate, call_id, "expired-numeric", " 3.5 ", writer)
         other_cookie, other_csrf = _login(port, certificate)
         foreign = _submit(port, certificate, call_id, "foreign-expired", " 3.5 ", _headers(other_cookie, other_csrf, port))
         _, continuation, _ = _post(port, certificate, _continuation("numeric-expired-event", interaction_id, call_id, 1), "test-token-alpha")
