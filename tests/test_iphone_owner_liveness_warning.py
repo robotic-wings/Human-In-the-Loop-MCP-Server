@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -24,6 +25,18 @@ def _accepted_owner(tmp_path: Path, request_id: str):
     owner_cookie, owner_csrf = _login(port, certificate)
     _accept(port, certificate, call_id, _headers(owner_cookie, owner_csrf, port))
     return port, config, certificate, process, call_id, owner_cookie, owner_csrf
+
+
+def _configure_desktop_terminal(config: Path) -> None:
+    credentials = config.parent / "terminal-credentials.json"
+    credentials.write_text(
+        json.dumps({"desktop-token": {"device_id": "desktop-registered", "terminal_platform": "windows"}}),
+        encoding="utf-8",
+    )
+    raw = json.loads(config.read_text(encoding="utf-8"))
+    raw["terminal_credentials_file"] = str(credentials)
+    raw["eligible_desktop_device_ids"] = ["desktop-registered"]
+    config.write_text(json.dumps(raw), encoding="utf-8")
 
 
 def _snapshot(database: Path, call_id: str) -> tuple[object, ...]:
@@ -76,6 +89,62 @@ def test_tls_liveness_warning_is_owner_only_and_read_only(tmp_path: Path) -> Non
     assert owner[0] == other[0] == api_read[0] == 200
     assert 'data-owner-liveness-warning' not in str(other[2])
     assert before == after
+
+
+def test_tls_warning_is_absent_for_ringing_desktop_owner_and_terminal_contexts(tmp_path: Path) -> None:
+    # Ringing browser views are summaries, not an owner-liveness session.
+    ring_port = _free_port()
+    ring_config, ring_certificate = _write_operator_config(tmp_path / "ringing", ring_port)
+    _configure_phone_route(ring_config)
+    ring_process = _start(ring_config)
+    _wait_for_listener(ring_process, ring_port)
+    try:
+        ringing = _create_call(ring_port, ring_certificate, "owner-warning-ringing")
+        ring_id = ringing["call_id"]
+        assert isinstance(ring_id, str)
+        ring_cookie, _ = _login(ring_port, ring_certificate)
+        ring_database = tmp_path / "ringing" / "data" / "calls.sqlite3"
+        ring_before = _snapshot(ring_database, ring_id)
+        ring_page = _request(ring_port, ring_certificate, "GET", f"/calls/{ring_id}", headers={"Cookie": ring_cookie})
+        ring_after = _snapshot(ring_database, ring_id)
+    finally:
+        _stop(ring_process)
+
+    desktop_port = _free_port()
+    desktop_config, desktop_certificate = _write_operator_config(tmp_path / "desktop", desktop_port)
+    _configure_phone_route(desktop_config)
+    _configure_desktop_terminal(desktop_config)
+    desktop_process = _start(desktop_config)
+    _wait_for_listener(desktop_process, desktop_port)
+    try:
+        desktop_call = _create_call(desktop_port, desktop_certificate, "owner-warning-desktop")
+        desktop_id = desktop_call["call_id"]
+        assert isinstance(desktop_id, str)
+        accepted = _request(
+            desktop_port, desktop_certificate, "POST", f"/api/calls/{desktop_id}/accept",
+            body={"action_id": "desktop-owner-accept", "owner_session_id": "desktop-owner-session"},
+            headers={"Authorization": "Bearer desktop-token"},
+        )
+        desktop_cookie, _ = _login(desktop_port, desktop_certificate)
+        desktop_database = tmp_path / "desktop" / "data" / "calls.sqlite3"
+        desktop_before = _snapshot(desktop_database, desktop_id)
+        desktop_page = _request(
+            desktop_port, desktop_certificate, "GET", f"/calls/{desktop_id}", headers={"Cookie": desktop_cookie},
+        )
+        terminal_state = _request(
+            desktop_port, desktop_certificate, "GET", "/api/terminals/state", headers={"Authorization": "Bearer desktop-token"},
+        )
+        desktop_after = _snapshot(desktop_database, desktop_id)
+    finally:
+        _stop(desktop_process)
+
+    assert ring_page[0] == 200 and 'data-owner-liveness-warning' not in str(ring_page[2])
+    assert ring_before == ring_after
+    assert accepted[0] == 200 and isinstance(accepted[2], dict) and accepted[2]["handled_on"] == "desktop"
+    assert desktop_page[0] == terminal_state[0] == 200
+    assert 'data-owner-liveness-warning' not in str(desktop_page[2])
+    assert 'data-owner-liveness-warning' not in str(terminal_state[2])
+    assert desktop_before == desktop_after
 
 
 def test_tls_owner_warning_reads_do_not_revive_expired_call_or_leak_to_denied_readers(tmp_path: Path) -> None:
