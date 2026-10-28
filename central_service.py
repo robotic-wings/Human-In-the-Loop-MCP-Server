@@ -1937,6 +1937,11 @@ class _PublicHandler(BaseHTTPRequestHandler):
         submission_script = ""
         writer_script = ""
         writer_controls = ""
+        # This control is deliberately page-local.  It reuses the existing
+        # operator-session boundary and does not carry any call authority.
+        logout_control = (
+            '<button data-operator-logout data-endpoint="/api/operator/logout">Sign out</button>'
+        )
         if call_state == "ringing":
             ring_deadline = state.get("ring_deadline")
             deadline_value = ring_deadline if isinstance(ring_deadline, str) else ""
@@ -2331,11 +2336,17 @@ class _PublicHandler(BaseHTTPRequestHandler):
             "body:JSON.stringify({action_id:crypto.randomUUID()})});"
             "if(response.ok)location.reload();"
             "}));"
+            "document.querySelector('[data-operator-logout]').addEventListener('click',async()=>{"
+            "const button=document.querySelector('[data-operator-logout]');"
+            "const response=await fetch(button.dataset.endpoint,{method:'POST',credentials:'same-origin',"
+            "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:'{}'});"
+            "if(response.ok)location.reload();"
+            "});"
             f"{submission_script}"
             f"{authoritative_poll_script}"
             f"{heartbeat_script}"
             "</script>"
-            f"<a href=\"{endpoint}\">Refresh</a></main>"
+            f"<a href=\"{endpoint}\">Refresh</a>{logout_control}</main>"
         )
     def _start_chunked_json(self, status: HTTPStatus) -> None:
         self.send_response(status)
