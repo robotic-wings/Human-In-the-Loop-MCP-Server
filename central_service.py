@@ -1230,6 +1230,9 @@ class _OperatorGateway:
                 draft = self._coordinator.read_terminal_draft(call_id, "iphone_web", session)
                 if draft is not None:
                     state["_draft"] = draft
+                pending_attachments = self._coordinator.read_iphone_pending_attachments(call_id, session)
+                if pending_attachments is not None:
+                    state["_pending_attachments"] = pending_attachments
             if _is_feedback_message(state.get("message")) and state.get("_page_session_matches_owner"):
                 with self._lock:
                     self._feedback_forms.add((session, call_id))
@@ -1427,19 +1430,32 @@ class _OperatorGateway:
             user_input = payload.get("user_input")
             if not isinstance(user_input, str) or not user_input or "confirmed" in payload:
                 return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
+            attachment_ids = payload.get("attachment_ids")
+            if attachment_ids is not None and (
+                not isinstance(attachment_ids, list)
+                or any(not isinstance(item, str) or not item for item in attachment_ids)
+            ):
+                return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
             numeric_input = self._coordinator.numeric_input_type_for_call(call_id) is not None
             multiline_input = self._coordinator.multiline_default_for_call(call_id) is not None
             if numeric_input:
+                if attachment_ids is not None:
+                    return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
                 result = self._coordinator.submit_terminal_numeric_input(
                     call_id, "iphone_web", session or "", submission_id, user_input
                 )
             elif multiline_input:
+                if attachment_ids is not None:
+                    return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
                 result = self._coordinator.submit_terminal_multiline_input(
                     call_id, "iphone_web", session or "", submission_id, user_input
                 )
             else:
+                if not set(payload).issubset({"submission_id", "user_input", "attachment_ids"}):
+                    return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
                 result = self._coordinator.submit_terminal_text(
-                    call_id, "iphone_web", session or "", submission_id, user_input, operator_owner=True
+                    call_id, "iphone_web", session or "", submission_id, user_input,
+                    attachment_ids=attachment_ids, operator_owner=True,
                 )
         if result is None:
             # An authenticated operator may know a ringing call without owning
@@ -2123,7 +2139,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         "draftSave.addEventListener('click',async()=>{const response=await fetch(draftSave.dataset.endpoint,{method:'PUT',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({body:draftInput.value,expected_draft_version:Number(draftInput.dataset.draftVersion)})});if(response.ok){const saved=await response.json();draftInput.dataset.draftVersion=String(saved.draft_version);draftStatus.dataset.draftStatus='saved';draftStatus.textContent='saved';}});"
                         "document.querySelectorAll('button[data-text-input]').forEach((button)=>"
                         "button.addEventListener('click',async()=>{const textarea=document.querySelector('textarea[name=user_input]');"
-                        "const user_input=textarea.value;const response=await fetch(button.dataset.endpoint,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({submission_id:crypto.randomUUID(),user_input:user_input})});if(response.ok)location.reload();}));"
+                        "const user_input=textarea.value;const response=await fetch(button.dataset.endpoint,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({submission_id:crypto.randomUUID(),user_input:user_input,attachment_ids:pendingAttachmentIds})});if(response.ok)location.reload();}));"
                     )
                 attachment_controls = (
                     '<form data-attachment-form enctype="multipart/form-data">'
@@ -2132,16 +2148,32 @@ class _PublicHandler(BaseHTTPRequestHandler):
                     '<ul data-attachment-list></ul>'
                     '<button data-attachment-upload>Upload file</button>'
                 )
+                pending_attachments = state.get("_pending_attachments")
+                pending_json = json.dumps(
+                    pending_attachments if isinstance(pending_attachments, list) else [],
+                    separators=(",", ":"),
+                ).replace("<", "\\u003c")
                 attachment_script = (
+                    f"const pendingAttachmentMetadata={pending_json};const pendingAttachmentIds=pendingAttachmentMetadata.map((attachment)=>attachment.attachment_id);"
                     "const attachmentFile=document.querySelector('input[data-attachment-file]');"
                     "const attachmentStatus=document.querySelector('[data-attachment-status]');"
                     "const attachmentList=document.querySelector('[data-attachment-list]');"
                     "document.querySelector('button[data-attachment-upload]').addEventListener('click',async(event)=>{"
                     "const file=attachmentFile.files[0];if(!file){return;}const form=new FormData();form.append('file',file,file.name);"
                     f"const response=await fetch('{endpoint}/attachments',{{method:'POST',credentials:'same-origin',headers:{{'X-Writer-Token':writerToken}},body:form}});"
-                    "if(response.ok){const uploaded=await response.json();const item=document.createElement('li');item.textContent=uploaded.attachment.name+' ('+uploaded.attachment.byte_count+' bytes)';attachmentList.append(item);attachmentStatus.setAttribute('data-attachment-status','saved');attachmentStatus.textContent='saved';}"
+                    "if(response.ok){const uploaded=await response.json();pendingAttachmentIds.push(uploaded.attachment.attachment_id);const item=document.createElement('li');item.textContent=uploaded.attachment.name+' ('+uploaded.attachment.byte_count+' bytes)';attachmentList.append(item);attachmentStatus.setAttribute('data-attachment-status','saved');attachmentStatus.textContent='saved';}"
                     "else{attachmentStatus.outerHTML='<p data-attachment-status=\"failed\">Upload failed.</p>';}});"
                 )
+                pending_items = "".join(
+                    "<li data-attachment-id=\"%s\">%s (%s bytes)</li>" % (
+                        html.escape(str(item.get("attachment_id", "")), quote=True),
+                        html.escape(str(item.get("name", ""))),
+                        html.escape(str(item.get("byte_count", ""))),
+                    )
+                    for item in (pending_attachments if isinstance(pending_attachments, list) else [])
+                    if isinstance(item, dict)
+                )
+                attachment_controls = attachment_controls.replace('<ul data-attachment-list></ul>', f'<ul data-attachment-list>{pending_items}</ul>')
                 controls += attachment_controls
                 submission_script += attachment_script
                 heartbeat_script = (
