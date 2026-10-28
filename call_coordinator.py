@@ -801,6 +801,7 @@ class CallCoordinator:
                 and (
                     not isinstance(attachment_ids, list)
                     or any(not isinstance(attachment_id, str) or not attachment_id for attachment_id in attachment_ids)
+                    or len(set(attachment_ids)) != len(attachment_ids)
                 )
             )
         ):
@@ -1699,6 +1700,32 @@ class CallCoordinator:
             return self._archive_accepted_attachment(
                 connection, call_id, original_name, media_type, content
             )
+
+    def read_iphone_pending_attachments(
+        self, call_id: str, owner_session_id: str,
+    ) -> list[dict[str, Any]] | None:
+        """Read this accepted iPhone owner's archive metadata without liveness effects."""
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT state, owner_device_id, owner_session_id FROM calls WHERE call_id = ?",
+                (call_id,),
+            ).fetchone()
+            if row is None or not (
+                row["state"] in {"accepted", "in_progress"}
+                and row["owner_device_id"] == "iphone_web"
+                and row["owner_session_id"] == owner_session_id
+            ):
+                return None
+            rows = self._connection.execute(
+                "SELECT attachment_id, original_name, media_type, byte_count, sha256 "
+                "FROM attachments WHERE call_id = ? ORDER BY rowid",
+                (call_id,),
+            ).fetchall()
+            return [{
+                "attachment_id": item["attachment_id"], "name": item["original_name"],
+                "media_type": item["media_type"], "byte_count": item["byte_count"],
+                "sha256": item["sha256"],
+            } for item in rows]
 
     def _archive_accepted_attachment(
         self, connection: sqlite3.Connection, call_id: str, original_name: str,
