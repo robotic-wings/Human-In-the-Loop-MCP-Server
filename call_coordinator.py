@@ -354,11 +354,13 @@ class CallCoordinator:
 
     def cancel_iphone_call(
         self, call_id: str, session_id: str, action_id: str, cancelled: object,
+        feedback_requested: object = False,
     ) -> dict[str, Any] | None:
         """Cancel one phone-routed task from its accepted browser session."""
         scoped_action_id = f"iphone:{session_id}:{call_id}:{action_id}"
         action = asdict(CancelCall(call_id, scoped_action_id, "iphone_web", session_id))
         action["cancelled"] = cancelled
+        action["feedback_requested"] = feedback_requested
         payload = self._canonical(action)
         with self._write_transaction() as connection:
             try:
@@ -379,7 +381,7 @@ class CallCoordinator:
             ).fetchone()
             if replay is not None:
                 return self._decode(replay["result"]) if replay["payload"] == payload else self._conflict()
-            if cancelled is not True:
+            if cancelled is not True or not isinstance(feedback_requested, bool):
                 return {"success": False, "status": "invalid_submission"}
             self._settle_if_expired(connection, row)
             row = self._call_or_raise(connection, call_id)
@@ -387,7 +389,7 @@ class CallCoordinator:
                 return self._current_result(connection, row)
             if not self._is_task_request(row["message"]):
                 return {"success": False, "status": "invalid_submission"}
-            result = self._cancel(connection, row)
+            result = self._cancel(connection, row, feedback_requested=feedback_requested)
             connection.execute(
                 "INSERT INTO cancel_operations (caller_id, request_id, payload, result) VALUES (?, ?, ?, ?)",
                 (f"iphone:{session_id}:{call_id}", action_id, payload, self._canonical(result)),
@@ -1320,6 +1322,7 @@ class CallCoordinator:
     def submit_terminal_task_final(
         self, call_id: str, device_id: str, owner_session_id: str,
         submission_id: str, status: object, report: object, task_version: object = 0,
+        feedback_requested: object = False,
     ) -> dict[str, Any] | None:
         """Persist one completed or failed terminal report from its task owner."""
         if (
@@ -1330,12 +1333,16 @@ class CallCoordinator:
             or not isinstance(task_version, int)
             or isinstance(task_version, bool)
             or task_version < 0
+            or not isinstance(feedback_requested, bool)
         ):
             return {"success": False, "status": "invalid_submission"}
         normalized_report = report.strip()
         if not normalized_report:
             return {"success": False, "status": "invalid_submission"}
-        payload = self._canonical({"status": status, "report": normalized_report, "task_version": task_version})
+        payload = self._canonical({
+            "status": status, "report": normalized_report, "task_version": task_version,
+            "feedback_requested": feedback_requested,
+        })
         with self._write_transaction() as connection:
             try:
                 row = self._call_or_raise(connection, call_id)
@@ -1377,6 +1384,8 @@ class CallCoordinator:
                 "handled_on": row["handled_on"], "terminal_platform": row["terminal_platform"],
                 "report": normalized_report, "resubmittable": True, "result_id": str(uuid.uuid4()),
             }
+            if feedback_requested:
+                result["feedback_requested"] = True
             connection.execute("UPDATE calls SET state = ?, version = version + 1 WHERE call_id = ?", (status, call_id))
             self._add_event(connection, call_id, result)
             connection.execute(
@@ -2455,7 +2464,9 @@ class CallCoordinator:
         self._add_event(connection, row["call_id"], result)
         return result
 
-    def _cancel(self, connection: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+    def _cancel(
+        self, connection: sqlite3.Connection, row: sqlite3.Row, *, feedback_requested: bool = False,
+    ) -> dict[str, Any]:
         result = self._envelope(
             status="cancelled",
             call_state="cancelled",
@@ -2472,6 +2483,8 @@ class CallCoordinator:
         )
         if self._is_task_request(row["message"]):
             result["task_id"] = row["interaction_id"]
+        if feedback_requested:
+            result["feedback_requested"] = True
         connection.execute(
             "UPDATE calls SET state = 'cancelled', version = version + 1 WHERE call_id = ?",
             (row["call_id"],),

@@ -1396,10 +1396,12 @@ class _OperatorGateway:
                 payload["feedback_type"], payload["feedback_text"],
             )
         elif "status" in payload or "report" in payload:
-            allowed_task_fields = {"submission_id", "status", "report", "task_version"}
+            allowed_task_fields = {"submission_id", "status", "report", "task_version", "feedback_requested"}
             if not set(payload).issubset(allowed_task_fields) or not {"submission_id", "status", "report"}.issubset(payload):
                 return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
             if payload["status"] == "in_progress":
+                if payload.get("feedback_requested") is not None:
+                    return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
                 task_progress_submission = True
                 result = self._coordinator.submit_terminal_task_progress(
                     call_id, "iphone_web", session or "", submission_id, payload["report"],
@@ -1409,6 +1411,7 @@ class _OperatorGateway:
                 result = self._coordinator.submit_terminal_task_final(
                     call_id, "iphone_web", session or "", submission_id,
                     payload["status"], payload["report"], payload.get("task_version", 0),
+                    payload.get("feedback_requested", False),
                 )
         elif "selected_choices" in payload and "user_input" not in payload and "confirmed" not in payload:
             if self._coordinator.multiple_choice_options_for_call(call_id) is not None:
@@ -1523,7 +1526,7 @@ class _OperatorGateway:
             or origin != f"https://{self._expected_host}"
             or host != self._expected_host
             or not isinstance(payload, dict)
-            or set(payload) != {"action_id", "cancelled"}
+            or not set(payload).issubset({"action_id", "cancelled", "feedback_requested"})
             or not isinstance(payload.get("action_id"), str)
             or not payload["action_id"]
             or not isinstance(payload.get("cancelled"), bool)
@@ -1532,6 +1535,7 @@ class _OperatorGateway:
             return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
         result = self._coordinator.cancel_iphone_call(
             call_id, session or "", payload["action_id"], payload["cancelled"],
+            payload.get("feedback_requested", False),
         )
         if result is None:
             return HTTPStatus.CONFLICT, {"error": "cannot cancel"}
@@ -1961,6 +1965,10 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         f'<button data-task-final="completed" data-task-version="{html.escape(str(task_version), quote=True)}" data-endpoint="{endpoint}/submissions">Completed</button>'
                         f'<button data-task-final="failed" data-task-version="{html.escape(str(task_version), quote=True)}" data-endpoint="{endpoint}/submissions">Failed</button>'
                         f'<button data-task-cancel="true" data-endpoint="{endpoint}/cancel">Cancel task</button>'
+                        f'<button data-task-feedback-exit="completed" data-task-version="{html.escape(str(task_version), quote=True)}" data-endpoint="{endpoint}/submissions">Complete and request feedback</button>'
+                        f'<button data-task-feedback-exit="failed" data-task-version="{html.escape(str(task_version), quote=True)}" data-endpoint="{endpoint}/submissions">Fail and request feedback</button>'
+                        f'<button data-task-feedback-exit="cancelled" data-endpoint="{endpoint}/submissions">Cancel and request feedback</button>'
+                        '<button data-task-feedback-exit="withdraw">Withdraw feedback request</button>'
                     )
                     submission_script = (
                         "const progress=document.querySelector('button[data-task-progress]');"
@@ -1971,35 +1979,44 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:body})"
                         ".then((response)=>{if(response.ok)location.reload();});"
                         "});"
-                        "const completed=document.querySelector('button[data-task-final=\"completed\"]');"
+                        "const normalCompleted=document.querySelector('button[data-task-final=\"completed\"]');"
+                        "normalCompleted.addEventListener('click',()=>{const status=normalCompleted.dataset.taskFinal;const report=document.querySelector('textarea[data-task-report]').value;const body=JSON.stringify({submission_id:crypto.randomUUID(),status:status,report:report,task_version:Number(normalCompleted.dataset.taskVersion)});fetch(normalCompleted.dataset.endpoint,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:body}).then((response)=>{if(response.ok)location.reload();});});"
+                        "const normalFailed=document.querySelector('button[data-task-final=\"failed\"]');"
+                        "normalFailed.addEventListener('click',()=>{const status=normalFailed.dataset.taskFinal;const report=document.querySelector('textarea[data-task-report]').value;const body=JSON.stringify({submission_id:crypto.randomUUID(),status:status,report:report,task_version:Number(normalFailed.dataset.taskVersion)});fetch(normalFailed.dataset.endpoint,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:body}).then((response)=>{if(response.ok)location.reload();});});"
+                        "document.querySelector('button[data-task-cancel]').addEventListener('click',()=>{"
+                        "fetch(document.querySelector('button[data-task-cancel]').dataset.endpoint,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({action_id:crypto.randomUUID(),cancelled:true})}).then((response)=>{if(response.ok)location.reload();});"
+                        "});"
+                        "const completed=document.querySelector('button[data-task-feedback-exit=\"completed\"]');"
                         "completed.addEventListener('click',()=>{"
-                        "const status=completed.dataset.taskFinal;"
+                        "const status=completed.dataset.taskFeedbackExit;"
                         "const taskVersion=Number(completed.dataset.taskVersion);"
                         "const report=document.querySelector('textarea[data-task-report]').value;"
-                        "const body=JSON.stringify({submission_id:crypto.randomUUID(),status:status,report:report,task_version:taskVersion});"
+                        "const body=JSON.stringify({submission_id:crypto.randomUUID(),status:status,report:report,task_version:taskVersion,feedback_requested:true});"
                         "fetch(completed.dataset.endpoint,{method:'POST',credentials: 'same-origin',"
                         "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},"
                         "body:body})"
                         ".then((response)=>{if(response.ok)location.reload();});"
                         "});"
-                        "const failed=document.querySelector('button[data-task-final=\"failed\"]');"
+                        "const failed=document.querySelector('button[data-task-feedback-exit=\"failed\"]');"
                         "failed.addEventListener('click',()=>{"
-                        "const status=failed.dataset.taskFinal;"
+                        "const status=failed.dataset.taskFeedbackExit;"
                         "const taskVersion=Number(failed.dataset.taskVersion);"
                         "const report=document.querySelector('textarea[data-task-report]').value;"
-                        "const body=JSON.stringify({submission_id:crypto.randomUUID(),status:status,report:report,task_version:taskVersion});"
+                        "const body=JSON.stringify({submission_id:crypto.randomUUID(),status:status,report:report,task_version:taskVersion,feedback_requested:true});"
                         "fetch(failed.dataset.endpoint,{method:'POST',credentials: 'same-origin',"
                         "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},"
                         "body:body})"
                         ".then((response)=>{if(response.ok)location.reload();});"
                         "});"
-                        "const cancel=document.querySelector('button[data-task-cancel]');"
+                        "const cancel=document.querySelector('button[data-task-feedback-exit=\"cancelled\"]');"
                         "cancel.addEventListener('click',()=>{"
-                        "const body=JSON.stringify({action_id:crypto.randomUUID(),cancelled:true});"
-                        "fetch(cancel.dataset.endpoint,{method:'POST',credentials: 'same-origin',"
+                        "const body=JSON.stringify({action_id:crypto.randomUUID(),cancelled:true,feedback_requested:true});"
+                        f"fetch('{endpoint}/cancel',{{method:'POST',credentials: 'same-origin',"
                         "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:body})"
                         ".then((response)=>{if(response.ok)location.reload();});"
                         "});"
+                        "const withdraw=document.querySelector('button[data-task-feedback-exit=\"withdraw\"]');"
+                        "withdraw.addEventListener('click',()=>{document.querySelectorAll('button[data-task-feedback-exit]').forEach((button)=>{button.hidden=true;});});"
                     )
                 elif _is_feedback_message(state.get("message")):
                     options = "".join(
