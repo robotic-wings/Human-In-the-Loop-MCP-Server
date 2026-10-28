@@ -1222,10 +1222,53 @@ class _OperatorGateway:
         state = self._coordinator.operator_call_page(call_id)
         if state is not None:
             state["_page_session_matches_owner"] = state.get("owner_session_id") == session
+            if (
+                state.get("_page_session_matches_owner")
+                and state.get("owner_device_id") == "iphone_web"
+                and isinstance(session, str)
+            ):
+                draft = self._coordinator.read_terminal_draft(call_id, "iphone_web", session)
+                if draft is not None:
+                    state["_draft"] = draft
             if _is_feedback_message(state.get("message")) and state.get("_page_session_matches_owner"):
                 with self._lock:
                     self._feedback_forms.add((session, call_id))
         return state, csrf
+
+    def read_draft(self, session: str | None, call_id: str) -> tuple[HTTPStatus, dict[str, object]]:
+        """Read an accepted iPhone owner's persisted draft without a bearer route."""
+        if not self._session_exists(session) or not isinstance(session, str):
+            return HTTPStatus.NOT_FOUND, {"error": "not found"}
+        draft = self._coordinator.read_terminal_draft(call_id, "iphone_web", session)
+        if draft is None:
+            return HTTPStatus.NOT_FOUND, {"error": "not found"}
+        return HTTPStatus.OK, draft
+
+    def save_draft(
+        self, session: str | None, csrf: str | None, origin: str | None, host: str | None,
+        call_id: str, payload: object,
+    ) -> tuple[HTTPStatus, dict[str, object]]:
+        """CAS-save an iPhone owner draft through the operator-session boundary."""
+        if (
+            not self._session_matches(session, csrf)
+            or origin != f"https://{self._expected_host}"
+            or host != self._expected_host
+            or not isinstance(session, str)
+            or not isinstance(payload, dict)
+            or set(payload) != {"body", "expected_draft_version"}
+        ):
+            return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+        result = self._coordinator.save_terminal_draft(
+            call_id, "iphone_web", session, payload.get("body"), payload.get("expected_draft_version"),
+        )
+        if result is None:
+            return HTTPStatus.NOT_FOUND, {"error": "not found"}
+        if result.get("status") == "saved":
+            draft = result.get("draft")
+            return HTTPStatus.OK, draft if isinstance(draft, dict) else result
+        if result.get("status") == "invalid_draft":
+            return HTTPStatus.BAD_REQUEST, result
+        return HTTPStatus.CONFLICT, result
 
     def accept(
         self, session: str | None, csrf: str | None, origin: str | None, host: str | None,
@@ -1503,6 +1546,10 @@ class _PublicHandler(BaseHTTPRequestHandler):
             return
         draft_call_id = self._terminal_draft_call_id(path)
         if draft_call_id is not None:
+            if operator is not None and not self.headers.get("Authorization"):
+                status, response = operator.read_draft(self._operator_session(), draft_call_id)
+                self._send_json(status, response)
+                return
             terminal = self._terminal_gateway()
             identity = (
                 terminal.identity_for(self.headers.get("Authorization"))
@@ -1669,6 +1716,18 @@ class _PublicHandler(BaseHTTPRequestHandler):
 
     def do_PUT(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path
+        draft_call_id = self._terminal_draft_call_id(path)
+        operator = self._operator_gateway()
+        if draft_call_id is not None and operator is not None and not self.headers.get("Authorization"):
+            body_ok, payload = self._terminal_request_body()
+            if not body_ok:
+                return
+            status, response = operator.save_draft(
+                self._operator_session(), self.headers.get("X-CSRF-Token"), self.headers.get("Origin"),
+                self.headers.get("Host"), draft_call_id, payload,
+            )
+            self._send_json(status, response)
+            return
         authenticated = self._terminal_request_identity()
         if authenticated is None:
             return
@@ -1820,15 +1879,28 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         "}));"
                     )
                 elif multiline_default is not None:
-                    escaped_default = html.escape(multiline_default, quote=False)
+                    draft = state.get("_draft")
+                    draft_body = draft.get("body") if isinstance(draft, dict) else None
+                    draft_version = draft.get("draft_version", 0) if isinstance(draft, dict) else 0
+                    initial_body = draft_body if isinstance(draft_body, str) else multiline_default
+                    escaped_default = html.escape(initial_body, quote=False)
                     controls = (
-                        f'<textarea data-input-kind="multiline" data-default="{html.escape(multiline_default, quote=True)}">'
-                        f'{escaped_default}</textarea><button data-multiline-input data-endpoint="{endpoint}/submissions">Submit</button>'
+                        f'<textarea data-draft-input="multiline" data-input-kind="multiline" '
+                        f'data-default="{html.escape(multiline_default, quote=True)}" '
+                        f'data-draft-version="{html.escape(str(draft_version), quote=True)}">'
+                        f'{escaped_default}</textarea><p data-draft-status="saved">Saved</p>'
+                        f'<button data-draft-save data-endpoint="{endpoint}/draft">Save draft</button>'
+                        f'<button data-multiline-input data-endpoint="{endpoint}/submissions">Submit</button>'
                     )
                     submission_script = (
+                        "const draftInput=document.querySelector('[data-draft-input]');"
+                        "const draftStatus=document.querySelector('[data-draft-status]');"
+                        "const draftSave=document.querySelector('button[data-draft-save]');"
+                        "draftInput.addEventListener('input',()=>{draftStatus.dataset.draftStatus='not-synced';draftStatus.textContent='not-synced';});"
+                        "draftSave.addEventListener('click',async()=>{const response=await fetch(draftSave.dataset.endpoint,{method:'PUT',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({body:draftInput.value,expected_draft_version:Number(draftInput.dataset.draftVersion)})});if(response.ok){const saved=await response.json();draftInput.dataset.draftVersion=String(saved.draft_version);draftStatus.dataset.draftStatus='saved';draftStatus.textContent='saved';}});"
                         "document.querySelectorAll('button[data-multiline-input]').forEach((button)=>"
                         "button.addEventListener('click',()=>{"
-                        "const textarea=document.querySelector('textarea[data-input-kind=multiline]');"
+                        "const textarea=document.querySelector('textarea[data-draft-input=multiline]');"
                         "const user_input=textarea.value;"
                         "fetch(button.dataset.endpoint,{method:'POST',credentials:'same-origin',"
                         "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},"
@@ -1899,9 +1971,26 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         "}));"
                     )
                 else:
+                    draft = state.get("_draft")
+                    draft_body = draft.get("body") if isinstance(draft, dict) else None
+                    draft_version = draft.get("draft_version", 0) if isinstance(draft, dict) else 0
                     controls = (
-                        f'<form data-endpoint="{endpoint}/submissions"><textarea name="user_input"></textarea>'
-                        '<input name="submission_id"><button>Submit</button></form>'
+                        f'<textarea name="user_input" data-draft-input="text" '
+                        f'data-draft-version="{html.escape(str(draft_version), quote=True)}">'
+                        f'{html.escape(draft_body if isinstance(draft_body, str) else "", quote=False)}</textarea>'
+                        '<p data-draft-status="saved">Saved</p>'
+                        f'<button data-draft-save data-endpoint="{endpoint}/draft">Save draft</button>'
+                        f'<button data-text-input data-endpoint="{endpoint}/submissions">Submit</button>'
+                    )
+                    submission_script = (
+                        "const draftInput=document.querySelector('textarea[name=user_input][data-draft-input=text]');"
+                        "const draftStatus=document.querySelector('[data-draft-status]');"
+                        "const draftSave=document.querySelector('button[data-draft-save]');"
+                        "draftInput.addEventListener('input',()=>{draftStatus.dataset.draftStatus='not-synced';draftStatus.textContent='not-synced';});"
+                        "draftSave.addEventListener('click',async()=>{const response=await fetch(draftSave.dataset.endpoint,{method:'PUT',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({body:draftInput.value,expected_draft_version:Number(draftInput.dataset.draftVersion)})});if(response.ok){const saved=await response.json();draftInput.dataset.draftVersion=String(saved.draft_version);draftStatus.dataset.draftStatus='saved';draftStatus.textContent='saved';}});"
+                        "document.querySelectorAll('button[data-text-input]').forEach((button)=>"
+                        "button.addEventListener('click',async()=>{const textarea=document.querySelector('textarea[name=user_input]');"
+                        "const user_input=textarea.value;const response=await fetch(button.dataset.endpoint,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({submission_id:crypto.randomUUID(),user_input:user_input})});if(response.ok)location.reload();}));"
                     )
                 heartbeat_script = (
                     f"const heartbeatEndpoint='{endpoint}/heartbeat';"

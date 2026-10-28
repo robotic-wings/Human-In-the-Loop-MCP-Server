@@ -613,7 +613,7 @@ class CallCoordinator:
     ) -> dict[str, Any] | None:
         """Return a draft only to the accepted terminal session that owns it."""
         with self._write_transaction() as connection:
-            row = self._routed_terminal_call(connection, device_id, call_id)
+            row = self._draft_terminal_call(connection, device_id, call_id)
             if row is None:
                 return None
             self._settle_if_expired(connection, row)
@@ -644,7 +644,7 @@ class CallCoordinator:
         ):
             return {"success": False, "status": "invalid_draft"}
         with self._write_transaction() as connection:
-            row = self._routed_terminal_call(connection, device_id, call_id)
+            row = self._draft_terminal_call(connection, device_id, call_id)
             if row is None:
                 return None
             self._settle_if_expired(connection, row)
@@ -670,6 +670,19 @@ class CallCoordinator:
                 "status": "saved",
                 "draft": {"body": body, "draft_version": draft_version},
             }
+
+    def _draft_terminal_call(
+        self, connection: sqlite3.Connection, device_id: str, call_id: str,
+    ) -> sqlite3.Row | None:
+        """Apply the durable route authority for the two draft namespaces."""
+        if device_id == "iphone_web":
+            return connection.execute(
+                "SELECT calls.* FROM calls JOIN bark_deliveries "
+                "ON bark_deliveries.call_id = calls.call_id "
+                "WHERE calls.call_id = ?",
+                (call_id,),
+            ).fetchone()
+        return self._routed_terminal_call(connection, device_id, call_id)
 
     def submit_terminal_text(
         self,
