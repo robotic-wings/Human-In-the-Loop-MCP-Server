@@ -37,6 +37,13 @@ def _submit(port: int, certificate: Path, call_id: str, submission_id: str, stat
     return _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": submission_id, "status": status, "report": report}, headers=headers)
 
 
+def _owner_writer_headers(port: int, certificate: Path, call_id: str, cookie: str, csrf: str) -> dict[str, str]:
+    headers = _headers(cookie, csrf, port)
+    acquired = _request(port, certificate, "POST", f"/api/calls/{call_id}/writer/acquire", body={"page_id": "task-final", "action_id": f"writer-{call_id}"}, headers=headers)
+    assert acquired[0] == 200 and isinstance(acquired[2], dict) and acquired[2].get("writable") is True and isinstance(acquired[2].get("writer_token"), str) and acquired[2]["writer_token"]
+    return {**headers, "X-Writer-Token": acquired[2]["writer_token"]}
+
+
 def _task_continuation(request_id: str, task_id: str, call_id: str, after_event_seq: int) -> dict[str, object]:
     request = _continuation(request_id, task_id, call_id, after_event_seq)
     arguments = request["params"]["arguments"]
@@ -82,7 +89,7 @@ def test_tls_accepted_iphone_task_completed_persists_replays_and_delivers_agent_
         created = _call(port, certificate, "task-completed"); call_id, task_id = created["call_id"], created["interaction_id"]; assert isinstance(call_id, str) and isinstance(task_id, str)
         cookie, csrf = _login(port, certificate); headers = _headers(cookie, csrf, port); assert _accept(port, certificate, call_id, headers)[0] == 200
         with sqlite3.connect(database) as connection: before = connection.execute("SELECT state, owner_device_id, owner_session_id, version FROM calls WHERE call_id = ?", (call_id,)).fetchone(); events = connection.execute("SELECT event_seq FROM events WHERE call_id = ?", (call_id,)).fetchall()
-        page_csrf = _page(_request(port, certificate, "GET", f"/calls/{call_id}", headers={"Cookie": cookie})[2], call_id); protected = _headers(cookie, page_csrf, port)
+        page_csrf = _page(_request(port, certificate, "GET", f"/calls/{call_id}", headers={"Cookie": cookie})[2], call_id); protected = _owner_writer_headers(port, certificate, call_id, cookie, page_csrf)
         with sqlite3.connect(database) as connection: assert connection.execute("SELECT state, owner_device_id, owner_session_id, version FROM calls WHERE call_id = ?", (call_id,)).fetchone() == before; assert connection.execute("SELECT event_seq FROM events WHERE call_id = ?", (call_id,)).fetchall() == events
         first = _submit(port, certificate, call_id, "task-final", "completed", "  Finished safely.  ", protected); replay = _submit(port, certificate, call_id, "task-final", "completed", "Finished safely.", protected); conflict = _submit(port, certificate, call_id, "task-final", "failed", "Finished safely.", protected)
         _, event, _ = _post(port, certificate, _task_continuation("task-event", task_id, call_id, 1), "test-token-alpha")
@@ -97,7 +104,7 @@ def test_tls_accepted_iphone_task_failed_is_a_distinct_human_terminal_report(tmp
     port = _free_port(); config, certificate = _write_operator_config(tmp_path, port); _configure_phone_route(config); database = tmp_path / "data" / "calls.sqlite3"; process = _start(config); _wait_for_listener(process, port)
     try:
         created = _call(port, certificate, "task-failed"); call_id, task_id = created["call_id"], created["interaction_id"]; assert isinstance(call_id, str) and isinstance(task_id, str)
-        cookie, csrf = _login(port, certificate); headers = _headers(cookie, csrf, port); assert _accept(port, certificate, call_id, headers)[0] == 200
+        cookie, csrf = _login(port, certificate); headers = _headers(cookie, csrf, port); assert _accept(port, certificate, call_id, headers)[0] == 200; headers = _owner_writer_headers(port, certificate, call_id, cookie, csrf)
         failed = _submit(port, certificate, call_id, "task-failed", "failed", "  Access was denied.  ", headers); _, event, _ = _post(port, certificate, _task_continuation("task-failed-event", task_id, call_id, 1), "test-token-alpha")
         with sqlite3.connect(database) as connection: state = connection.execute("SELECT state, handled_on, terminal_platform FROM calls WHERE call_id = ?", (call_id,)).fetchone(); operations = connection.execute("SELECT count(*) FROM submission_operations WHERE call_id = ?", (call_id,)).fetchone()[0]
     finally: _stop(process)
@@ -110,11 +117,11 @@ def test_tls_iphone_task_rejects_invalid_foreign_route_and_late_writers_without_
     port = _free_port(); config, certificate = _write_operator_config(tmp_path, port); _configure_phone_route(config); database = tmp_path / "data" / "calls.sqlite3"; process = _start(config); _wait_for_listener(process, port)
     try:
         created = _call(port, certificate, "task-security"); call_id, task_id = created["call_id"], created["interaction_id"]; assert isinstance(call_id, str) and isinstance(task_id, str)
-        owner_cookie, owner_csrf = _login(port, certificate); other_cookie, other_csrf = _login(port, certificate); owner = _headers(owner_cookie, owner_csrf, port); assert _accept(port, certificate, call_id, owner)[0] == 200
+        owner_cookie, owner_csrf = _login(port, certificate); other_cookie, other_csrf = _login(port, certificate); owner = _headers(owner_cookie, owner_csrf, port); assert _accept(port, certificate, call_id, owner)[0] == 200; protected = _owner_writer_headers(port, certificate, call_id, owner_cookie, owner_csrf)
         with sqlite3.connect(database) as connection: before = connection.execute("SELECT state, owner_device_id, owner_session_id FROM calls WHERE call_id = ?", (call_id,)).fetchone(); events = connection.execute("SELECT event_seq FROM events WHERE call_id = ?", (call_id,)).fetchall()
-        bad = [_submit(port, certificate, call_id, "bad-status", "other", "x", owner), _submit(port, certificate, call_id, "blank", "completed", "   ", owner), _submit(port, certificate, call_id, "type", "completed", 1, owner), _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "wrong-form", "status": "completed", "report": "x", "confirmed": False}, headers=owner), _submit(port, certificate, call_id, "foreign", "completed", "x", _headers(other_cookie, other_csrf, port)), _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "cross", "status": "completed", "report": "x"}, headers={**owner, "Origin": "https://evil.example"})]
+        bad = [_submit(port, certificate, call_id, "no-writer", "completed", "x", owner), _submit(port, certificate, call_id, "bad-status", "other", "x", protected), _submit(port, certificate, call_id, "blank", "completed", "   ", protected), _submit(port, certificate, call_id, "type", "completed", 1, protected), _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "wrong-form", "status": "completed", "report": "x", "confirmed": False}, headers=protected), _submit(port, certificate, call_id, "foreign", "completed", "x", _headers(other_cookie, other_csrf, port)), _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "cross", "status": "completed", "report": "x"}, headers={**protected, "Origin": "https://evil.example"})]
         with sqlite3.connect(database) as connection: after = connection.execute("SELECT state, owner_device_id, owner_session_id FROM calls WHERE call_id = ?", (call_id,)).fetchone(); operations = connection.execute("SELECT count(*) FROM submission_operations WHERE call_id = ?", (call_id,)).fetchone()[0]; after_events = connection.execute("SELECT event_seq FROM events WHERE call_id = ?", (call_id,)).fetchall(); connection.execute("UPDATE calls SET terminal_last_seen_at = ?, terminal_disconnect_deadline = ? WHERE call_id = ?", ((datetime.now(UTC) - timedelta(seconds=181)).isoformat(), (datetime.now(UTC) - timedelta(seconds=1)).isoformat(), call_id)); connection.commit()
-        late = _submit(port, certificate, call_id, "late", "completed", "x", owner); _, terminal, _ = _post(port, certificate, _task_continuation("task-terminal", task_id, call_id, 1), "test-token-alpha"); next_call = _call(port, certificate, "task-after-expiry")
+        late = _submit(port, certificate, call_id, "late", "completed", "x", protected); _, terminal, _ = _post(port, certificate, _task_continuation("task-terminal", task_id, call_id, 1), "test-token-alpha"); next_call = _call(port, certificate, "task-after-expiry")
     finally: _stop(process)
     assert all(item[0] in {400, 401, 403, 404, 409} for item in bad) and after == before and operations == 0 and after_events == events == [(1,)]
     opaque = repr(bad[-2][2]).lower(); assert not any(word in opaque for word in (call_id.lower(), "status", "call_state", "reason", "result", "task", "owner", "route", "accepted"))
