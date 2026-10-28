@@ -51,7 +51,7 @@ def test_tls_accepted_iphone_text_and_multiline_drafts_hydrate_and_survive_resta
         _stop(process)
     assert first_get[0] == 200 and isinstance(first_get[2], dict) and first_get[2]["body"] is None
     assert saved[0] == 200 and isinstance(saved[2], dict) and saved[2]["draft_version"] == 1
-    assert page[0] == 200 and 'data-draft-input="text"' in str(page[2]) and "text draft" in str(page[2]) and "data-draft-status" in str(page[2])
+    assert page[0] == 200 and 'data-draft-input="text"' in str(page[2]) and "text draft" in str(page[2]) and 'data-draft-status="saved"' in str(page[2]).lower()
     assert recovered[0] == 200 and isinstance(recovered[2], dict) and recovered[2]["body"] == "text draft"
 
     # Multiline is a separate interaction because the first accepted call remains busy.
@@ -65,7 +65,10 @@ def test_tls_accepted_iphone_text_and_multiline_drafts_hydrate_and_survive_resta
     finally:
         _stop(process)
     assert saved[0] == 200
-    assert page[0] == 200 and 'data-draft-input="multiline"' in str(page[2]) and "line one\nline two" in str(page[2]) and "not-synced" in str(page[2]).lower()
+    rendered = str(page[2]).lower()
+    assert page[0] == 200 and 'data-draft-input="multiline"' in str(page[2]) and "line one\nline two" in str(page[2]) and 'data-draft-status="saved"' in rendered
+    # A local edit must become visibly unsynced until its PUT succeeds; it is never a submission.
+    assert "not-synced" in rendered and "addEventListener('input'" in str(page[2])
 
 
 def test_tls_iphone_browser_draft_cas_concurrency_limit_and_nonterminal_state(tmp_path: Path) -> None:
@@ -79,15 +82,16 @@ def test_tls_iphone_browser_draft_cas_concurrency_limit_and_nonterminal_state(tm
         with ThreadPoolExecutor(max_workers=2) as pool:
             raced = [pool.submit(_draft, port, cert, call_id, "PUT", body={"body": item, "expected_draft_version": 1}, headers=headers) for item in ("left", "right")]
             race = [item.result() for item in raced]
-        oversized = _draft(port, cert, call_id, "PUT", body={"body": "x" * 257, "expected_draft_version": 2}, headers=headers)
+        boundary = _draft(port, cert, call_id, "PUT", body={"body": "x" * 256, "expected_draft_version": 2}, headers=headers)
+        oversized = _draft(port, cert, call_id, "PUT", body={"body": "x" * 257, "expected_draft_version": 3}, headers=headers)
         after = _snapshot(db, call_id)
         _, busy, _ = _post(port, cert, {"jsonrpc": "2.0", "id": "busy", "method": "tools/call", "params": {"name": "get_user_input", "arguments": {"title": "new", "prompt": "new", "request_id": "browser-draft-busy", "client_timeout_seconds": 2}}}, "test-token-alpha")
     finally:
         _stop(process)
     assert first[0] == 200 and stale[0] == 409
-    assert sorted(item[0] for item in race) == [200, 409] and oversized[0] in {400, 409, 422}
+    assert sorted(item[0] for item in race) == [200, 409] and boundary[0] == 200 and oversized[0] in {400, 409, 422}
     assert before[:3] == after[:3] == ("accepted", before[1], before[2])
-    assert after[3] == 2 and after[4] in {"left", "right"} and before[5:] == after[5:]
+    assert after[3] == 3 and after[4] == "x" * 256 and before[5:] == after[5:]
     assert _structured(busy)["status"] == "busy"
 
 
