@@ -1677,49 +1677,65 @@ class CallCoordinator:
             if row["state"] != "accepted":
                 return self._current_result(connection, row)
 
-            byte_count = len(content)
-            if byte_count > self._attachment_max_file_bytes:
-                return self._attachment_rejected("file_limit_exceeded")
-            if byte_count > self._attachment_max_submission_bytes:
-                return self._attachment_rejected("submission_limit_exceeded")
-            archived_bytes = connection.execute(
-                "SELECT COALESCE(SUM(byte_count), 0) FROM attachments"
-            ).fetchone()[0]
-            occupied_bytes = max(archived_bytes, self._attachment_bytes_on_disk())
-            if occupied_bytes + byte_count > self._attachment_max_archive_bytes:
-                return self._attachment_rejected("archive_capacity_exceeded")
-
-            attachment_id = str(uuid.uuid4())
-            digest = hashlib.sha256(content).hexdigest()
-            self._attachment_directory.mkdir(parents=True, exist_ok=True)
-            storage_path = self._attachment_directory / attachment_id
-            storage_path.write_bytes(content)
-            connection.execute(
-                "INSERT INTO attachments "
-                "(attachment_id, call_id, original_name, media_type, byte_count, sha256, storage_path) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    attachment_id,
-                    call_id,
-                    original_name,
-                    media_type,
-                    byte_count,
-                    digest,
-                    str(storage_path),
-                ),
+            return self._archive_accepted_attachment(
+                connection, call_id, original_name, media_type, content
             )
-            self._refresh_terminal_liveness(connection, call_id)
-            return {
-                "success": True,
-                "status": "uploaded",
-                "attachment": {
-                    "attachment_id": attachment_id,
-                    "name": original_name,
-                    "media_type": media_type,
-                    "byte_count": byte_count,
-                    "sha256": digest,
-                },
-            }
+
+    def upload_iphone_attachment(
+        self, call_id: str, owner_session_id: str, original_name: str,
+        media_type: str, content: bytes,
+    ) -> dict[str, Any] | None:
+        """Archive one accepted phone-owner file without creating a result."""
+        if (
+            not isinstance(original_name, str) or not original_name
+            or not isinstance(media_type, str) or not media_type
+            or not isinstance(content, bytes)
+        ):
+            return {"success": False, "status": "invalid_attachment"}
+        with self._write_transaction() as connection:
+            row = self._iphone_writer_call(connection, call_id, owner_session_id)
+            if row is None:
+                return None
+            return self._archive_accepted_attachment(
+                connection, call_id, original_name, media_type, content
+            )
+
+    def _archive_accepted_attachment(
+        self, connection: sqlite3.Connection, call_id: str, original_name: str,
+        media_type: str, content: bytes,
+    ) -> dict[str, Any]:
+        """Apply shared archive quotas and persist a single accepted-owner file."""
+        byte_count = len(content)
+        if byte_count > self._attachment_max_file_bytes:
+            return self._attachment_rejected("file_limit_exceeded")
+        if byte_count > self._attachment_max_submission_bytes:
+            return self._attachment_rejected("submission_limit_exceeded")
+        archived_bytes = connection.execute(
+            "SELECT COALESCE(SUM(byte_count), 0) FROM attachments"
+        ).fetchone()[0]
+        occupied_bytes = max(archived_bytes, self._attachment_bytes_on_disk())
+        if occupied_bytes + byte_count > self._attachment_max_archive_bytes:
+            return self._attachment_rejected("archive_capacity_exceeded")
+
+        attachment_id = str(uuid.uuid4())
+        digest = hashlib.sha256(content).hexdigest()
+        self._attachment_directory.mkdir(parents=True, exist_ok=True)
+        storage_path = self._attachment_directory / attachment_id
+        storage_path.write_bytes(content)
+        connection.execute(
+            "INSERT INTO attachments "
+            "(attachment_id, call_id, original_name, media_type, byte_count, sha256, storage_path) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (attachment_id, call_id, original_name, media_type, byte_count, digest, str(storage_path)),
+        )
+        self._refresh_terminal_liveness(connection, call_id)
+        return {
+            "success": True, "status": "uploaded",
+            "attachment": {
+                "attachment_id": attachment_id, "name": original_name,
+                "media_type": media_type, "byte_count": byte_count, "sha256": digest,
+            },
+        }
 
     def reject_terminal_attachment_submission_limit(
         self,
@@ -1746,6 +1762,14 @@ class CallCoordinator:
             row = self._call_or_raise(connection, call_id)
             if row["state"] != "accepted":
                 return self._current_result(connection, row)
+            return self._attachment_rejected("submission_limit_exceeded")
+
+    def reject_iphone_attachment_submission_limit(
+        self, call_id: str, owner_session_id: str,
+    ) -> dict[str, Any] | None:
+        with self._write_transaction() as connection:
+            if self._iphone_writer_call(connection, call_id, owner_session_id) is None:
+                return None
             return self._attachment_rejected("submission_limit_exceeded")
 
     @staticmethod
