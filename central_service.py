@@ -1928,9 +1928,28 @@ class _PublicHandler(BaseHTTPRequestHandler):
         writer_script = ""
         writer_controls = ""
         if call_state == "ringing":
+            ring_deadline = state.get("ring_deadline")
+            deadline_value = ring_deadline if isinstance(ring_deadline, str) else ""
+            escaped_deadline = html.escape(deadline_value, quote=True)
             controls = (
+                f'<p data-ring-deadline="{escaped_deadline}" data-remaining-seconds="">Remaining time: <span data-ring-countdown></span></p>'
                 f'<button data-action="accept" data-endpoint="{endpoint}/accept">Accept</button>'
                 f'<button data-action="decline" data-endpoint="{endpoint}/decline">Decline</button>'
+            )
+            authoritative_poll_script = (
+                f"const ringingStateEndpoint='{endpoint}';"
+                f"const renderedRingingVersion='{html.escape(str(state.get('version', '')), quote=True)}';"
+                "const ringingExpiryState='not_accepted';const ringingExpiryReason='ring_timeout';"
+                "const ringingCountdown=document.querySelector('[data-ring-countdown]');"
+                "const ringingDeadlineElement=document.querySelector('[data-ring-deadline]');"
+                "const ringDeadline=new Date(ringingDeadlineElement.dataset.ringDeadline).getTime();"
+                "const disableRingingControls=()=>{document.querySelectorAll('button[data-action]').forEach((button)=>{button.disabled=true;button.remove();});};"
+                "let ringingPollTimer=null;let ringingCountdownTimer=null;"
+                "const showRingingUnavailable=()=>{clearInterval(ringingPollTimer);clearInterval(ringingCountdownTimer);disableRingingControls();document.querySelector('[data-state]').textContent='Connection/state unavailable.';};"
+                "const reconcileRingingState=(authoritative)=>{const nextState=String(authoritative.state||authoritative.call_state||'unknown');const nextVersion=String(authoritative.version??'');if(nextState===ringingExpiryState||nextState!=='ringing'||nextVersion!==renderedRingingVersion){clearInterval(ringingPollTimer);clearInterval(ringingCountdownTimer);disableRingingControls();location.reload();}};"
+                "const pollRingingState=async()=>{try{const response=await fetch(ringingStateEndpoint,{method:'GET',credentials:'same-origin'});if(!response.ok){showRingingUnavailable();return;}const payload=await response.json();if(!payload||!payload.call){showRingingUnavailable();return;}reconcileRingingState(payload.call);}catch(_error){showRingingUnavailable();}};"
+                "const updateRingingCountdown=()=>{const remaining=Math.max(0,Math.ceil((ringDeadline-Date.now())/1000));ringingDeadlineElement.dataset.remainingSeconds=String(remaining);ringingCountdown.textContent=String(remaining);if(remaining===0){clearInterval(ringingCountdownTimer);disableRingingControls();pollRingingState();}};"
+                "updateRingingCountdown();ringingCountdownTimer=setInterval(updateRingingCountdown,250);ringingPollTimer=setInterval(pollRingingState,2000);"
             )
         elif call_state in {"accepted", "in_progress"}:
             if state.get("owner_device_id") == "iphone_web" and state.get("_page_session_matches_owner"):
