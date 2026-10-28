@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -53,6 +54,47 @@ def _accepted_owner(tmp_path: Path, request_id: str):
     headers = _headers(cookie, csrf, port)
     _accept(port, cert, call_id, headers)
     return port, config, cert, process, call_id, cookie, csrf, headers
+
+
+def test_tls_accepted_writer_page_exposes_readonly_takeover_and_revocation_ui(tmp_path: Path) -> None:
+    """A refreshed same-session page must offer a visible, operable ownership switch."""
+    port, _, cert, process, call_id, cookie, _, _ = _accepted_owner(tmp_path, "writer-page-ui")
+    db = tmp_path / "data" / "calls.sqlite3"
+    try:
+        before = _business_snapshot(db, call_id)
+        page = _request(port, cert, "GET", f"/calls/{call_id}", headers={"Cookie": cookie})
+        after = _business_snapshot(db, call_id)
+    finally:
+        _stop(process)
+
+    assert page[0] == 200
+    source = str(page[2])
+    assert 'data-writer-status="' in source
+    assert 'data-writer-takeover' in source
+    # Acquire must make the first page writable while rendering a second page as read-only,
+    # rather than leaving recovery to an otherwise invisible server endpoint.
+    assert re.search(
+        r"writerEndpoint\+'\/acquire'.*?lease\.writable.*?setWriterState\(true\).*?"
+        r"setWriterState\(false\)",
+        source,
+        re.DOTALL,
+    )
+    # The user-facing switch has to call takeover, install the replacement token, and make
+    # that refreshed page writable.  Route-only implementations therefore cannot satisfy it.
+    assert re.search(
+        r"data-writer-takeover.*?addEventListener\('click'.*?writerEndpoint\+'\/takeover'.*?"
+        r"lease\.writer_token.*?setWriterState\(true\)",
+        source,
+        re.DOTALL,
+    )
+    # When takeover revokes the old token, its page must become visibly read-only on the
+    # next protected write instead of continuing to present writable controls.
+    assert re.search(
+        r"response\.status\s*===\s*401.*?response\.status\s*===\s*403.*?setWriterState\(false\)",
+        source,
+        re.DOTALL,
+    )
+    assert before == after
 
 
 def test_tls_browser_writer_first_page_is_writable_peer_is_readonly_and_takeover_revokes(tmp_path: Path) -> None:
