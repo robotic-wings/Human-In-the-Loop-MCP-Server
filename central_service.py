@@ -1992,9 +1992,17 @@ class _PublicHandler(BaseHTTPRequestHandler):
                 if task_spec is not None:
                     title, description, context_note = task_spec
                     task_version = state.get("task_version", 0)
+                    draft = state.get("_draft")
+                    draft_body = draft.get("body") if isinstance(draft, dict) else None
+                    draft_version = draft.get("draft_version", 0) if isinstance(draft, dict) else 0
+                    initial_report = draft_body if isinstance(draft_body, str) else ""
                     controls = (
                         f'<h2>{html.escape(title)}</h2><p>{html.escape(description)}</p><p>{html.escape(context_note)}</p>'
-                        f'<textarea data-task-report></textarea>'
+                        f'<textarea data-task-report data-draft-input="task-report" '
+                        f'data-draft-version="{html.escape(str(draft_version), quote=True)}">'
+                        f'{html.escape(initial_report, quote=False)}</textarea>'
+                        '<p data-draft-status="saved">Saved</p>'
+                        f'<button data-draft-save data-endpoint="{endpoint}/draft">Save draft</button>'
                         f'<button data-task-progress="true" data-endpoint="{endpoint}/submissions">Still progressing</button>'
                         f'<button data-task-final="completed" data-task-version="{html.escape(str(task_version), quote=True)}" data-endpoint="{endpoint}/submissions">Completed</button>'
                         f'<button data-task-final="failed" data-task-version="{html.escape(str(task_version), quote=True)}" data-endpoint="{endpoint}/submissions">Failed</button>'
@@ -2005,6 +2013,11 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         '<button data-task-feedback-exit="withdraw">Withdraw feedback request</button>'
                     )
                     submission_script = (
+                        "const draftInput=document.querySelector('textarea[data-task-report][data-draft-input=task-report]');"
+                        "const draftStatus=document.querySelector('[data-draft-status]');"
+                        "const draftSave=document.querySelector('button[data-draft-save]');"
+                        "draftInput.addEventListener('input',()=>{draftStatus.dataset.draftStatus='not-synced';draftStatus.textContent='not-synced';});"
+                        "draftSave.addEventListener('click',async()=>{const response=await fetch(draftSave.dataset.endpoint,{method:'PUT',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({body:draftInput.value,expected_draft_version:Number(draftInput.dataset.draftVersion)})});if(response.ok){const saved=await response.json();draftInput.dataset.draftVersion=String(saved.draft_version);draftStatus.dataset.draftStatus='saved';draftStatus.textContent='saved';}else{draftStatus.dataset.draftStatus='not-synced';draftStatus.textContent='draft conflict; not-synced';}});"
                         "const progress=document.querySelector('button[data-task-progress]');"
                         "progress.addEventListener('click',()=>{"
                         "const report=document.querySelector('textarea[data-task-report]').value;"
