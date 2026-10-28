@@ -75,7 +75,7 @@ def test_tls_accepted_iphone_text_and_multiline_drafts_hydrate_and_survive_resta
         r"const textarea=document\.querySelector\(['\"]textarea\[name=user_input\]['\"]\);"
         r".*?const user_input=textarea\.value;"
         r".*?fetch\(button\.dataset\.endpoint"
-        r".*?JSON\.stringify\(\{submission_id:crypto\.randomUUID\(\),user_input:user_input\}\)",
+        r".*?JSON\.stringify\(\{submission_id:crypto\.randomUUID\(\),user_input:user_input,attachment_ids:pendingAttachmentIds\}\)",
         text_page,
         re.DOTALL,
     )
