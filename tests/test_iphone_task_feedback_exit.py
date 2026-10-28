@@ -139,7 +139,7 @@ def test_tls_task_feedback_exit_denials_and_withdraw_leave_task_unchanged(tmp_pa
         denied = [
             _exit(port, certificate, call_id, "missing-csrf", "completed", "x", {"Cookie": owner_cookie, "Host": f"127.0.0.1:{port}", "Origin": f"https://127.0.0.1:{port}"}),
             _exit(port, certificate, call_id, "other-session", "completed", "x", _headers(other_cookie, other_csrf, port)),
-            _exit(port, certificate, call_id, "stale-version", "completed", "x", owner),
+            _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "stale-version", "status": "completed", "report": "x", "task_version": 1, "feedback_requested": True}, headers=owner),
             _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "mixed", "status": "in_progress", "report": "x", "feedback_requested": True}, headers=owner),
             _exit(port, certificate, call_id, "origin", "completed", "x", {**owner, "Origin": "https://evil.example"}),
         ]
