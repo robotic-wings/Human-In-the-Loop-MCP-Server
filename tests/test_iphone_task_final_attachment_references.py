@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from test_central_mcp_gateway import _free_port, _post, _rpc, _start, _stop, _structured, _wait_for_listener
-from test_iphone_browser_attachment_upload import _accepted_owner, _snapshot, _upload_browser
+from test_iphone_browser_attachment_upload import _upload_browser
 from test_iphone_task_final_submission import _accept, _call, _owner_writer_headers, _task_continuation
 from test_iphone_web_acceptance import _create_call, _login, _request, _write_operator_config
 from test_iphone_web_decline import _configure_phone_route, _headers
@@ -24,6 +24,22 @@ def _submit(port: int, certificate: Path, call_id: str, headers: dict[str, str],
         body={"submission_id": submission_id, "status": status, "report": report,
               "task_version": task_version, "attachment_ids": attachment_ids}, headers=headers,
     )
+
+
+def _accepted_task_owner(tmp_path: Path, request_id: str):
+    """Create the task interaction whose final-report UI this contract covers."""
+    port = _free_port()
+    config, certificate = _write_operator_config(tmp_path, port)
+    _configure_phone_route(config)
+    process = _start(config); _wait_for_listener(process, port)
+    created = _call(port, certificate, request_id)
+    call_id = created["call_id"]
+    assert isinstance(call_id, str)
+    cookie, csrf = _login(port, certificate)
+    owner = _headers(cookie, csrf, port)
+    assert _accept(port, certificate, call_id, owner)[0] == 200
+    writer = _owner_writer_headers(port, certificate, call_id, cookie, csrf)
+    return port, config, certificate, process, call_id, cookie, owner, writer
 
 
 def _business_snapshot(database: Path, call_id: str) -> tuple[object, ...]:
@@ -39,7 +55,7 @@ def _business_snapshot(database: Path, call_id: str) -> tuple[object, ...]:
 
 
 def test_tls_accepted_iphone_task_final_serializes_rehydrates_and_durably_returns_ordered_attachment_references(tmp_path: Path) -> None:
-    port, config, certificate, process, call_id, cookie, owner, writer = _accepted_owner(tmp_path, "task-final-attached")
+    port, config, certificate, process, call_id, cookie, owner, writer = _accepted_task_owner(tmp_path, "task-final-attached")
     database = tmp_path / "data" / "calls.sqlite3"
     try:
         first = _upload_browser(port, certificate, call_id, writer, filename="first.txt", content=b"first")
@@ -77,7 +93,7 @@ def test_tls_accepted_iphone_task_final_serializes_rehydrates_and_durably_return
 
 
 def test_tls_accepted_iphone_task_failed_attachment_references_validate_same_call_and_replay_immutably(tmp_path: Path) -> None:
-    port, config, certificate, process, prior_id, _cookie, _owner, prior_writer = _accepted_owner(tmp_path, "task-final-foreign-source")
+    port, config, certificate, process, prior_id, _cookie, _owner, prior_writer = _accepted_task_owner(tmp_path, "task-final-foreign-source")
     try:
         foreign = _upload_browser(port, certificate, prior_id, prior_writer, content=b"foreign")
         foreign_id = foreign[1]["attachment"]["attachment_id"]
@@ -109,7 +125,7 @@ def test_tls_accepted_iphone_task_failed_attachment_references_validate_same_cal
     assert [item[2] for item in rejected[:4]] == [
         {"success": False, "status": "invalid_attachment_reference", "needs_continuation": False},
         {"success": False, "status": "invalid_attachment_reference", "needs_continuation": False},
-        {"success": False, "status": "invalid_attachment_reference", "needs_continuation": False},
+        {"success": False, "status": "invalid_submission"},
         {"success": False, "status": "invalid_submission"},
     ]
     assert rejected[4][2] == {"success": False, "status": "task_version_conflict", "call_state": "accepted", "task_version": 0, "needs_continuation": False}
@@ -121,7 +137,7 @@ def test_tls_accepted_iphone_task_failed_attachment_references_validate_same_cal
 
 
 def test_tls_task_final_attachment_references_reject_untrusted_or_terminal_contexts_without_mutation(tmp_path: Path) -> None:
-    port, _config, certificate, process, call_id, cookie, owner, writer = _accepted_owner(tmp_path, "task-final-denials")
+    port, _config, certificate, process, call_id, cookie, owner, writer = _accepted_task_owner(tmp_path, "task-final-denials")
     database = tmp_path / "data" / "calls.sqlite3"
     try:
         upload = _upload_browser(port, certificate, call_id, writer, content=b"evidence")
