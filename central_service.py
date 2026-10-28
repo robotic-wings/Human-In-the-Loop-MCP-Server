@@ -12,6 +12,8 @@ import html
 import hashlib
 import hmac
 import json
+import getpass
+import os
 import secrets
 import ssl
 import sys
@@ -119,8 +121,6 @@ def _load_config(config_path: Path) -> ServiceConfig:
         operator_credentials_file = None
     elif isinstance(operator_credentials_value, str) and operator_credentials_value.strip():
         operator_credentials_file = Path(operator_credentials_value.strip())
-        if not operator_credentials_file.is_file():
-            raise ConfigurationError("config operator credentials file must exist")
     else:
         raise ConfigurationError("config operator_credentials_file must be a non-empty path")
     eligible = raw.get("eligible_desktop_device_ids", [])
@@ -450,18 +450,66 @@ def _load_operator_credentials(path: Path | None) -> dict[str, object] | None:
         raise ConfigurationError("operator credentials are invalid")
     if any(name not in record for name in ("salt", "digest", "n", "r", "p")):
         raise ConfigurationError("operator credentials are invalid")
-    return record
+    return value
+
+
+def _read_operator_bootstrap_password() -> str:
+    """Read the bootstrap secret without placing it in argv or process output."""
+    return getpass.getpass("Operator password: ")
+
+
+def _operator_password_record(password: str) -> dict[str, object]:
+    if not password:
+        raise ConfigurationError("operator password must not be empty")
+    salt = secrets.token_bytes(16)
+    digest = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=2**14, r=8, p=1)
+    return {
+        "algorithm": "scrypt",
+        "salt": base64.b64encode(salt).decode("ascii"),
+        "n": 2**14,
+        "r": 8,
+        "p": 1,
+        "digest": base64.b64encode(digest).decode("ascii"),
+    }
+
+
+def _create_operator(config: ServiceConfig, operator_id: str) -> None:
+    """Atomically install the sole operator record without overwriting a winner."""
+    if config.operator_credentials_file is None:
+        raise ConfigurationError("config operator_credentials_file is required for create-operator")
+    if not operator_id.strip():
+        raise ConfigurationError("operator_id must not be empty")
+    password = _read_operator_bootstrap_password()
+    record = {"operator_id": operator_id, "password_hash": _operator_password_record(password)}
+    target = config.operator_credentials_file
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError as error:
+        raise ConfigurationError("operator credentials already exist") from error
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            json.dump(record, output, sort_keys=True, separators=(",", ":"))
+            output.flush()
+            os.fsync(output.fileno())
+    except BaseException:
+        try:
+            target.unlink()
+        except OSError:
+            pass
+        raise
 
 
 class _McpGateway:
     def __init__(
         self, coordinator: CallCoordinator, credentials: dict[str, str], desktop_route_device_id: str | None = None,
-        bark_enabled: bool = False,
+        bark_enabled: bool = False, operator_id: str = "operator-default",
     ) -> None:
         self._coordinator = coordinator
         self._credentials = credentials
         self._desktop_route_device_id = desktop_route_device_id
         self._bark_enabled = bark_enabled
+        self._operator_id = operator_id
 
     def caller_for(self, authorization: str | None) -> str | None:
         if not isinstance(authorization, str) or not authorization.startswith("Bearer "):
@@ -600,7 +648,7 @@ class _McpGateway:
         )
         envelope = self._coordinator.create_call(
             CreateCall(
-                operator_id="operator-default",
+                operator_id=self._operator_id,
                 caller_id=caller_id,
                 interaction_id=interaction_id,
                 request_id=request_id,
@@ -1332,11 +1380,14 @@ class _OperatorGateway:
 
     def _password_matches(self, password: str) -> bool:
         try:
-            salt = base64.b64decode(self._record["salt"], validate=True)
-            expected = base64.b64decode(self._record["digest"], validate=True)
+            record = self._record["password_hash"]
+            if not isinstance(record, dict):
+                return False
+            salt = base64.b64decode(record["salt"], validate=True)
+            expected = base64.b64decode(record["digest"], validate=True)
             actual = hashlib.scrypt(
-                password.encode("utf-8"), salt=salt, n=int(self._record["n"]),
-                r=int(self._record["r"]), p=int(self._record["p"]),
+                password.encode("utf-8"), salt=salt, n=int(record["n"]),
+                r=int(record["r"]), p=int(record["p"]),
             )
         except (KeyError, TypeError, ValueError):
             return False
@@ -2478,8 +2529,13 @@ def _serve(config: ServiceConfig) -> None:
         configured_desktop_route_device_id = (
             config.eligible_desktop_device_ids[0] if config.eligible_desktop_device_ids else None
         )
+        operator_id = (
+            operator_record["operator_id"]
+            if isinstance(operator_record, dict) and isinstance(operator_record.get("operator_id"), str)
+            else "operator-default"
+        )
         gateway = _McpGateway(
-            coordinator, credentials, configured_desktop_route_device_id, config.bark_enabled
+            coordinator, credentials, configured_desktop_route_device_id, config.bark_enabled, operator_id
         )
         terminal_gateway = _TerminalGateway(
             coordinator,
@@ -2510,22 +2566,32 @@ def _fail(message: str) -> NoReturn:
     raise SystemExit(2)
 
 
-def _parse_config_path(arguments: list[str]) -> Path:
+def _parse_command(arguments: list[str]) -> tuple[Path, str | None, str | None]:
     legacy_modes = {"--stdio", "--local", "--service"}
     if any(argument in legacy_modes for argument in arguments):
         _fail("legacy stdio/local/service modes are rejected and not supported")
+    if "--password" in arguments or any(argument.startswith("--password=") for argument in arguments):
+        _fail("password command-line options are rejected")
     parser = argparse.ArgumentParser(description="HITL central HTTPS service")
     parser.add_argument("--config", type=Path, help="path to central-service JSON config")
+    subparsers = parser.add_subparsers(dest="command")
+    create_operator = subparsers.add_parser("create-operator")
+    create_operator.add_argument("--operator-id", required=True)
     parsed = parser.parse_args(arguments)
     if parsed.config is None:
         _fail("config is required; no default listener or stdio mode exists")
-    return parsed.config
+    return parsed.config, parsed.command, getattr(parsed, "operator_id", None)
 
 
 def main(argv: list[str] | None = None) -> None:
     arguments = sys.argv[1:] if argv is None else argv
     try:
-        config = _load_config(_parse_config_path(arguments))
+        config_path, command, operator_id = _parse_command(arguments)
+        config = _load_config(config_path)
+        if command == "create-operator":
+            assert operator_id is not None
+            _create_operator(config, operator_id)
+            return
         _serve(config)
     except ConfigurationError as error:
         _fail(f"configuration error: {error}")
