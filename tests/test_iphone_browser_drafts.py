@@ -57,7 +57,16 @@ def test_tls_accepted_iphone_text_and_multiline_drafts_hydrate_and_survive_resta
     assert page[0] == 200 and 'data-draft-input="text"' in text_page and "text draft" in text_page and 'data-draft-status="saved"' in text_page.lower()
     # The persisted value belongs in the actual final-answer control, not an unrelated draft scratchpad.
     assert re.search(r'<textarea(?=[^>]*name="user_input")(?=[^>]*data-draft-input="text")[^>]*>text draft</textarea>', text_page)
-    assert re.search(r'textarea\[name=user_input\].*?fetch\(.*?/submissions', text_page, re.DOTALL)
+    assert f'data-text-input data-endpoint="/api/calls/{text_id}/submissions"' in text_page
+    assert re.search(
+        r"button\[data-text-input\].*?"
+        r"const textarea=document\.querySelector\(['\"]textarea\[name=user_input\]['\"]\);"
+        r".*?const user_input=textarea\.value;"
+        r".*?fetch\(button\.dataset\.endpoint"
+        r".*?JSON\.stringify\(\{submission_id:crypto\.randomUUID\(\),user_input:user_input\}\)",
+        text_page,
+        re.DOTALL,
+    )
     assert recovered[0] == 200 and isinstance(recovered[2], dict) and recovered[2]["body"] == "text draft"
     assert submitted[0] == 200 and isinstance(submitted[2], dict) and submitted[2]["user_input"] == "text draft"
 
