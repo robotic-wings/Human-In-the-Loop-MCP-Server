@@ -42,6 +42,17 @@ def _accepted_task_owner(tmp_path: Path, request_id: str):
     return port, config, certificate, process, call_id, cookie, owner, writer
 
 
+def _accepted_task(port: int, certificate: Path, request_id: str):
+    """Make a second accepted task on an already running phone-routed server."""
+    created = _call(port, certificate, request_id)
+    call_id = created["call_id"]
+    assert isinstance(call_id, str)
+    cookie, csrf = _login(port, certificate)
+    owner = _headers(cookie, csrf, port)
+    assert _accept(port, certificate, call_id, owner)[0] == 200
+    return call_id, cookie, owner, _owner_writer_headers(port, certificate, call_id, cookie, csrf)
+
+
 def _business_snapshot(database: Path, call_id: str) -> tuple[object, ...]:
     with sqlite3.connect(database) as connection:
         call = connection.execute(
@@ -99,11 +110,7 @@ def test_tls_accepted_iphone_task_failed_attachment_references_validate_same_cal
         foreign_id = foreign[1]["attachment"]["attachment_id"]
         with sqlite3.connect(tmp_path / "data" / "calls.sqlite3") as connection:
             connection.execute("UPDATE calls SET state = 'cancelled' WHERE call_id = ?", (prior_id,)); connection.commit()
-        created = _call(port, certificate, "task-final-failed-attached")
-        call_id = created["call_id"]
-        cookie, csrf = _login(port, certificate); owner = _headers(cookie, csrf, port)
-        assert _accept(port, certificate, call_id, owner)[0] == 200
-        writer = _owner_writer_headers(port, certificate, call_id, cookie, csrf)
+        call_id, cookie, owner, writer = _accepted_task(port, certificate, "task-final-failed-attached")
         upload = _upload_browser(port, certificate, call_id, writer, filename="failure.txt", content=b"failure")
         attachment_id = upload[1]["attachment"]["attachment_id"]
         database = tmp_path / "data" / "calls.sqlite3"; before = _business_snapshot(database, call_id)
