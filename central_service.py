@@ -1246,7 +1246,7 @@ class _OperatorGateway:
 
     def save_draft(
         self, session: str | None, csrf: str | None, origin: str | None, host: str | None,
-        call_id: str, payload: object,
+        call_id: str, payload: object, writer_token: str | None,
     ) -> tuple[HTTPStatus, dict[str, object]]:
         """CAS-save an iPhone owner draft through the operator-session boundary."""
         if (
@@ -1256,6 +1256,7 @@ class _OperatorGateway:
             or not isinstance(session, str)
             or not isinstance(payload, dict)
             or set(payload) != {"body", "expected_draft_version"}
+            or not self._coordinator.browser_writer_matches(call_id, session, writer_token)
         ):
             return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
         result = self._coordinator.save_terminal_draft(
@@ -1291,13 +1292,14 @@ class _OperatorGateway:
 
     def submit(
         self, session: str | None, csrf: str | None, origin: str | None, host: str | None,
-        call_id: str, payload: object,
+        call_id: str, payload: object, writer_token: str | None,
     ) -> tuple[HTTPStatus, dict[str, object]]:
         if (
             not self._session_matches(session, csrf)
             or origin != f"https://{self._expected_host}"
             or host != self._expected_host
             or not isinstance(payload, dict)
+            or not self._coordinator.browser_writer_matches(call_id, session or "", writer_token)
         ):
             return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
         submission_id = payload.get("submission_id")
@@ -1439,7 +1441,7 @@ class _OperatorGateway:
 
     def cancel(
         self, session: str | None, csrf: str | None, origin: str | None, host: str | None,
-        call_id: str, payload: object,
+        call_id: str, payload: object, writer_token: str | None,
     ) -> tuple[HTTPStatus, dict[str, object]]:
         if (
             not self._session_matches(session, csrf)
@@ -1450,6 +1452,7 @@ class _OperatorGateway:
             or not isinstance(payload.get("action_id"), str)
             or not payload["action_id"]
             or not isinstance(payload.get("cancelled"), bool)
+            or not self._coordinator.browser_writer_matches(call_id, session or "", writer_token)
         ):
             return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
         result = self._coordinator.cancel_iphone_call(
@@ -1467,12 +1470,13 @@ class _OperatorGateway:
 
     def heartbeat(
         self, session: str | None, csrf: str | None, origin: str | None, host: str | None,
-        call_id: str,
+        call_id: str, writer_token: str | None,
     ) -> tuple[HTTPStatus, dict[str, object]]:
         if (
             not self._session_matches(session, csrf)
             or origin != f"https://{self._expected_host}"
             or host != self._expected_host
+            or not self._coordinator.browser_writer_matches(call_id, session or "", writer_token)
         ):
             return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
         result = self._coordinator.heartbeat_iphone_call(call_id, session or "")
@@ -1480,6 +1484,36 @@ class _OperatorGateway:
             return HTTPStatus.CONFLICT, {"error": "cannot heartbeat"}
         if result["status"] not in {"accepted", "in_progress"}:
             return HTTPStatus.CONFLICT, result
+        return HTTPStatus.OK, result
+
+    def writer(
+        self, session: str | None, csrf: str | None, origin: str | None, host: str | None,
+        call_id: str, kind: str, payload: object,
+    ) -> tuple[HTTPStatus, dict[str, object]]:
+        """Expose the narrow same-session page writer arbitration protocol."""
+        if (
+            not self._session_matches(session, csrf)
+            or origin != f"https://{self._expected_host}"
+            or host != self._expected_host
+            or not isinstance(session, str)
+            or not isinstance(payload, dict)
+        ):
+            return HTTPStatus.FORBIDDEN, {"error": "forbidden"}
+        page_id = payload.get("page_id")
+        if kind == "status":
+            if set(payload) != {"page_id", "writer_token"}:
+                return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
+            result = self._coordinator.browser_writer_status(call_id, session, page_id, payload.get("writer_token"))
+        else:
+            if set(payload) != {"page_id", "action_id"}:
+                return HTTPStatus.BAD_REQUEST, {"error": "invalid request"}
+            result = self._coordinator.browser_writer(
+                call_id, session, page_id, payload.get("action_id"), takeover=(kind == "takeover"),
+            )
+        if result is None:
+            return HTTPStatus.CONFLICT, {"error": "cannot acquire writer"}
+        if result.get("status") in {"invalid_writer", "writer_conflict"}:
+            return HTTPStatus.CONFLICT, {"error": "writer unavailable"}
         return HTTPStatus.OK, result
 
     def _session_exists(self, session: str | None) -> bool:
@@ -1626,6 +1660,18 @@ class _PublicHandler(BaseHTTPRequestHandler):
                 ) if status == HTTPStatus.OK else None,
             )
             return
+        writer_route = self._web_writer_route(path)
+        if operator is not None and writer_route is not None:
+            body_ok, payload = self._terminal_request_body()
+            if not body_ok:
+                return
+            writer_call_id, writer_kind = writer_route
+            status, response = operator.writer(
+                self._operator_session(), self.headers.get("X-CSRF-Token"), self.headers.get("Origin"),
+                self.headers.get("Host"), writer_call_id, writer_kind, payload,
+            )
+            self._send_json(status, response)
+            return
         web_accept_id = self._web_accept_call_id(path)
         if operator is not None and web_accept_id is not None:
             body_ok, payload = self._terminal_request_body()
@@ -1658,6 +1704,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
             status, response = operator.cancel(
                 self._operator_session(), self.headers.get("X-CSRF-Token"), self.headers.get("Origin"),
                 self.headers.get("Host"), web_cancel_id, payload,
+                self.headers.get("X-Writer-Token"),
             )
             self._send_json(status, response)
             return
@@ -1669,6 +1716,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
             status, response = operator.heartbeat(
                 self._operator_session(), self.headers.get("X-CSRF-Token"), self.headers.get("Origin"),
                 self.headers.get("Host"), web_heartbeat_id,
+                self.headers.get("X-Writer-Token"),
             )
             self._send_json(status, response)
             return
@@ -1680,6 +1728,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
             status, response = operator.submit(
                 self._operator_session(), self.headers.get("X-CSRF-Token"), self.headers.get("Origin"),
                 self.headers.get("Host"), web_submission_id, payload,
+                self.headers.get("X-Writer-Token"),
             )
             self._send_json(status, response)
             return
@@ -1725,6 +1774,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
             status, response = operator.save_draft(
                 self._operator_session(), self.headers.get("X-CSRF-Token"), self.headers.get("Origin"),
                 self.headers.get("Host"), draft_call_id, payload,
+                self.headers.get("X-Writer-Token"),
             )
             self._send_json(status, response)
             return
@@ -1774,6 +1824,8 @@ class _PublicHandler(BaseHTTPRequestHandler):
         controls = ""
         heartbeat_script = ""
         submission_script = ""
+        writer_script = ""
+        writer_controls = ""
         if call_state == "ringing":
             controls = (
                 f'<button data-action="accept" data-endpoint="{endpoint}/accept">Accept</button>'
@@ -1781,6 +1833,20 @@ class _PublicHandler(BaseHTTPRequestHandler):
             )
         elif call_state in {"accepted", "in_progress"}:
             if state.get("owner_device_id") == "iphone_web" and state.get("_page_session_matches_owner"):
+                writer_controls = (
+                    '<p data-writer-status="loading">Acquiring write access.</p>'
+                    '<button data-writer-takeover disabled>Take over editing</button>'
+                )
+                writer_script = (
+                    f"const writerEndpoint='{endpoint}/writer';"
+                    "const pageId=crypto.randomUUID();let writerToken=null;const rawFetch=window.fetch.bind(window);"
+                    "const writerStatus=document.querySelector('[data-writer-status]');const takeover=document.querySelector('button[data-writer-takeover]');"
+                    "const setWriterState=(writable)=>{writerStatus.textContent=writable?'Writable page.':'Read-only page.';writerStatus.dataset.writerStatus=writable?'writable':'readonly';takeover.disabled=writable;document.querySelectorAll('button[data-endpoint]').forEach((button)=>{button.disabled=!writable;});};"
+                    "window.fetch=async(input,init={})=>{const headers=new Headers(init.headers||{});if(writerToken)headers.set('X-Writer-Token',writerToken);const response=await rawFetch(input,{...init,headers:headers});if(response.status === 401 || response.status === 403)setWriterState(false);return response;};"
+                    "rawFetch(writerEndpoint+'/acquire',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({page_id:pageId,action_id:crypto.randomUUID()})})"
+                    ".then(async(response)=>{const lease=await response.json();if(response.ok&&lease.writable){writerToken=lease.writer_token;setWriterState(true);}else{setWriterState(false);}});"
+                    "document.querySelector('button[data-writer-takeover]').addEventListener('click',async()=>{const response=await rawFetch(writerEndpoint+'/takeover',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({page_id:pageId,action_id:crypto.randomUUID()})});const lease=await response.json();if(response.ok&&lease.writable){writerToken=lease.writer_token;setWriterState(true);}});"
+                )
                 # The caller has already authenticated this exact browser
                 # session; the form does not create a second ownership path.
                 numeric_spec = _numeric_input_spec(state.get("message"))
@@ -2007,10 +2073,11 @@ class _PublicHandler(BaseHTTPRequestHandler):
             controls = f"<p>Call is {escaped_state}.</p>"
         return (
             "<!doctype html><meta charset=utf-8><title>Operator call</title><main>"
-            f"<p>{message}</p><p data-state=\"{escaped_state}\">{escaped_state}</p>{controls}"
+            f"<p>{message}</p><p data-state=\"{escaped_state}\">{escaped_state}</p>{writer_controls}{controls}"
             f"<meta name=\"X-CSRF-Token\" content=\"{csrf_value}\">"
             "<script>"
             "const csrf=document.querySelector('meta[name=\"X-CSRF-Token\"]').content;"
+            f"{writer_script}"
             "document.querySelectorAll('button[data-action]').forEach((button)=>"
             "button.addEventListener('click',async()=>{"
             "const response=await fetch(button.dataset.endpoint,{method:'POST',credentials:'same-origin',"
@@ -2094,6 +2161,16 @@ class _PublicHandler(BaseHTTPRequestHandler):
         parts = path.split("/")
         if len(parts) == 5 and parts[:3] == ["", "api", "calls"] and parts[3] and parts[4] == "heartbeat":
             return parts[3]
+        return None
+
+    @staticmethod
+    def _web_writer_route(path: str) -> tuple[str, str] | None:
+        parts = path.split("/")
+        if (
+            len(parts) == 6 and parts[:3] == ["", "api", "calls"] and parts[3]
+            and parts[4] == "writer" and parts[5] in {"acquire", "status", "takeover"}
+        ):
+            return parts[3], parts[5]
         return None
 
     def _terminal_request_identity(self) -> tuple[_TerminalGateway, _TerminalIdentity] | None:
