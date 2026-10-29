@@ -42,7 +42,7 @@ def test_tls_accepted_task_cancel_renders_ready_and_bound_non_ok_status(tmp_path
     handler = _handler(source)
     assert "action_id:crypto.randomUUID()" in handler and "cancelled:true" in handler
     assert "if(response.ok)location.reload();" in handler
-    failed = re.search(r"if\\(response\\.ok\\)\\{.*?\\}else\\{(?P<body>.*?)\\}", handler, re.DOTALL)
+    failed = re.search(r"if\(response\.ok\)\{.*?\}else\{(?P<body>.*?)\}", handler, re.DOTALL)
     assert failed is not None
     failure = failed.group("body")
     assert any(word in failure for word in ("not-submitted", "conflict", "unavailable"))
