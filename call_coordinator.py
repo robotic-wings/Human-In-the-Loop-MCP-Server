@@ -1645,10 +1645,20 @@ class CallCoordinator:
             body = result.get("user_input")
             if not isinstance(body, str):
                 body = result.get("report")
-            if not isinstance(body, str) or cursor > len(body):
-                return self._not_found_read()
             attachments = self._result_attachments(row["call_id"], result)
-            page = self._body_page(result_id, body, cursor, max_result_bytes, attachments)
+            if isinstance(body, str):
+                if cursor > len(body):
+                    return self._not_found_read()
+                page = self._body_page(result_id, body, cursor, max_result_bytes, attachments)
+            else:
+                choices = result.get("selected_choices")
+                if (
+                    not isinstance(choices, list)
+                    or any(not isinstance(choice, str) for choice in choices)
+                    or cursor > len(choices)
+                ):
+                    return self._not_found_read()
+                page = self._choice_page(result_id, choices, cursor, max_result_bytes, attachments)
             return page if page is not None else self._not_found_read()
 
     def read_interaction_attachment(
@@ -1907,6 +1917,20 @@ class CallCoordinator:
                 "next_cursor": None if complete else end, "attachments": attachments,
             }
         return self._largest_budgeted_page(cursor, len(body), budget, page)
+
+    def _choice_page(
+        self, result_id: str, choices: list[str], cursor: int, budget: int,
+        attachments: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Page canonical ordered selections without splitting Unicode text."""
+        def page(end: int) -> dict[str, Any]:
+            complete = end == len(choices)
+            return {
+                "success": True, "result_id": result_id, "body": choices[cursor:end],
+                "full_length": len(choices), "complete": complete,
+                "next_cursor": None if complete else end, "attachments": attachments,
+            }
+        return self._largest_budgeted_page(cursor, len(choices), budget, page)
 
     def _attachment_page(
         self, item: sqlite3.Row, content: bytes, offset: int, budget: int
