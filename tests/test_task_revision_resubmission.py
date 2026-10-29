@@ -165,9 +165,13 @@ def test_tls_task_revision_replays_same_business_content_under_new_request_id_wi
         task_id, old_call_id = original["interaction_id"], original["call_id"]
         assert isinstance(task_id, str) and isinstance(old_call_id, str)
         _finish_task(port, certificate, old_call_id, "failed", "revision-replay-final")
+        # Omitted and explicit zero cursors have the same revision meaning.
         _, first_raw, _ = _post(port, certificate, _revision_request(task_id, old_call_id, "revision-replay", "revision-replay-first"), "test-token-alpha")
         before_rows = _call_rows(database, task_id)
-        _, replay_raw, _ = _post(port, certificate, _revision_request(task_id, old_call_id, "revision-replay", "revision-replay-second"), "test-token-alpha")
+        retry = _revision_request(task_id, old_call_id, "revision-replay", "revision-replay-second")
+        retry["params"]["arguments"]["after_event_seq"] = 0
+        retry["params"]["arguments"]["max_result_bytes"] = 16_384
+        _, replay_raw, _ = _post(port, certificate, retry, "test-token-alpha")
         after_rows = _call_rows(database, task_id)
     finally:
         _stop(process)
