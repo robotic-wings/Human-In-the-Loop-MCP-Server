@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 
 from test_central_mcp_gateway import _free_port, _post, _start, _stop, _structured, _wait_for_listener
+from test_iphone_browser_drafts import _writer_headers
 from test_iphone_web_acceptance import _login, _request, _write_operator_config
 from test_iphone_web_decline import _configure_phone_route, _headers
 from test_mcp_continuation import _continuation
@@ -67,10 +68,10 @@ def _page(html: object, call_id: str) -> str:
     assert re.search(r'''(?sx)
         (?:const|let)\s+(?P<button>[A-Za-z_$][\w$]*)\s*=\s*document\.querySelector\(\s*['"]button\[data-task-cancel\]['"]\s*\)
         .*?(?P=button)\.addEventListener\(\s*['"]click['"]
-        .*?JSON\.stringify\(\{[^}]*action_id[^}]*cancelled\s*:\s*true
         .*?fetch\(\s*(?P=button)\.dataset\.endpoint
-        .*?['"]X-CSRF-Token['"]\s*:\s*csrf
         .*?credentials\s*:\s*['"]same-origin['"]
+        .*?['"]X-CSRF-Token['"]\s*:\s*csrf
+        .*?JSON\.stringify\(\{[^}]*action_id[^}]*cancelled\s*:\s*true
     ''', source)
     return parser.csrf
 
@@ -91,9 +92,10 @@ def test_tls_accepted_iphone_task_cancel_is_durable_replayable_and_releases_busy
     try:
         created = _call(port, certificate, "cancel-main"); call_id, task_id = created["call_id"], created["interaction_id"]; assert isinstance(call_id, str) and isinstance(task_id, str)
         cookie, csrf = _login(port, certificate); headers = _headers(cookie, csrf, port); assert _accept(port, certificate, call_id, headers)[0] == 200
-        first = _cancel(port, certificate, call_id, "task-cancel", headers)
+        writer = _writer_headers(port, certificate, call_id, headers, "cancel-main")
+        first = _cancel(port, certificate, call_id, "task-cancel", writer)
         _stop(process); process = _start(config); _wait_for_listener(process, port)
-        replay = _cancel(port, certificate, call_id, "task-cancel", headers); conflict = _cancel(port, certificate, call_id, "task-cancel", headers, cancelled=False)
+        replay = _cancel(port, certificate, call_id, "task-cancel", writer); conflict = _cancel(port, certificate, call_id, "task-cancel", writer, cancelled=False)
         assert first[0] == replay[0] == 200 and first[2] == replay[2] and conflict[0] == 409 and isinstance(first[2], dict)
         _, event, _ = _post(port, certificate, _continuation_for_task("cancel-event", task_id, call_id, 1), "test-token-alpha")
         display = _request(port, certificate, "GET", f"/calls/{call_id}", headers={"Cookie": cookie})
@@ -116,31 +118,35 @@ def test_tls_iphone_task_cancel_is_owner_route_expiry_first_and_race_safe(tmp_pa
     try:
         created = _call(port, certificate, "cancel-security"); call_id = created["call_id"]; assert isinstance(call_id, str)
         owner_cookie, owner_csrf = _login(port, certificate); other_cookie, other_csrf = _login(port, certificate); owner = _headers(owner_cookie, owner_csrf, port); assert _accept(port, certificate, call_id, owner)[0] == 200
+        writer = _writer_headers(port, certificate, call_id, owner, "cancel-security")
         with sqlite3.connect(database) as connection:
             before = connection.execute("SELECT state, owner_device_id, owner_session_id FROM calls WHERE call_id = ?", (call_id,)).fetchone(); events = connection.execute("SELECT event_seq FROM events WHERE call_id = ?", (call_id,)).fetchall()
-        cross_site = {**owner, "Origin": "https://evil.example"}
-        rejected = [_cancel(port, certificate, call_id, "foreign", _headers(other_cookie, other_csrf, port)), _cancel(port, certificate, call_id, "cross-site", cross_site), _request(port, certificate, "POST", f"/api/calls/{call_id}/cancel", body={"action_id": "mixed", "cancelled": True, "status": "completed"}, headers=owner)]
+        cross_site = {**writer, "Origin": "https://evil.example"}
+        tokenless = _cancel(port, certificate, call_id, "tokenless", owner)
+        rejected = [_cancel(port, certificate, call_id, "foreign", _headers(other_cookie, other_csrf, port)), tokenless, _cancel(port, certificate, call_id, "cross-site", cross_site), _request(port, certificate, "POST", f"/api/calls/{call_id}/cancel", body={"action_id": "mixed", "cancelled": True, "status": "completed"}, headers=writer)]
         with sqlite3.connect(database) as connection:
             after = connection.execute("SELECT state, owner_device_id, owner_session_id FROM calls WHERE call_id = ?", (call_id,)).fetchone(); after_events = connection.execute("SELECT event_seq FROM events WHERE call_id = ?", (call_id,)).fetchall()
             connection.execute("UPDATE calls SET terminal_last_seen_at = ?, terminal_disconnect_deadline = ? WHERE call_id = ?", ((datetime.now(UTC) - timedelta(seconds=181)).isoformat(), (datetime.now(UTC) - timedelta(seconds=1)).isoformat(), call_id)); connection.commit()
-        expired = _cancel(port, certificate, call_id, "expired", owner); after_expiry = _call(port, certificate, "cancel-after-expiry")
+        expired = _cancel(port, certificate, call_id, "expired", writer); after_expiry = _call(port, certificate, "cancel-after-expiry")
         assert expired[0] == 409 and isinstance(expired[2], dict) and expired[2]["status"] == expired[2]["call_state"] == "disconnected" and expired[2]["reason"] == "terminal_disconnected" and after_expiry["call_state"] == "ringing"
         admitted_id = after_expiry["call_id"]; assert isinstance(admitted_id, str)
         assert _accept(port, certificate, admitted_id, owner)[0] == 200
-        cleanup = _cancel(port, certificate, admitted_id, "post-expiry-cleanup", owner)
+        admitted_writer = _writer_headers(port, certificate, admitted_id, owner, "cancel-after-expiry")
+        cleanup = _cancel(port, certificate, admitted_id, "post-expiry-cleanup", admitted_writer)
         assert cleanup[0] == 200 and isinstance(cleanup[2], dict) and cleanup[2]["status"] == "cancelled"
 
         raced = _call(port, certificate, "cancel-race"); race_id = raced["call_id"]; assert isinstance(race_id, str); race_cookie, race_csrf = _login(port, certificate); race_headers = _headers(race_cookie, race_csrf, port); assert _accept(port, certificate, race_id, race_headers)[0] == 200
+        race_writer = _writer_headers(port, certificate, race_id, race_headers, "cancel-race")
         with ThreadPoolExecutor(max_workers=2) as executor:
-            cancel = executor.submit(_cancel, port, certificate, race_id, "race-cancel", race_headers)
-            final = executor.submit(_submit, port, certificate, race_id, "race-final", "completed", "done", race_headers)
+            cancel = executor.submit(_cancel, port, certificate, race_id, "race-cancel", race_writer)
+            final = executor.submit(_submit, port, certificate, race_id, "race-final", "completed", "done", race_writer)
             cancel_response, final_response = cancel.result(), final.result()
         with sqlite3.connect(database) as connection:
             race_state = connection.execute("SELECT state FROM calls WHERE call_id = ?", (race_id,)).fetchone()[0]
             race_events = connection.execute("SELECT event_seq FROM events WHERE call_id = ? ORDER BY event_seq", (race_id,)).fetchall()
     finally:
         _stop(process)
-    assert all(item[0] in {400, 401, 403, 404, 409} for item in rejected) and after == before and after_events == events == [(1,)]
+    assert tokenless[0] == 403 and all(item[0] in {400, 401, 403, 404, 409} for item in rejected) and after == before and after_events == events == [(1,)]
     assert call_id.lower() not in repr(rejected[0][2]).lower()
     assert {cancel_response[0], final_response[0]} <= {200, 400, 409} and race_state in {"cancelled", "completed"} and race_events == [(1,), (2,)]
 
@@ -150,9 +156,10 @@ def test_tls_task_cancel_and_progress_race_has_ordered_events_and_no_feedback(tm
     try:
         created = _call(port, certificate, "cancel-progress-race"); call_id = created["call_id"]; assert isinstance(call_id, str)
         cookie, csrf = _login(port, certificate); headers = _headers(cookie, csrf, port); assert _accept(port, certificate, call_id, headers)[0] == 200
+        writer = _writer_headers(port, certificate, call_id, headers, "cancel-progress-race")
         with ThreadPoolExecutor(max_workers=2) as executor:
-            cancelling = executor.submit(_cancel, port, certificate, call_id, "cancel-progress-race", headers)
-            progressing = executor.submit(_submit, port, certificate, call_id, "cancel-progress", "in_progress", "Race progress", headers)
+            cancelling = executor.submit(_cancel, port, certificate, call_id, "cancel-progress-race", writer)
+            progressing = executor.submit(_submit, port, certificate, call_id, "cancel-progress", "in_progress", "Race progress", writer)
             cancel_response, progress_response = cancelling.result(), progressing.result()
         with sqlite3.connect(database) as connection:
             state = connection.execute("SELECT state FROM calls WHERE call_id = ?", (call_id,)).fetchone()[0]
