@@ -96,7 +96,11 @@ def test_accepted_desktop_archive_mkdir_failure_is_non_disclosing_and_atomic(tmp
         failed = coordinator.upload_terminal_attachment(
             call_id, "desktop-registered", "desktop-owner", "evidence.txt", "text/plain", b"bytes"
         )
-        assert failed == {"success": False, "status": "archive_unavailable"}
+        assert failed == {
+            "success": False,
+            "status": "attachment_rejected",
+            "reason": "archive_unavailable",
+        }
         assert _snapshot(database, call_id) == before
     finally:
         coordinator.close()
@@ -118,7 +122,11 @@ def test_accepted_iphone_archive_write_failure_is_non_disclosing_atomic_and_reco
         failed = coordinator.upload_iphone_attachment(
             call_id, "iphone-owner", "photo.txt", "text/plain", b"phone bytes"
         )
-        assert failed == {"success": False, "status": "archive_unavailable"}
+        assert failed == {
+            "success": False,
+            "status": "attachment_rejected",
+            "reason": "archive_unavailable",
+        }
         assert _snapshot(database, call_id) == before
 
         # The failure cannot make an earlier durable attachment unreadable or
