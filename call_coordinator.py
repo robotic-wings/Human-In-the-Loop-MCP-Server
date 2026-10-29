@@ -1534,6 +1534,7 @@ class CallCoordinator:
                 "event_seq": (self._event_seq(connection, call_id) or 0) + 1,
                 "handled_on": row["handled_on"], "terminal_platform": row["terminal_platform"],
                 "report": normalized_report,
+                "result_id": str(uuid.uuid4()),
             }
             connection.execute(
                 "UPDATE calls SET state = 'in_progress', version = version + 1 WHERE call_id = ?",
@@ -1877,6 +1878,12 @@ class CallCoordinator:
         return {"success": False, "status": "session_not_found", "needs_continuation": False}
 
     def _result_for_id(self, call_id: str, result_id: str) -> dict[str, Any] | None:
+        archived = self._connection.execute(
+            "SELECT result FROM results WHERE call_id = ? AND result_id = ?",
+            (call_id, result_id),
+        ).fetchone()
+        if archived is not None:
+            return self._decode(archived["result"])
         rows = self._connection.execute(
             "SELECT result FROM submission_operations WHERE call_id = ?", (call_id,)
         ).fetchall()
@@ -2693,6 +2700,12 @@ class CallCoordinator:
         row = self._call_or_raise(connection, call_id)
         if row["agent_progress_event_seq"] == event_seq:
             return
+        result_id = result.get("result_id")
+        if isinstance(result_id, str):
+            connection.execute(
+                "INSERT OR IGNORE INTO results (result_id, call_id, result) VALUES (?, ?, ?)",
+                (result_id, call_id, self._canonical(result)),
+            )
         deadline = self._now() + timedelta(seconds=300)
         connection.execute(
             "UPDATE calls SET agent_reconnect_deadline = ?, agent_progress_event_seq = ? WHERE call_id = ?",
