@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from test_central_mcp_gateway import _free_port, _post, _start, _stop, _structured, _wait_for_listener
+from test_iphone_browser_drafts import _writer_headers
 from test_iphone_web_acceptance import _login, _request, _write_operator_config
 from test_iphone_web_decline import _configure_phone_route, _headers
 from test_mcp_continuation import _continuation
@@ -50,7 +51,7 @@ class _ConfirmationPageParser(HTMLParser):
         values = dict(attrs)
         if tag == "meta" and values.get("name") == "X-CSRF-Token":
             self.csrf = values.get("content")
-        if values.get("data-endpoint"):
+        if tag == "button" and values.get("data-confirmed") in {"true", "false"}:
             self.endpoint = values["data-endpoint"]
         if values.get("data-confirmed") in {"true", "false"}:
             self.choices.add(values["data-confirmed"])
@@ -98,7 +99,9 @@ def test_tls_accepted_iphone_confirmation_is_answered_replayable_and_agent_reada
         owner_page = _request(port, certificate, "GET", f"/calls/{call_id}", headers={"Cookie": cookie})
         endpoint, rendered_csrf, choices = _parsed_confirmation_page(owner_page[2], call_id)
         assert str(confirmed).lower() in choices
-        rendered_headers = _headers(cookie, rendered_csrf, port)
+        rendered_headers = _writer_headers(
+            port, certificate, call_id, _headers(cookie, rendered_csrf, port), f"confirm-writer-{confirmed}"
+        )
         first = _request(
             port, certificate, "POST", endpoint,
             body={"submission_id": submission_id, "confirmed": confirmed}, headers=rendered_headers,
@@ -146,11 +149,14 @@ def test_tls_iphone_confirmation_rejects_nonowner_cross_site_and_text_payloads(t
         owner_cookie, owner_csrf = _login(port, certificate)
         other_cookie, other_csrf = _login(port, certificate)
         before_accept = _submit(port, certificate, call_id, "preaccept", False, _headers(owner_cookie, owner_csrf, port))
-        assert _accept(port, certificate, call_id, _headers(owner_cookie, owner_csrf, port))[0] == 200
+        owner = _headers(owner_cookie, owner_csrf, port)
+        assert _accept(port, certificate, call_id, owner)[0] == 200
+        writer = _writer_headers(port, certificate, call_id, owner, "confirm-security")
         foreign = _submit(port, certificate, call_id, "foreign", False, {"Cookie": owner_cookie, "X-CSRF-Token": owner_csrf, "Origin": "https://evil.example"})
         other = _submit(port, certificate, call_id, "other", True, _headers(other_cookie, other_csrf, port))
-        text = _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "text", "user_input": "not a confirmation"}, headers=_headers(owner_cookie, owner_csrf, port))
-        malformed = _submit(port, certificate, call_id, "bad", "false", _headers(owner_cookie, owner_csrf, port))
+        tokenless = _submit(port, certificate, call_id, "tokenless", False, owner)
+        text = _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "text", "user_input": "not a confirmation"}, headers=writer)
+        malformed = _submit(port, certificate, call_id, "bad", "false", writer)
         with sqlite3.connect(tmp_path / "data" / "calls.sqlite3") as connection:
             state = connection.execute("SELECT state FROM calls WHERE call_id = ?", (call_id,)).fetchone()[0]
             submissions = connection.execute("SELECT count(*) FROM submission_operations WHERE call_id = ?", (call_id,)).fetchone()[0]
@@ -160,6 +166,7 @@ def test_tls_iphone_confirmation_rejects_nonowner_cross_site_and_text_payloads(t
     assert before_accept[0] in {400, 401, 403, 409}
     assert foreign[0] in {400, 403}
     assert other[0] in {400, 401, 403, 404, 409}
+    assert tokenless[0] == 403
     assert text[0] == malformed[0] == 400
     assert state == "accepted"
     assert submissions == 0
@@ -210,6 +217,7 @@ def test_tls_expired_accepted_iphone_confirmation_settles_disconnect_before_subm
         cookie, csrf = _login(port, certificate)
         headers = _headers(cookie, csrf, port)
         assert _accept(port, certificate, call_id, headers)[0] == 200
+        writer = _writer_headers(port, certificate, call_id, headers, "confirm-expiry")
         with sqlite3.connect(database) as connection:
             connection.execute(
                 "UPDATE calls SET terminal_last_seen_at = ?, terminal_disconnect_deadline = ? WHERE call_id = ?",
@@ -220,7 +228,7 @@ def test_tls_expired_accepted_iphone_confirmation_settles_disconnect_before_subm
                 ),
             )
             connection.commit()
-        late = _submit(port, certificate, call_id, "expired-confirm", False, headers)
+        late = _submit(port, certificate, call_id, "expired-confirm", False, writer)
         _, continuation, _ = _post(
             port, certificate, _continuation("expired-confirm-event", interaction_id, call_id, 1), "test-token-alpha"
         )
