@@ -688,6 +688,7 @@ class _McpGateway:
             spec.name in (
                 "get_user_input", "get_multiline_input", "get_user_choice",
                 "get_feedback_from_user", "show_confirmation_dialog", "show_info_message",
+                "assign_task_to_human",
             )
             and "max_result_bytes" in safe_arguments
             and not _valid_text_input_result_budget(safe_arguments["max_result_bytes"])
@@ -964,6 +965,8 @@ def _input_transport_view(envelope: dict[str, object], budget: object) -> dict[s
         field = "user_input"
     elif isinstance(envelope.get("feedback_text"), str):
         field = "feedback_text"
+    elif isinstance(envelope.get("report"), str):
+        field = "report"
     else:
         field = "selected_choices"
     if field == "selected_choices" and not isinstance(envelope.get(field), list):
