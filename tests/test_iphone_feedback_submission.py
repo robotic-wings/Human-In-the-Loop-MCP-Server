@@ -43,7 +43,7 @@ class _Page(HTMLParser):
     def handle_starttag(self, tag, attrs) -> None:
         values = {key: value or "" for key, value in attrs}
         if tag == "meta" and values.get("name") == "X-CSRF-Token": self.csrf = values.get("content")
-        if values.get("data-endpoint"): self.endpoint = values["data-endpoint"]
+        if tag == "button" and values.get("data-feedback-send") == "true": self.endpoint = values.get("data-endpoint")
         if tag == "option": self.options.append(values)
         if tag == "textarea": self.textarea = True
         if tag == "button" and values.get("data-feedback-send") == "true": self.send.append(values)
