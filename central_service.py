@@ -2172,7 +2172,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         "}));"
                     )
                 elif multi_choice_options is not None:
-                    controls = "".join(
+                    controls = '<p data-multiple-choice-status="ready">Ready to submit</p>' + "".join(
                         f'<label><input type="checkbox" data-choice="{html.escape(choice, quote=True)}">'
                         f'{html.escape(choice)}</label>'
                         for choice in multi_choice_options
@@ -2180,12 +2180,13 @@ class _PublicHandler(BaseHTTPRequestHandler):
                     submission_script = (
                         "document.querySelectorAll('button[data-multiple-choice]').forEach((button)=>"
                         "button.addEventListener('click',()=>{"
+                        "const choiceStatus=document.querySelector('[data-multiple-choice-status]');"
                         "const selected=Array.from(document.querySelectorAll('input[type=checkbox][data-choice]'))"
                         ".filter((checkbox)=>checkbox.checked).map((checkbox)=>checkbox.dataset.choice);"
                         "fetch(button.dataset.endpoint,{method:'POST',credentials:'same-origin',"
                         "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},"
                         "body:JSON.stringify({submission_id:crypto.randomUUID(),selected_choices:selected})})"
-                        ".then((response)=>{if(response.ok)location.reload();});"
+                        ".then((response)=>{if(response.ok)location.reload();if(response.ok){}else{choiceStatus.dataset.multipleChoiceStatus='not-submitted';choiceStatus.textContent='not-submitted: conflict or unavailable';}});"
                         "}));"
                     )
                 elif choice_options is not None:
