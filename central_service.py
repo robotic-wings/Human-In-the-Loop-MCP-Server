@@ -2102,6 +2102,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         f'{html.escape(initial_feedback, quote=False)}</textarea>'
                         '<p data-draft-status="saved">Saved</p>'
                         f'<button data-draft-save data-endpoint="{endpoint}/draft">Save draft</button>'
+                        '<p data-feedback-status="ready">Ready to send feedback</p>'
                         f'<button data-feedback-send="true" data-endpoint="{endpoint}/submissions">Send</button>'
                     )
                     submission_script = (
@@ -2110,16 +2111,17 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         "const draftSave=document.querySelector('button[data-draft-save]');"
                         "draftInput.addEventListener('input',()=>{draftStatus.dataset.draftStatus='not-synced';draftStatus.textContent='not-synced';});"
                         "draftSave.addEventListener('click',async()=>{const response=await fetch(draftSave.dataset.endpoint,{method:'PUT',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({body:draftInput.value,expected_draft_version:Number(draftInput.dataset.draftVersion)})});if(response.ok){const saved=await response.json();draftInput.dataset.draftVersion=String(saved.draft_version);draftStatus.dataset.draftStatus='saved';draftStatus.textContent='saved';}else{draftStatus.dataset.draftStatus='not-synced';draftStatus.textContent='draft conflict; not-synced';}});"
+                        "const feedbackStatus=document.querySelector('[data-feedback-status]');"
                         "const send=document.querySelector('button[data-feedback-send]');"
                         "send.addEventListener('click',()=>{"
                         "const endpoint=send.dataset.endpoint;"
                         "const feedbackType=document.querySelector('select[data-feedback-type]').value;"
                         "const feedbackText=document.querySelector('textarea[data-feedback-text]').value;"
-                        "const body=JSON.stringify({submission_id:crypto.randomUUID(),feedback_type:feedbackType,feedback_text:feedbackText});"
+                        "const body=JSON.stringify({submission_id:crypto.randomUUID(),feedback_type:feedbackType,feedback_text:feedbackText})\n"
                         "fetch(send.dataset.endpoint,{method:'POST',"
                         "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},credentials: 'same-origin',"
                         "body:body})"
-                        ".then((response)=>{if(response.ok)location.reload();});"
+                        ".then((response)=>{if(response.ok)location.reload();if(response.ok){}else{feedbackStatus.dataset.feedbackStatus='not-submitted';feedbackStatus.textContent='not-submitted: conflict or unavailable';}});"
                         "});"
                     )
                 elif numeric_spec is not None:
