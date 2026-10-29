@@ -66,6 +66,21 @@ def _call_rows(database: Path, task_id: str):
         ).fetchall()
 
 
+def _durable_counts(database: Path, task_id: str) -> tuple[int, int, int, int, int]:
+    with sqlite3.connect(database) as connection:
+        call_ids = [row[0] for row in connection.execute(
+            "SELECT call_id FROM calls WHERE interaction_id = ?", (task_id,)
+        )]
+        placeholders = ",".join("?" for _ in call_ids)
+        events = connection.execute(f"SELECT count(*) FROM events WHERE call_id IN ({placeholders})", call_ids).fetchone()[0]
+        results = connection.execute(f"SELECT count(*) FROM results WHERE call_id IN ({placeholders})", call_ids).fetchone()[0]
+        submissions = connection.execute(f"SELECT count(*) FROM submission_operations WHERE call_id IN ({placeholders})", call_ids).fetchone()[0]
+        # create_operations is keyed by caller/request rather than interaction;
+        # this isolated database contains only this test's task.
+        creates = connection.execute("SELECT count(*) FROM create_operations").fetchone()[0]
+    return len(call_ids), events, results, submissions, creates
+
+
 def test_tls_task_revision_creates_one_new_round_replays_and_conflicts_without_reusing_old_events(tmp_path: Path) -> None:
     port = _free_port(); config, certificate = _write_operator_config(tmp_path, port); _configure_phone_route(config)
     database = tmp_path / "data" / "calls.sqlite3"; process = _start(config); _wait_for_listener(process, port)
@@ -118,3 +133,45 @@ def test_tls_task_revision_rejects_nonfinal_nonlatest_busy_foreign_and_late_old_
     assert "error" in foreign_raw or foreign["success"] is False
     assert busy["success"] is True and busy["status"] == "busy"
     assert before == after == [(active_call, "failed"), (new_call, "ringing")]
+
+
+def test_tls_task_revision_rejects_nonzero_cursor_before_admission_without_durable_mutation(tmp_path: Path) -> None:
+    port = _free_port(); config, certificate = _write_operator_config(tmp_path, port); _configure_phone_route(config)
+    database = tmp_path / "data" / "calls.sqlite3"; process = _start(config); _wait_for_listener(process, port)
+    try:
+        original = _call(port, certificate, "revision-cursor-original")
+        task_id, old_call_id = original["interaction_id"], original["call_id"]
+        assert isinstance(task_id, str) and isinstance(old_call_id, str)
+        _finish_task(port, certificate, old_call_id, "completed", "revision-cursor-final")
+        before_rows, before_counts = _call_rows(database, task_id), _durable_counts(database, task_id)
+        request = _revision_request(task_id, old_call_id, "revision-cursor", "revision-cursor-request")
+        request["params"]["arguments"]["after_event_seq"] = 1
+        _, response, _ = _post(port, certificate, request, "test-token-alpha")
+        after_rows, after_counts = _call_rows(database, task_id), _durable_counts(database, task_id)
+    finally:
+        _stop(process)
+    rejected = _structured(response)
+    assert rejected["success"] is False and rejected["needs_continuation"] is False
+    assert rejected["status"] in {"invalid_cursor", "invalid_revision"}
+    assert after_rows == before_rows == [(old_call_id, "completed")]
+    assert after_counts == before_counts
+
+
+def test_tls_task_revision_replays_same_business_content_under_new_request_id_without_duplicate_ring(tmp_path: Path) -> None:
+    port = _free_port(); config, certificate = _write_operator_config(tmp_path, port); _configure_phone_route(config)
+    database = tmp_path / "data" / "calls.sqlite3"; process = _start(config); _wait_for_listener(process, port)
+    try:
+        original = _call(port, certificate, "revision-replay-original")
+        task_id, old_call_id = original["interaction_id"], original["call_id"]
+        assert isinstance(task_id, str) and isinstance(old_call_id, str)
+        _finish_task(port, certificate, old_call_id, "failed", "revision-replay-final")
+        _, first_raw, _ = _post(port, certificate, _revision_request(task_id, old_call_id, "revision-replay", "revision-replay-first"), "test-token-alpha")
+        before_rows = _call_rows(database, task_id)
+        _, replay_raw, _ = _post(port, certificate, _revision_request(task_id, old_call_id, "revision-replay", "revision-replay-second"), "test-token-alpha")
+        after_rows = _call_rows(database, task_id)
+    finally:
+        _stop(process)
+    first, replay = _structured(first_raw), _structured(replay_raw)
+    assert first["success"] is replay["success"] is True and first["call_id"] != old_call_id
+    assert replay["call_id"] == first["call_id"] and replay["status"] != "revision_conflict"
+    assert before_rows == after_rows == [(old_call_id, "failed"), (first["call_id"], "ringing")]
