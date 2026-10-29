@@ -2023,6 +2023,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         f'{html.escape(initial_report, quote=False)}</textarea>'
                         '<p data-draft-status="saved">Saved</p>'
                         f'<button data-draft-save data-endpoint="{endpoint}/draft">Save draft</button>'
+                        '<p data-task-progress-status="ready">Ready to report progress</p>'
                         f'<button data-task-progress="true" data-endpoint="{endpoint}/submissions">Still progressing</button>'
                         f'<button data-task-final="completed" data-task-version="{html.escape(str(task_version), quote=True)}" data-endpoint="{endpoint}/submissions">Completed</button>'
                         f'<button data-task-final="failed" data-task-version="{html.escape(str(task_version), quote=True)}" data-endpoint="{endpoint}/submissions">Failed</button>'
@@ -2038,13 +2039,14 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         "const draftSave=document.querySelector('button[data-draft-save]');"
                         "draftInput.addEventListener('input',()=>{draftStatus.dataset.draftStatus='not-synced';draftStatus.textContent='not-synced';});"
                         "draftSave.addEventListener('click',async()=>{const response=await fetch(draftSave.dataset.endpoint,{method:'PUT',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({body:draftInput.value,expected_draft_version:Number(draftInput.dataset.draftVersion)})});if(response.ok){const saved=await response.json();draftInput.dataset.draftVersion=String(saved.draft_version);draftStatus.dataset.draftStatus='saved';draftStatus.textContent='saved';}else{draftStatus.dataset.draftStatus='not-synced';draftStatus.textContent='draft conflict; not-synced';}});"
+                        "const progressStatus=document.querySelector('[data-task-progress-status]');"
                         "const progress=document.querySelector('button[data-task-progress]');"
                         "progress.addEventListener('click',()=>{"
                         "const report=document.querySelector('textarea[data-task-report]').value;"
                         "const body=JSON.stringify({submission_id:crypto.randomUUID(),status:'in_progress',report:report});"
                         "fetch(progress.dataset.endpoint,{method:'POST',credentials: 'same-origin',"
                         "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:body})"
-                        ".then((response)=>{if(response.ok)location.reload();});"
+                        ".then((response)=>{if(response.ok)location.reload();if(response.ok){}else{progressStatus.dataset.taskProgressStatus='not-submitted';progressStatus.textContent='not-submitted: conflict or unavailable';}});"
                         "});"
                         "const normalCompleted=document.querySelector('button[data-task-final=\"completed\"]');"
                         "normalCompleted.addEventListener('click',()=>{const status=normalCompleted.dataset.taskFinal;const report=document.querySelector('textarea[data-task-report]').value;const body=JSON.stringify({submission_id:crypto.randomUUID(),status:status,report:report,task_version:Number(normalCompleted.dataset.taskVersion),attachment_ids:pendingAttachmentIds});fetch(normalCompleted.dataset.endpoint,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:body}).then((response)=>{if(response.ok)location.reload();});});"
