@@ -17,8 +17,8 @@ from test_mcp_continuation import _continuation
 
 def _handler(source: str, status: str) -> str:
     match = re.search(
-        rf"const normal{status.title()}=document\\.querySelector\('button\\[data-task-final=\\\"{status}\\\"\\]'\);"
-        rf"normal{status.title()}\\.addEventListener\('click',\\(\\)=>\\{{(?P<body>.*?)\\}}\\);",
+        rf"const normal{status.title()}=document\.querySelector\('button\[data-task-final=\"{status}\"\]'\);"
+        rf"normal{status.title()}\.addEventListener\('click',\(\)=>\{{(?P<body>.*?)\}}\);",
         source,
         re.DOTALL,
     )
