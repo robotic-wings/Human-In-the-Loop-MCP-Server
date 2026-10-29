@@ -11,7 +11,6 @@ from test_central_mcp_gateway import (
     _rpc,
     _start,
     _stop,
-    _structured,
     _wait_for_listener,
     _write_gateway_config,
 )
@@ -51,19 +50,19 @@ def _database_snapshot(database: Path) -> dict[str, int]:
 
 
 def _prompt_call(
-    port: int, certificate: Path, token: str | None, arguments: object = None
+    port: int, certificate: Path, token: str | None, params: object = None
 ) -> tuple[int, dict[str, object]]:
-    value = {} if arguments is None else arguments
+    value = {"name": PROMPT_NAME} if params is None else params
     status, response, _ = _post(
         port,
         certificate,
-        _rpc("tools/call", {"name": PROMPT_NAME, "arguments": value}),
+        _rpc("prompts/get", value),
         token,
     )
     return status, response
 
 
-def test_authenticated_prompt_tool_discovery_and_read_return_complete_central_guidance(
+def test_authenticated_prompt_discovery_and_read_return_complete_central_guidance(
     tmp_path: Path,
 ) -> None:
     port = _free_port()
@@ -72,18 +71,29 @@ def test_authenticated_prompt_tool_discovery_and_read_return_complete_central_gu
     _wait_for_listener(process, port)
     try:
         list_status, listed, _ = _post(
-            port, certificate, _rpc("tools/list", {}), "test-token-alpha"
+            port, certificate, _rpc("prompts/list", {}), "test-token-alpha"
         )
         get_status, prompt = _prompt_call(port, certificate, "test-token-alpha")
     finally:
         _stop(process)
 
     assert list_status == get_status == 200
-    assert PROMPT_NAME in {tool["name"] for tool in listed["result"]["tools"]}
-    assert _structured(prompt) == {"guidance": CANONICAL_GUIDANCE}
+    assert listed["result"] == {
+        "prompts": [
+            {
+                "name": PROMPT_NAME,
+                "description": "Central HTTP(S) human-loop protocol guidance.",
+            }
+        ]
+    }
+    messages = prompt["result"]["messages"]
+    assert isinstance(messages, list) and len(messages) == 1
+    content = messages[0]["content"]
+    assert messages[0]["role"] == "user"
+    assert content == {"type": "text", "text": CANONICAL_GUIDANCE}
 
 
-def test_prompt_tool_rejects_arguments_and_preserves_json_rpc_and_auth_errors(
+def test_prompt_requests_reject_invalid_params_and_preserve_json_rpc_and_auth_errors(
     tmp_path: Path,
 ) -> None:
     port = _free_port()
@@ -92,19 +102,19 @@ def test_prompt_tool_rejects_arguments_and_preserves_json_rpc_and_auth_errors(
     _wait_for_listener(process, port)
     try:
         malformed_status, malformed = _prompt_call(
-            port, certificate, "test-token-alpha", {"unexpected": "value"}
+            port, certificate, "test-token-alpha", {"name": PROMPT_NAME, "unexpected": "value"}
         )
         unknown_status, unknown, _ = _post(
-            port, certificate, _rpc("tools/call", {"name": "not-a-central-prompt", "arguments": {}}), "test-token-alpha"
+            port, certificate, _rpc("prompts/get", {"name": "not-a-central-prompt"}), "test-token-alpha"
         )
         method_status, method, _ = _post(
-            port, certificate, _rpc("tools/delete", {}), "test-token-alpha"
+            port, certificate, _rpc("prompts/delete", {}), "test-token-alpha"
         )
         unauthenticated_status, unauthenticated, _ = _post(
-            port, certificate, _rpc("tools/list", {}), None
+            port, certificate, _rpc("prompts/list", {}), None
         )
         bad_bearer_status, bad_bearer, _ = _post(
-            port, certificate, _rpc("tools/call", {"name": PROMPT_NAME, "arguments": {}}), "foreign-token"
+            port, certificate, _rpc("prompts/get", {"name": PROMPT_NAME}), "foreign-token"
         )
     finally:
         _stop(process)
@@ -133,7 +143,7 @@ def test_prompt_reads_do_not_create_calls_results_events_outbox_or_busy_state(
     try:
         before = _database_snapshot(database)
         list_status, listed, _ = _post(
-            port, certificate, _rpc("tools/list", {}), "test-token-alpha"
+            port, certificate, _rpc("prompts/list", {}), "test-token-alpha"
         )
         get_status, prompt = _prompt_call(port, certificate, "test-token-alpha")
         after = _database_snapshot(database)
