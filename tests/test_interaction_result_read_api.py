@@ -392,6 +392,50 @@ def test_tls_attachment_reader_offsets_authorization_and_budget_are_nonleaking(t
         _stop(process)
 
 
+def test_tls_attachment_reader_rejects_same_length_archive_tampering_without_leakage(
+    tmp_path: Path,
+) -> None:
+    """A stored digest is an archive-integrity check, not metadata to repeat after a bad read."""
+    attachment = b"original archive bytes"
+    replacement = b"substituted archive!!!"
+    assert len(replacement) == len(attachment)
+    port, certificate, process, created, fixture = _completed_fixture(
+        tmp_path,
+        request_id="attachment-integrity-read",
+        owner_session_id="attachment-integrity-owner",
+        body="attachment integrity answer",
+        attachment=attachment,
+    )
+    try:
+        attachment_id = fixture["uploaded"]["attachment"]["attachment_id"]
+        database = tmp_path / "data" / "calls.sqlite3"
+        row = _attachment_rows(database, created["call_id"])[0]
+        archive_path = Path(row["storage_path"])
+        archive_path.write_bytes(replacement)
+        before = _persisted_snapshot(tmp_path / "data", created["call_id"])
+
+        failed = _read_attachment(
+            port,
+            certificate,
+            "test-token-alpha",
+            created["interaction_id"],
+            attachment_id,
+            None,
+            _MIN_RESULT_BUDGET,
+        )
+
+        assert failed == {
+            "success": False,
+            "status": "session_not_found",
+            "needs_continuation": False,
+        }
+        assert "data_base64" not in failed
+        assert "sha256" not in failed
+        assert _persisted_snapshot(tmp_path / "data", created["call_id"]) == before
+    finally:
+        _stop(process)
+
+
 def test_tls_authorized_readers_default_the_result_budget_and_positions_without_mutation(
     tmp_path: Path,
 ) -> None:
