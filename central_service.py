@@ -687,7 +687,7 @@ class _McpGateway:
             # An omitted operation ID is a best-effort cancel without replay
             # guarantees.  Give the coordinator a fresh bounded ID so it still
             # records exactly one terminal transition.
-            if request_id is None:
+            if "request_id" not in arguments:
                 request_id = f"cancel-{secrets.token_hex(16)}"
             if (
                 not isinstance(request_id, str)
