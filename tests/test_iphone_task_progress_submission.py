@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 
 from test_central_mcp_gateway import _free_port, _post, _start, _stop, _structured, _wait_for_listener
+from test_iphone_browser_drafts import _writer_headers
 from test_iphone_web_acceptance import _login, _request, _write_operator_config
 from test_iphone_web_decline import _configure_phone_route, _headers
 from test_mcp_continuation import _continuation
@@ -75,7 +76,7 @@ def test_tls_accepted_iphone_task_progress_persists_replays_and_keeps_page_writa
     try:
         created = _call(port, certificate, "progress-main"); call_id, task_id = created["call_id"], created["interaction_id"]; assert isinstance(call_id, str) and isinstance(task_id, str)
         cookie, csrf = _login(port, certificate); headers = _headers(cookie, csrf, port); assert _accept(port, certificate, call_id, headers)[0] == 200
-        page_csrf = _page(_request(port, certificate, "GET", f"/calls/{call_id}", headers={"Cookie": cookie})[2], call_id); protected = _headers(cookie, page_csrf, port)
+        page_csrf = _page(_request(port, certificate, "GET", f"/calls/{call_id}", headers={"Cookie": cookie})[2], call_id); protected = _writer_headers(port, certificate, call_id, _headers(cookie, page_csrf, port), "task-progress-main")
         first = _submit(port, certificate, call_id, "progress-1", "in_progress", "  Waiting for access.  ", protected); replay = _submit(port, certificate, call_id, "progress-1", "in_progress", "Waiting for access.", protected); conflict = _submit(port, certificate, call_id, "progress-1", "in_progress", "Different", protected)
         _, event, _ = _post(port, certificate, _continuation_for_task("progress-event", task_id, call_id, 1), "test-token-alpha")
         with sqlite3.connect(database) as connection:
@@ -99,7 +100,7 @@ def test_tls_task_progress_reconnect_grace_is_300_seconds_and_replay_does_not_ex
     port = _free_port(); config, certificate = _write_operator_config(tmp_path, port); _configure_phone_route(config); database = tmp_path / "data" / "calls.sqlite3"; process = _start(config); _wait_for_listener(process, port)
     try:
         created = _call(port, certificate, "progress-grace"); call_id, task_id = created["call_id"], created["interaction_id"]; assert isinstance(call_id, str) and isinstance(task_id, str)
-        cookie, csrf = _login(port, certificate); headers = _headers(cookie, csrf, port); assert _accept(port, certificate, call_id, headers)[0] == 200; assert _submit(port, certificate, call_id, "progress-grace", "in_progress", "Still working", headers)[0] == 200
+        cookie, csrf = _login(port, certificate); headers = _headers(cookie, csrf, port); assert _accept(port, certificate, call_id, headers)[0] == 200; headers = _writer_headers(port, certificate, call_id, headers, "task-progress-grace"); assert _submit(port, certificate, call_id, "progress-grace", "in_progress", "Still working", headers)[0] == 200
         delivery_started = datetime.now(UTC)
         _, delivered, _ = _post(port, certificate, _continuation_for_task("progress-deliver", task_id, call_id, 1), "test-token-alpha")
         with sqlite3.connect(database) as connection: first_deadline = connection.execute("SELECT agent_reconnect_deadline FROM calls WHERE call_id = ?", (call_id,)).fetchone()[0]
@@ -118,10 +119,10 @@ def test_tls_task_progress_rejects_invalid_foreign_and_expired_agent_releases_bu
     port = _free_port(); config, certificate = _write_operator_config(tmp_path, port); _configure_phone_route(config); database = tmp_path / "data" / "calls.sqlite3"; process = _start(config); _wait_for_listener(process, port)
     try:
         created = _call(port, certificate, "progress-security"); call_id, task_id = created["call_id"], created["interaction_id"]; assert isinstance(call_id, str) and isinstance(task_id, str)
-        owner_cookie, owner_csrf = _login(port, certificate); other_cookie, other_csrf = _login(port, certificate); owner = _headers(owner_cookie, owner_csrf, port); assert _accept(port, certificate, call_id, owner)[0] == 200
+        owner_cookie, owner_csrf = _login(port, certificate); other_cookie, other_csrf = _login(port, certificate); owner = _headers(owner_cookie, owner_csrf, port); assert _accept(port, certificate, call_id, owner)[0] == 200; protected = _writer_headers(port, certificate, call_id, owner, "task-progress-security")
         with sqlite3.connect(database) as connection: before = connection.execute("SELECT state, owner_device_id, owner_session_id FROM calls WHERE call_id = ?", (call_id,)).fetchone(); events = connection.execute("SELECT event_seq FROM events WHERE call_id = ?", (call_id,)).fetchall()
-        cross_site = dict(owner); cross_site["Origin"] = "https://evil.example"
-        bad = [_submit(port, certificate, call_id, "empty", "in_progress", "   ", owner), _submit(port, certificate, call_id, "wrong", "other", "x", owner), _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "mixed", "status": "in_progress", "report": "x", "confirmed": False}, headers=owner), _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "cross-site", "status": "in_progress", "report": "x"}, headers=cross_site), _submit(port, certificate, call_id, "foreign", "in_progress", "x", _headers(other_cookie, other_csrf, port))]
+        cross_site = dict(protected); cross_site["Origin"] = "https://evil.example"
+        bad = [_submit(port, certificate, call_id, "no-writer", "in_progress", "x", owner), _submit(port, certificate, call_id, "empty", "in_progress", "   ", protected), _submit(port, certificate, call_id, "wrong", "other", "x", protected), _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "mixed", "status": "in_progress", "report": "x", "confirmed": False}, headers=protected), _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "cross-site", "status": "in_progress", "report": "x"}, headers=cross_site), _submit(port, certificate, call_id, "foreign", "in_progress", "x", _headers(other_cookie, other_csrf, port))]
         with sqlite3.connect(database) as connection: after = connection.execute("SELECT state, owner_device_id, owner_session_id FROM calls WHERE call_id = ?", (call_id,)).fetchone(); operations = connection.execute("SELECT count(*) FROM submission_operations WHERE call_id = ?", (call_id,)).fetchone()[0]; after_events = connection.execute("SELECT event_seq FROM events WHERE call_id = ?", (call_id,)).fetchall(); connection.execute("UPDATE calls SET state = 'in_progress', agent_reconnect_deadline = ? WHERE call_id = ?", ((datetime.now(UTC) - timedelta(seconds=1)).isoformat(), call_id)); connection.commit()
         _stop(process); process = _start(config); _wait_for_listener(process, port); _, terminal, _ = _post(port, certificate, _continuation_for_task("progress-expired", task_id, call_id, 1), "test-token-alpha"); next_call = _call(port, certificate, "progress-after-expiry")
     finally: _stop(process)
@@ -140,5 +141,5 @@ def test_tls_task_accept_progress_race_has_no_duplicate_progress_event_or_operat
             accepted = accepted_future.result(); submitted = submitted_future.result()
         with sqlite3.connect(database) as connection: state = connection.execute("SELECT state FROM calls WHERE call_id = ?", (call_id,)).fetchone()[0]; operations = connection.execute("SELECT count(*) FROM submission_operations WHERE call_id = ?", (call_id,)).fetchone()[0]; events = connection.execute("SELECT event_seq FROM events WHERE call_id = ? ORDER BY event_seq", (call_id,)).fetchall()
     finally: _stop(process)
-    assert accepted[0] == 200 and submitted[0] in {200, 400, 409}
-    assert (state == "in_progress" and operations == 1 and events == [(1,), (2,)]) or (state == "accepted" and operations == 0 and events == [(1,)])
+    assert accepted[0] == 200 and submitted[0] in {200, 400, 403, 409}
+    assert (state == "in_progress" and operations == 1 and events == [(1,), (2,)]) or (state == "accepted" and operations == 0 and events == [(1,)] )
