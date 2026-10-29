@@ -2312,15 +2312,17 @@ class _PublicHandler(BaseHTTPRequestHandler):
                     if isinstance(item, dict)
                 )
                 attachment_controls = attachment_controls.replace('<ul data-attachment-list></ul>', f'<ul data-attachment-list>{pending_items}</ul>')
-                controls = owner_liveness_warning + controls + attachment_controls
+                controls = owner_liveness_warning + '<p data-heartbeat-status="ready">Heartbeat ready.</p>' + controls + attachment_controls
                 submission_script += attachment_script
                 heartbeat_script = (
                     f"const heartbeatEndpoint='{endpoint}/heartbeat';"
+                    "const heartbeatStatus=document.querySelector('[data-heartbeat-status]');"
+                    "const showHeartbeatUnavailable=()=>{heartbeatStatus.setAttribute('data-heartbeat-status','unavailable');heartbeatStatus.textContent='unavailable: reload needed';};"
                     "const heartbeatTimer=setInterval(async()=>{"
-                    "const response=await fetch(heartbeatEndpoint,{method:'POST',credentials:'same-origin',"
-                    "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:'{}'});"
-                    "if(!response.ok){clearInterval(heartbeatTimer);"
-                    "document.querySelector('[data-state]').textContent='Connection lost.';}"
+                    "try{const response=await fetch(heartbeatEndpoint,{method:'POST',credentials:'same-origin',"
+                    "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf,'X-Writer-Token':writerToken},body:'{}'});"
+                    "if(!response.ok){clearInterval(heartbeatTimer);showHeartbeatUnavailable();}}"
+                    "catch(_error){showHeartbeatUnavailable();}"
                     "},10000);"
                 )
                 # Polling only observes the server's durable projection.  It
