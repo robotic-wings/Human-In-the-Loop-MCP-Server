@@ -20,6 +20,7 @@ from test_central_mcp_gateway import _free_port, _post, _start, _stop, _structur
 from test_iphone_browser_drafts import _accept, _writer_headers
 from test_iphone_web_acceptance import _create_call, _login, _request, _write_operator_config
 from test_iphone_web_decline import _configure_phone_route, _headers
+from test_iphone_late_open_desktop_status import _desktop_config
 from test_terminal_attachment_upload_api import _attachment_files, _attachment_rows
 
 
@@ -219,6 +220,9 @@ def test_tls_browser_attachment_upload_rejects_ringing_and_route_excluded_withou
         _stop(process)
 
     port = _free_port(); config, cert = _write_operator_config(tmp_path / "excluded", port)
+    # A desktop-only route is eligible for call admission, while preserving the
+    # iPhone route exclusion that this upload check exercises.
+    _desktop_config(config, phone_route=False)
     process = _start(config); _wait_for_listener(process, port)
     database = tmp_path / "excluded" / "data" / "calls.sqlite3"
     try:
