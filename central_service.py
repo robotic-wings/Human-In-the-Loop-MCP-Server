@@ -350,7 +350,7 @@ _TOOL_SPECS = (
             "interaction_id": {"type": "string"},
             "request_id": {"type": "string"},
         },
-        ("interaction_id", "call_id", "request_id"),
+        ("interaction_id", "call_id"),
     ),
     _tool_spec(
         "read_interaction_result",
@@ -683,17 +683,24 @@ class _McpGateway:
             return self._read_interaction_result_tool(rpc_id, safe_arguments, caller_id)
         if spec.name == "read_interaction_attachment":
             return self._read_interaction_attachment_tool(rpc_id, safe_arguments, caller_id)
-        if not isinstance(request_id, str) or not request_id:
-            return _rpc_error(rpc_id, -32602, "invalid params")
         if spec.name == "cancel_interaction":
-            # Agent cancellation operation identifiers are persisted for replay,
-            # so enforce their bounded ASCII wire contract before the coordinator
-            # can inspect a call or create an operation record.
-            if len(request_id) > 128 or not request_id.isascii():
+            # An omitted operation ID is a best-effort cancel without replay
+            # guarantees.  Give the coordinator a fresh bounded ID so it still
+            # records exactly one terminal transition.
+            if request_id is None:
+                request_id = f"cancel-{secrets.token_hex(16)}"
+            if (
+                not isinstance(request_id, str)
+                or not request_id
+                or len(request_id) > 128
+                or not request_id.isascii()
+            ):
                 return _rpc_error(rpc_id, -32602, "invalid params")
             return self._cancel_interaction_tool(
                 rpc_id, safe_arguments, caller_id, request_id
             )
+        if not isinstance(request_id, str) or not request_id:
+            return _rpc_error(rpc_id, -32602, "invalid params")
         interaction_key = "task_id" if spec.name == "assign_task_to_human" else "interaction_id"
         client_timeout_seconds = safe_arguments.get("client_timeout_seconds")
         if client_timeout_seconds is not None and not _valid_client_timeout(client_timeout_seconds):
