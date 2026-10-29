@@ -1824,6 +1824,8 @@ class CallCoordinator:
                 return self._not_found_read()
             if len(content) != item["byte_count"]:
                 return self._not_found_read()
+            if hashlib.sha256(content).hexdigest() != item["sha256"]:
+                return self._not_found_read()
             return self._attachment_page(item, content, offset_bytes, max_result_bytes)
 
     def upload_terminal_attachment(
