@@ -2282,7 +2282,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
                 attachment_controls = (
                     '<form data-attachment-form enctype="multipart/form-data">'
                     '<input type="file" data-attachment-file></form>'
-                    '<p data-attachment-status="saved">No attachment selected.</p>'
+                    '<p data-attachment-status="ready">No attachment selected.</p>'
                     '<ul data-attachment-list></ul>'
                     '<button data-attachment-upload>Upload file</button>'
                 )
@@ -2300,7 +2300,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
                     "const file=attachmentFile.files[0];if(!file){return;}const form=new FormData();form.append('file',file,file.name);"
                     f"const response=await fetch('{endpoint}/attachments',{{method:'POST',credentials:'same-origin',headers:{{'X-Writer-Token':writerToken}},body:form}});"
                     "if(response.ok){const uploaded=await response.json();pendingAttachmentIds.push(uploaded.attachment.attachment_id);const item=document.createElement('li');item.textContent=uploaded.attachment.name+' ('+uploaded.attachment.byte_count+' bytes)';attachmentList.append(item);attachmentStatus.setAttribute('data-attachment-status','saved');attachmentStatus.textContent='saved';}"
-                    "else{attachmentStatus.outerHTML='<p data-attachment-status=\"failed\">Upload failed.</p>';}});"
+                    "else{attachmentStatus.setAttribute('data-attachment-status','not-uploaded');attachmentStatus.textContent='not-uploaded: conflict or unavailable';}});"
                 )
                 pending_items = "".join(
                     "<li data-attachment-id=\"%s\">%s (%s bytes)</li>" % (
