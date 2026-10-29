@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import Any
 
 from test_central_mcp_gateway import _free_port, _post, _start, _stop, _structured, _wait_for_listener
+from test_iphone_browser_drafts import _writer_headers
 from test_iphone_web_acceptance import _create_call, _login, _request, _write_operator_config
+from test_iphone_web_decline import _configure_phone_route
 from test_mcp_continuation import _continuation
 
 
@@ -55,6 +57,7 @@ def test_tls_accepted_iphone_owner_submits_once_replays_and_agent_reads_final_ev
 ) -> None:
     port = _free_port()
     config, certificate = _write_operator_config(tmp_path, port)
+    _configure_phone_route(config)
     process = _start(config)
     _wait_for_listener(process, port)
     try:
@@ -64,15 +67,16 @@ def test_tls_accepted_iphone_owner_submits_once_replays_and_agent_reads_final_ev
         assert isinstance(call_id, str) and isinstance(interaction_id, str)
         cookie, csrf = _login(port, certificate)
         assert _accept(port, certificate, call_id, cookie, csrf)[0] == 200
+        writer = _writer_headers(port, certificate, call_id, _headers(cookie, csrf, port), "iphone-submit-create")
 
         first = _submit(
-            port, certificate, call_id, "iphone-text-1", "final phone answer", _headers(cookie, csrf, port)
+            port, certificate, call_id, "iphone-text-1", "final phone answer", writer
         )
         replay = _submit(
-            port, certificate, call_id, "iphone-text-1", "final phone answer", _headers(cookie, csrf, port)
+            port, certificate, call_id, "iphone-text-1", "final phone answer", writer
         )
         changed = _submit(
-            port, certificate, call_id, "iphone-text-1", "changed phone answer", _headers(cookie, csrf, port)
+            port, certificate, call_id, "iphone-text-1", "changed phone answer", writer
         )
         busy_released = _create_call(port, certificate, "iphone-submit-next")
         _, continuation_response, _ = _post(
@@ -113,6 +117,7 @@ def test_tls_accepted_iphone_owner_submits_once_replays_and_agent_reads_final_ev
 def test_tls_unaccepted_iphone_submission_is_rejected_without_mutation(tmp_path: Path) -> None:
     port = _free_port()
     config, certificate = _write_operator_config(tmp_path, port)
+    _configure_phone_route(config)
     process = _start(config)
     _wait_for_listener(process, port)
     try:
@@ -144,6 +149,7 @@ def test_tls_iphone_submission_rejects_competing_and_cross_site_requests_without
 ) -> None:
     port = _free_port()
     config, certificate = _write_operator_config(tmp_path, port)
+    _configure_phone_route(config)
     process = _start(config)
     _wait_for_listener(process, port)
     try:
@@ -153,13 +159,14 @@ def test_tls_iphone_submission_rejects_competing_and_cross_site_requests_without
         first_cookie, first_csrf = _login(port, certificate)
         second_cookie, second_csrf = _login(port, certificate)
         assert _accept(port, certificate, call_id, first_cookie, first_csrf)[0] == 200
+        writer = _writer_headers(port, certificate, call_id, _headers(first_cookie, first_csrf, port), "iphone-submit-security")
         invalid_non_ascii = _submit(
             port,
             certificate,
             call_id,
             "phone-\u2603",
             "non-ascii body must not persist",
-            _headers(first_cookie, first_csrf, port),
+            writer,
         )
         invalid_too_long = _submit(
             port,
@@ -167,7 +174,7 @@ def test_tls_iphone_submission_rejects_competing_and_cross_site_requests_without
             call_id,
             "a" * 129,
             "overlong body must not persist",
-            _headers(first_cookie, first_csrf, port),
+            writer,
         )
         with sqlite3.connect(tmp_path / "data" / "calls.sqlite3") as connection:
             invalid_state = connection.execute(
@@ -180,6 +187,9 @@ def test_tls_iphone_submission_rejects_competing_and_cross_site_requests_without
             invalid_events = connection.execute(
                 "SELECT count(*) FROM events WHERE call_id = ?", (call_id,)
             ).fetchone()[0]
+        tokenless = _submit(
+            port, certificate, call_id, "tokenless", "must not persist", _headers(first_cookie, first_csrf, port)
+        )
         competing = _submit(
             port, certificate, call_id, "competing", "private answer", _headers(second_cookie, second_csrf, port)
         )
@@ -223,6 +233,7 @@ def test_tls_iphone_submission_rejects_competing_and_cross_site_requests_without
     assert invalid_state == ("accepted", "iphone_web", "iphone_web", "ios")
     assert invalid_result_count == 0
     assert invalid_events == 1
+    assert tokenless[0] == 403
     assert competing[0] in {401, 403, 404, 409}
     assert wrong_session[0] in {401, 403, 404}
     assert missing_csrf[0] in {400, 403}
@@ -239,6 +250,7 @@ def test_tls_iphone_submission_rejects_competing_and_cross_site_requests_without
 def test_tls_expired_iphone_submission_settles_before_persisting_body(tmp_path: Path) -> None:
     port = _free_port()
     config, certificate = _write_operator_config(tmp_path, port)
+    _configure_phone_route(config)
     process = _start(config)
     _wait_for_listener(process, port)
     try:
@@ -247,6 +259,7 @@ def test_tls_expired_iphone_submission_settles_before_persisting_body(tmp_path: 
         assert isinstance(call_id, str)
         cookie, csrf = _login(port, certificate)
         assert _accept(port, certificate, call_id, cookie, csrf)[0] == 200
+        writer = _writer_headers(port, certificate, call_id, _headers(cookie, csrf, port), "iphone-submit-expired")
         with sqlite3.connect(tmp_path / "data" / "calls.sqlite3") as connection:
             connection.execute(
                 "UPDATE calls SET terminal_disconnect_deadline = ? WHERE call_id = ?",
@@ -254,7 +267,7 @@ def test_tls_expired_iphone_submission_settles_before_persisting_body(tmp_path: 
             )
             connection.commit()
         late = _submit(
-            port, certificate, call_id, "expired-text", "body must not persist", _headers(cookie, csrf, port)
+            port, certificate, call_id, "expired-text", "body must not persist", writer
         )
         with sqlite3.connect(tmp_path / "data" / "calls.sqlite3") as connection:
             state = connection.execute(
