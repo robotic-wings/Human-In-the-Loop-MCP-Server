@@ -2027,6 +2027,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         f'<button data-task-progress="true" data-endpoint="{endpoint}/submissions">Still progressing</button>'
                         f'<button data-task-final="completed" data-task-version="{html.escape(str(task_version), quote=True)}" data-endpoint="{endpoint}/submissions">Completed</button>'
                         f'<button data-task-final="failed" data-task-version="{html.escape(str(task_version), quote=True)}" data-endpoint="{endpoint}/submissions">Failed</button>'
+                        '<p data-task-cancel-status="ready">Ready to cancel task</p>'
                         f'<button data-task-cancel="true" data-endpoint="{endpoint}/cancel">Cancel task</button>'
                         f'<button data-task-feedback-exit="completed" data-task-version="{html.escape(str(task_version), quote=True)}" data-endpoint="{endpoint}/submissions">Complete and request feedback</button>'
                         f'<button data-task-feedback-exit="failed" data-task-version="{html.escape(str(task_version), quote=True)}" data-endpoint="{endpoint}/submissions">Fail and request feedback</button>'
@@ -2052,8 +2053,10 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         "normalCompleted.addEventListener('click',()=>{const status=normalCompleted.dataset.taskFinal;const report=document.querySelector('textarea[data-task-report]').value;const body=JSON.stringify({submission_id:crypto.randomUUID(),status:status,report:report,task_version:Number(normalCompleted.dataset.taskVersion),attachment_ids:pendingAttachmentIds});fetch(normalCompleted.dataset.endpoint,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:body}).then((response)=>{if(response.ok)location.reload();});});"
                         "const normalFailed=document.querySelector('button[data-task-final=\"failed\"]');"
                         "normalFailed.addEventListener('click',()=>{const status=normalFailed.dataset.taskFinal;const report=document.querySelector('textarea[data-task-report]').value;const body=JSON.stringify({submission_id:crypto.randomUUID(),status:status,report:report,task_version:Number(normalFailed.dataset.taskVersion),attachment_ids:pendingAttachmentIds});fetch(normalFailed.dataset.endpoint,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:body}).then((response)=>{if(response.ok)location.reload();});});"
-                        "document.querySelector('button[data-task-cancel]').addEventListener('click',()=>{"
-                        "fetch(document.querySelector('button[data-task-cancel]').dataset.endpoint,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({action_id:crypto.randomUUID(),cancelled:true})}).then((response)=>{if(response.ok)location.reload();});"
+                        "const cancelStatus=document.querySelector('[data-task-cancel-status]');"
+                        "const cancel=document.querySelector('button[data-task-cancel]');"
+                        "cancel.addEventListener('click',()=>{"
+                        "fetch(cancel.dataset.endpoint,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({action_id:crypto.randomUUID(),cancelled:true})}).then((response)=>{if(response.ok){if(response.ok)location.reload();}else{cancelStatus.dataset.taskCancelStatus='not-submitted';cancelStatus.textContent='not-submitted: conflict or unavailable';}});"
                         "});"
                         "const completed=document.querySelector('button[data-task-feedback-exit=\"completed\"]');"
                         "completed.addEventListener('click',()=>{"
