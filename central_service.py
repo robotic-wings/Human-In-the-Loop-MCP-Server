@@ -744,6 +744,11 @@ class _McpGateway:
         interaction_id = safe_arguments.get(interaction_key)
         if not isinstance(interaction_id, str) or not interaction_id:
             interaction_id = request_id
+        if not self._has_enabled_human_channel():
+            return _rpc_result(
+                rpc_id,
+                {"content": [], "structuredContent": _no_enabled_channel()},
+            )
         message = json.dumps(
             {"tool": spec.name, "arguments": safe_arguments},
             ensure_ascii=False,
@@ -839,6 +844,11 @@ class _McpGateway:
                 "request_id", "revision_id", "after_event_seq", "max_result_bytes",
             }
         }
+        if not self._has_enabled_human_channel():
+            return _rpc_result(
+                rpc_id,
+                {"content": [], "structuredContent": _no_enabled_channel()},
+            )
         envelope = self._coordinator.revise_task(
             caller_id=caller_id,
             interaction_id=task_id,
@@ -858,6 +868,10 @@ class _McpGateway:
                 envelope, arguments.get("max_result_bytes", _DEFAULT_RESULT_BYTES)
             )},
         )
+
+    def _has_enabled_human_channel(self) -> bool:
+        """Return whether this gateway's persisted route can notify a human."""
+        return self._desktop_route_device_id is not None or self._bark_enabled
 
     def _update_active_task_tool(
         self,
@@ -1045,6 +1059,17 @@ def _invalid_result_budget() -> dict[str, object]:
         "success": False,
         "status": "invalid_result_budget",
         "needs_continuation": False,
+    }
+
+
+def _no_enabled_channel() -> dict[str, object]:
+    """Return the pre-admission result without creating a durable call."""
+    return {
+        "success": False,
+        "status": "no_enabled_channel",
+        "needs_continuation": False,
+        "interaction_id": None,
+        "call_id": None,
     }
 
 
