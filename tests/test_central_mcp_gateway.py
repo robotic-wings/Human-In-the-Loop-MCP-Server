@@ -114,6 +114,16 @@ def _write_gateway_config(directory: Path, port: int) -> tuple[Path, Path]:
     return config, certfile
 
 
+def _enable_bark_route(config: Path) -> None:
+    """Make this legacy ringing fixture explicitly eligible for admission."""
+    raw = json.loads(config.read_text(encoding="utf-8"))
+    raw["bark_enabled"] = True
+    # No receiver is required for gateway admission assertions; the durable
+    # route, rather than delivery success, is the fixture's needed condition.
+    raw["bark_url"] = "http://127.0.0.1:1/gateway-fixture"
+    config.write_text(json.dumps(raw), encoding="utf-8")
+
+
 def _start(config_path: Path) -> subprocess.Popen[str]:
     return subprocess.Popen(
         [sys.executable, "-m", "central_service", "--config", str(config_path)],
@@ -202,6 +212,7 @@ def _structured(response: dict[str, Any]) -> dict[str, Any]:
 def gateway(tmp_path: Path):
     port = _free_port()
     config, certificate = _write_gateway_config(tmp_path, port)
+    _enable_bark_route(config)
     process = _start(config)
     _wait_for_listener(process, port)
     try:
@@ -293,6 +304,7 @@ def test_restart_preserves_active_occupancy_at_public_mcp_boundary(
 ) -> None:
     port = _free_port()
     config, certificate = _write_gateway_config(tmp_path, port)
+    _enable_bark_route(config)
     first = _start(config)
     _wait_for_listener(first, port)
     try:
@@ -317,6 +329,7 @@ def test_startup_settles_preseeded_expired_ringing_before_mcp_admission(
 ) -> None:
     port = _free_port()
     config, certificate = _write_gateway_config(tmp_path, port)
+    _enable_bark_route(config)
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     clock = FrozenClock(datetime(2020, 1, 1, tzinfo=timezone.utc))
