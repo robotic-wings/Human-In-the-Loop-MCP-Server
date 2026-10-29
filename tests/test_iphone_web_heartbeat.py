@@ -97,9 +97,13 @@ def test_tls_accepted_iphone_owner_heartbeat_refreshes_only_liveness(tmp_path: P
     assert refreshed[0] == 200
     assert isinstance(refreshed[2], dict)
     assert refreshed[2]["status"] == refreshed[2]["call_state"] == "accepted"
-    assert f"/api/calls/{call_id}/heartbeat" in str(active_page[2])
-    assert "setInterval" in str(active_page[2])
-    assert "Connection lost." in str(active_page[2])
+    active_source = str(active_page[2])
+    assert f"/api/calls/{call_id}/heartbeat" in active_source
+    assert "setInterval" in active_source
+    # This liveness fixture must leave the rendered durable state authoritative;
+    # heartbeat failure presentation is specified separately by its UI contract.
+    assert 'data-state="accepted"' in active_source
+    assert "Connection/state unavailable." in active_source
     assert after[:3] == ("accepted", "iphone_web", before[2])
     assert after[3] != before[3]
     assert after[4] != before[4]
