@@ -372,6 +372,7 @@ _TOOL_SPECS = (
         },
         ("interaction_id", "attachment_id", "max_result_bytes"),
     ),
+    ToolSpec("health_check", (), ()),
 )
 
 
@@ -529,12 +530,14 @@ class _McpGateway:
     def __init__(
         self, coordinator: CallCoordinator, credentials: dict[str, str], desktop_route_device_id: str | None = None,
         bark_enabled: bool = False, operator_id: str = "operator-default",
+        scheduler: "RingingDeadlineScheduler | None" = None,
     ) -> None:
         self._coordinator = coordinator
         self._credentials = credentials
         self._desktop_route_device_id = desktop_route_device_id
         self._bark_enabled = bark_enabled
         self._operator_id = operator_id
+        self._scheduler = scheduler
 
     def caller_for(self, authorization: str | None) -> str | None:
         if not isinstance(authorization, str) or not authorization.startswith("Bearer "):
@@ -647,6 +650,10 @@ class _McpGateway:
             spec = _find_tool_spec("assign_task_to_human")
         if spec is None or not isinstance(arguments, dict):
             return _rpc_error(rpc_id, -32602, "invalid params")
+        if spec.name == "health_check":
+            if arguments:
+                return _rpc_error(rpc_id, -32602, "invalid params")
+            return self._health_check_tool(rpc_id)
         # Callback routing and its credential are managed terminal configuration,
         # never Agent-controlled tool arguments.
         if {"callback_url", "callback_auth_token"} & arguments.keys():
@@ -762,6 +769,18 @@ class _McpGateway:
                 ),
             },
         )
+
+    def _health_check_tool(self, rpc_id: object) -> dict[str, object]:
+        """Return a non-secret operational snapshot without mutating state."""
+        report = self._coordinator.health_snapshot(
+            desktop_route_device_id=self._desktop_route_device_id,
+            bark_enabled=self._bark_enabled,
+        )
+        scheduler_running = self._scheduler is not None and self._scheduler.is_running
+        report["scheduler"] = {"status": "running" if scheduler_running else "stopped"}
+        if report["storage"] != {"status": "healthy"} or not scheduler_running:
+            report["status"] = "degraded"
+        return _rpc_result(rpc_id, {"content": [], "structuredContent": report})
 
     def _revise_task_tool(
         self, rpc_id: object, arguments: dict[str, object], caller_id: str
@@ -3040,6 +3059,10 @@ class RingingDeadlineScheduler:
     def tick(self) -> list[dict[str, Any]]:
         return self._coordinator.recover_and_settle()
 
+    @property
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
     def start(self) -> None:
         if self._thread is not None:
             return
@@ -3276,7 +3299,8 @@ def _serve(config: ServiceConfig) -> None:
             else "operator-default"
         )
         gateway = _McpGateway(
-            coordinator, credentials, configured_desktop_route_device_id, config.bark_enabled, operator_id
+            coordinator, credentials, configured_desktop_route_device_id, config.bark_enabled, operator_id,
+            scheduler,
         )
         terminal_gateway = _TerminalGateway(
             coordinator,

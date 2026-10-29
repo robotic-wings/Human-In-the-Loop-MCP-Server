@@ -686,6 +686,64 @@ class CallCoordinator:
             ).fetchone()
             return self._terminal_presence_result(row) if row is not None else None
 
+    def health_snapshot(
+        self, *, desktop_route_device_id: str | None, bark_enabled: bool,
+    ) -> dict[str, Any]:
+        """Read aggregate operational state without mutating or disclosing configuration."""
+        with self._lock:
+            try:
+                self._connection.execute("SELECT 1").fetchone()
+                configured = desktop_route_device_id is not None
+                online = False
+                if desktop_route_device_id is not None:
+                    row = self._connection.execute(
+                        "SELECT gui_ready, online_expires_at FROM terminal_presence WHERE device_id = ?",
+                        (desktop_route_device_id,),
+                    ).fetchone()
+                    online = (
+                        row is not None and bool(row["gui_ready"])
+                        and self._parse_stamp(row["online_expires_at"]) > self._now()
+                    )
+                desktop = {
+                    "configured": configured,
+                    "online": online,
+                    "status": "online" if online else ("offline" if configured else "not_configured"),
+                }
+                if not bark_enabled:
+                    bark = {"configured": False, "status": "not_configured",
+                            "recent_delivery_status": "not_configured"}
+                else:
+                    row = self._connection.execute(
+                        "SELECT state FROM bark_deliveries ORDER BY rowid DESC LIMIT 1"
+                    ).fetchone()
+                    recent = str(row["state"]) if row is not None else "not_delivered"
+                    degraded = recent in {"failed", "timeout", "uncertain"}
+                    bark = {"configured": True, "status": "degraded" if degraded else "healthy",
+                            "recent_delivery_status": recent}
+            except sqlite3.Error:
+                return {
+                    "success": True,
+                    "status": "degraded",
+                    "storage": {"status": "unavailable"},
+                    "desktop_terminal": {
+                        "configured": desktop_route_device_id is not None,
+                        "online": False,
+                        "status": "unavailable",
+                    },
+                    "bark": {
+                        "configured": bark_enabled,
+                        "status": "unavailable" if bark_enabled else "not_configured",
+                        "recent_delivery_status": "unavailable" if bark_enabled else "not_configured",
+                    },
+                }
+            return {
+                "success": True,
+                "status": "degraded" if bark["status"] == "degraded" else "healthy",
+                "storage": {"status": "healthy"},
+                "desktop_terminal": desktop,
+                "bark": bark,
+            }
+
     def terminal_poll_snapshot(
         self, device_id: str, call_id: str | None = None
     ) -> dict[str, Any] | None:
