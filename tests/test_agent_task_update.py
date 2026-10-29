@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from test_central_mcp_gateway import _free_port, _post, _start, _stop, _structured, _wait_for_listener
+from test_iphone_browser_drafts import _writer_headers
 from test_iphone_web_acceptance import _login, _request, _write_operator_config
 from test_iphone_web_decline import _configure_phone_route, _headers
 from test_iphone_task_progress_submission import _accept, _submit, _continuation_for_task
@@ -55,6 +56,7 @@ def _accepted_progress(port: int, certificate: Path, database: Path, request_id:
     assert isinstance(call_id, str) and isinstance(task_id, str)
     cookie, csrf = _login(port, certificate); owner = _headers(cookie, csrf, port)
     assert _accept(port, certificate, call_id, owner)[0] == 200
+    owner = _writer_headers(port, certificate, call_id, owner, "task-update-" + request_id)
     assert _submit(port, certificate, call_id, "progress-" + request_id, "in_progress", "  progress one  ", owner)[0] == 200
     _, delivered, _ = _post(port, certificate, _continuation_for_task("deliver-" + request_id, task_id, call_id, 1), "test-token-alpha")
     assert _structured(delivered)["status"] == "in_progress"
@@ -98,6 +100,8 @@ def test_tls_agent_update_requires_ack_owner_alias_and_active_progress_without_m
     try:
         created = _call(port, certificate, "update-security"); call_id, task_id = created["call_id"], created["interaction_id"]; assert isinstance(call_id, str) and isinstance(task_id, str)
         cookie, csrf = _login(port, certificate); owner = _headers(cookie, csrf, port); assert _accept(port, certificate, call_id, owner)[0] == 200
+        assert _submit(port, certificate, call_id, "tokenless-progress", "in_progress", "progress", owner)[0] == 403
+        owner = _writer_headers(port, certificate, call_id, owner, "task-update-security")
         assert _submit(port, certificate, call_id, "progress-security", "in_progress", "progress", owner)[0] == 200
         before_ack = _snapshot(database, call_id)
         _, no_ack_raw, _ = _post(port, certificate, _update("no-ack", task_id, call_id, 1, 0, "x", "x"), "test-token-alpha")
