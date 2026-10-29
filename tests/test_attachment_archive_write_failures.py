@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from call_coordinator import AcceptCall, CallCoordinator, CreateCall
@@ -60,7 +60,13 @@ def _snapshot(database: Path, call_id: str) -> tuple[object, ...]:
         submissions = connection.execute(
             "SELECT * FROM submission_operations WHERE call_id = ? ORDER BY submission_id", (call_id,)
         ).fetchall()
-    return call, attachments, events, submissions
+        bark = connection.execute(
+            "SELECT * FROM bark_deliveries WHERE call_id = ?", (call_id,)
+        ).fetchall()
+        callbacks = connection.execute(
+            "SELECT * FROM terminal_callback_deliveries WHERE call_id = ?", (call_id,)
+        ).fetchall()
+    return call, attachments, events, submissions, bark, callbacks
 
 
 def _accepted_owner(
@@ -142,4 +148,89 @@ def test_accepted_iphone_archive_write_failure_is_non_disclosing_atomic_and_reco
         assert completed is not None and completed["status"] == "answered"
     finally:
         coordinator._attachment_directory = archive_directory
+        coordinator.close()
+
+
+def test_accepted_desktop_occupancy_scan_failure_is_non_disclosing_and_atomic(tmp_path: Path) -> None:
+    coordinator, call_id, database = _accepted_owner(
+        tmp_path, owner_device_id="desktop-registered", session_id="desktop-owner", bark_enabled=False
+    )
+    try:
+        before = _snapshot(database, call_id)
+        scan_calls: list[None] = []
+
+        def failed_scan() -> int:
+            scan_calls.append(None)
+            raise OSError("injected archive occupancy scan failure")
+
+        coordinator._attachment_bytes_on_disk = failed_scan  # type: ignore[method-assign]
+        failed = coordinator.upload_terminal_attachment(
+            call_id, "desktop-registered", "desktop-owner", "evidence.txt", "text/plain", b"bytes"
+        )
+        assert failed == {
+            "success": False,
+            "status": "attachment_rejected",
+            "reason": "archive_unavailable",
+        }
+        assert scan_calls == [None]
+        assert _snapshot(database, call_id) == before
+    finally:
+        coordinator.close()
+
+
+def test_accepted_iphone_occupancy_scan_failure_is_non_disclosing_and_atomic(tmp_path: Path) -> None:
+    coordinator, call_id, database = _accepted_owner(
+        tmp_path, owner_device_id="iphone_web", session_id="iphone-owner", bark_enabled=True
+    )
+    try:
+        before = _snapshot(database, call_id)
+        scan_calls: list[None] = []
+
+        def failed_scan() -> int:
+            scan_calls.append(None)
+            raise OSError("injected archive occupancy scan failure")
+
+        coordinator._attachment_bytes_on_disk = failed_scan  # type: ignore[method-assign]
+        failed = coordinator.upload_iphone_attachment(
+            call_id, "iphone-owner", "photo.txt", "text/plain", b"phone bytes"
+        )
+        assert failed == {
+            "success": False,
+            "status": "attachment_rejected",
+            "reason": "archive_unavailable",
+        }
+        assert scan_calls == [None]
+        assert _snapshot(database, call_id) == before
+    finally:
+        coordinator.close()
+
+
+def test_unauthorized_and_expired_uploads_do_not_run_occupancy_scan(tmp_path: Path) -> None:
+    coordinator, call_id, database = _accepted_owner(
+        tmp_path, owner_device_id="desktop-registered", session_id="desktop-owner", bark_enabled=False
+    )
+    try:
+        scan_calls: list[None] = []
+
+        def failed_scan() -> int:
+            scan_calls.append(None)
+            raise AssertionError("unauthorized or expired upload reached archive occupancy scan")
+
+        coordinator._attachment_bytes_on_disk = failed_scan  # type: ignore[method-assign]
+        before_unauthorized = _snapshot(database, call_id)
+        assert coordinator.upload_terminal_attachment(
+            call_id, "desktop-registered", "wrong-session", "secret.txt", "text/plain", b"secret"
+        ) is None
+        assert scan_calls == []
+        assert _snapshot(database, call_id) == before_unauthorized
+
+        clock = coordinator._clock
+        assert isinstance(clock, _Clock)
+        clock.current += timedelta(seconds=181)
+        expired = coordinator.upload_terminal_attachment(
+            call_id, "desktop-registered", "desktop-owner", "late.txt", "text/plain", b"late"
+        )
+        assert expired is not None and expired["status"] == "disconnected"
+        assert scan_calls == []
+    finally:
         coordinator.close()
