@@ -2261,6 +2261,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         f'{html.escape(draft_body if isinstance(draft_body, str) else "", quote=False)}</textarea>'
                         '<p data-draft-status="saved">Saved</p>'
                         f'<button data-draft-save data-endpoint="{endpoint}/draft">Save draft</button>'
+                        '<p data-text-input-status="ready">Ready to submit</p>'
                         f'<button data-text-input data-endpoint="{endpoint}/submissions">Submit</button>'
                     )
                     submission_script = (
@@ -2269,9 +2270,11 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         "const draftSave=document.querySelector('button[data-draft-save]');"
                         "draftInput.addEventListener('input',()=>{draftStatus.dataset.draftStatus='not-synced';draftStatus.textContent='not-synced';});"
                         "draftSave.addEventListener('click',async()=>{const response=await fetch(draftSave.dataset.endpoint,{method:'PUT',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({body:draftInput.value,expected_draft_version:Number(draftInput.dataset.draftVersion)})});if(response.ok){const saved=await response.json();draftInput.dataset.draftVersion=String(saved.draft_version);draftStatus.dataset.draftStatus='saved';draftStatus.textContent='saved';}else{draftStatus.dataset.draftStatus='not-synced';draftStatus.textContent='draft conflict; not-synced';}});"
-                        "document.querySelectorAll('button[data-text-input]').forEach((button)=>"
-                        "button.addEventListener('click',async()=>{const textarea=document.querySelector('textarea[name=user_input]');"
-                        "const user_input=textarea.value;const response=await fetch(button.dataset.endpoint,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({submission_id:crypto.randomUUID(),user_input:user_input,attachment_ids:pendingAttachmentIds})});if(response.ok)location.reload();}));"
+                        "const textInputStatus=document.querySelector('[data-text-input-status]');"
+                        "const button=document.querySelector('button[data-text-input]');"
+                        "button.addEventListener('click',()=>{const textarea=document.querySelector('textarea[name=user_input]');"
+                        "const user_input=textarea.value;fetch(button.dataset.endpoint,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({submission_id:crypto.randomUUID(),user_input:user_input,attachment_ids:pendingAttachmentIds})})"
+                        ".then((response)=>{if(response.ok)location.reload();if(response.ok){}else{textInputStatus.dataset.textInputStatus='not-submitted';textInputStatus.textContent='not-submitted: conflict or unavailable';}});});"
                     )
                 attachment_controls = (
                     '<form data-attachment-form enctype="multipart/form-data">'
