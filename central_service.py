@@ -1948,6 +1948,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
             escaped_deadline = html.escape(deadline_value, quote=True)
             controls = (
                 f'<p data-ring-deadline="{escaped_deadline}" data-remaining-seconds="">Remaining time: <span data-ring-countdown></span></p>'
+                '<p data-ringing-action-status="ready">Ready to respond</p>'
                 f'<button data-action="accept" data-endpoint="{endpoint}/accept">Accept</button>'
                 f'<button data-action="decline" data-endpoint="{endpoint}/decline">Decline</button>'
             )
@@ -2355,12 +2356,13 @@ class _PublicHandler(BaseHTTPRequestHandler):
             "<script>"
             "const csrf=document.querySelector('meta[name=\"X-CSRF-Token\"]').content;"
             f"{writer_script}"
+            "const ringingActionStatus=document.querySelector('[data-ringing-action-status]');"
             "document.querySelectorAll('button[data-action]').forEach((button)=>"
             "button.addEventListener('click',async()=>{"
             "const response=await fetch(button.dataset.endpoint,{method:'POST',credentials:'same-origin',"
             "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},"
             "body:JSON.stringify({action_id:crypto.randomUUID()})});"
-            "if(response.ok)location.reload();"
+            "if(response.ok)location.reload();if(response.ok){}else{ringingActionStatus.dataset.ringingActionStatus='not-submitted';ringingActionStatus.textContent='not-submitted: conflict or unavailable';}"
             "}));"
             "document.querySelector('[data-operator-logout]').addEventListener('click',async()=>{"
             "const button=document.querySelector('[data-operator-logout]');"
