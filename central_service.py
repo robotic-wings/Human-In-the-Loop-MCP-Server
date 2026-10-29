@@ -2162,6 +2162,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         f'data-draft-version="{html.escape(str(draft_version), quote=True)}">'
                         f'{escaped_default}</textarea><p data-draft-status="saved">Saved</p>'
                         f'<button data-draft-save data-endpoint="{endpoint}/draft">Save draft</button>'
+                        '<p data-multiline-input-status="ready">Ready to submit</p>'
                         f'<button data-multiline-input data-endpoint="{endpoint}/submissions">Submit</button>'
                     )
                     submission_script = (
@@ -2170,6 +2171,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         "const draftSave=document.querySelector('button[data-draft-save]');"
                         "draftInput.addEventListener('input',()=>{draftStatus.dataset.draftStatus='not-synced';draftStatus.textContent='not-synced';});"
                         "draftSave.addEventListener('click',async()=>{const response=await fetch(draftSave.dataset.endpoint,{method:'PUT',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({body:draftInput.value,expected_draft_version:Number(draftInput.dataset.draftVersion)})});if(response.ok){const saved=await response.json();draftInput.dataset.draftVersion=String(saved.draft_version);draftStatus.dataset.draftStatus='saved';draftStatus.textContent='saved';}else{draftStatus.dataset.draftStatus='not-synced';draftStatus.textContent='draft conflict; not-synced';}});"
+                        "const multilineInputStatus=document.querySelector('[data-multiline-input-status]');"
                         "document.querySelectorAll('button[data-multiline-input]').forEach((button)=>"
                         "button.addEventListener('click',()=>{"
                         "const textarea=document.querySelector('textarea[data-draft-input=multiline]');"
@@ -2177,7 +2179,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         "fetch(button.dataset.endpoint,{method:'POST',credentials:'same-origin',"
                         "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},"
                         "body:JSON.stringify({submission_id:crypto.randomUUID(),user_input:user_input})})"
-                        ".then((response)=>{if(response.ok)location.reload();});"
+                        ".then((response)=>{if(response.ok)location.reload();if(response.ok){}else{multilineInputStatus.dataset.multilineInputStatus='not-submitted';multilineInputStatus.textContent='not-submitted: conflict or unavailable';}});"
                         "}));"
                     )
                 elif multi_choice_options is not None:
