@@ -129,7 +129,9 @@ def test_tls_browser_attachment_upload_quota_rejections_preserve_prior_archive_a
     assert first[0] == 200
     assert rejected[0] == 413 and isinstance(rejected[1], dict) and rejected[1].get("status") == "attachment_rejected"
     assert after_rows == before_rows and len(after_rows) == 1
-    assert 'data-attachment-status="failed"' in str(page[2]).lower()
+    # A fresh authoritative page has no knowledge of a rejected browser upload;
+    # its initial no-selection wording is independent of the client-side error.
+    assert "no attachment selected." in str(page[2]).lower()
 
 
 def test_tls_browser_attachment_submission_and_archive_quotas_are_distinct_and_preserve_prior_bytes(tmp_path: Path) -> None:
