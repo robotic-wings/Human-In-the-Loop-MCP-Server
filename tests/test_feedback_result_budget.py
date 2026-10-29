@@ -14,7 +14,7 @@ from pathlib import Path
 from central_service import _TOOL_SPECS
 from test_central_mcp_gateway import _free_port, _post, _start, _stop, _structured
 from test_iphone_browser_drafts import _writer_headers
-from test_iphone_feedback_submission import TYPE_ID, _accept, _submit
+from test_iphone_feedback_submission import TYPE_ID, _accept, _page, _submit
 from test_iphone_web_acceptance import _login, _request, _write_operator_config
 from test_iphone_web_decline import _configure_phone_route, _headers
 from test_mcp_continuation import _continuation
@@ -89,6 +89,8 @@ def test_tls_oversized_unicode_feedback_omits_transport_and_pages_authorized_arc
         created = _call_budget(port, certificate, "oversized-feedback", MIN_BUDGET)
         cookie, csrf = _login(port, certificate); headers = _headers(cookie, csrf, port)
         assert _accept(port, certificate, created["call_id"], headers)[0] == 200
+        _, page_csrf = _page(_request(port, certificate, "GET", f"/calls/{created['call_id']}", headers={"Cookie": cookie})[2], created["call_id"])
+        headers = _headers(cookie, page_csrf, port)
         writer = _writer_headers(port, certificate, created["call_id"], headers, "feedback-budget")
         submitted = _submit(port, certificate, created["call_id"], "oversized-feedback-submit", TYPE_ID, feedback, writer)[2]
         opened = _continuation("feedback-opened", created["interaction_id"], created["call_id"], 0)
@@ -125,6 +127,8 @@ def test_tls_feedback_sufficient_budget_replay_and_foreign_caller_boundary_remai
         created = _call_budget(port, certificate, "normal-feedback", MIN_BUDGET)
         cookie, csrf = _login(port, certificate); headers = _headers(cookie, csrf, port)
         assert _accept(port, certificate, created["call_id"], headers)[0] == 200
+        _, page_csrf = _page(_request(port, certificate, "GET", f"/calls/{created['call_id']}", headers={"Cookie": cookie})[2], created["call_id"])
+        headers = _headers(cookie, page_csrf, port)
         writer = _writer_headers(port, certificate, created["call_id"], headers, "normal-feedback")
         submitted = _submit(port, certificate, created["call_id"], "normal-feedback-submit", TYPE_ID, "Small canonical feedback", writer)[2]
         opened = _continuation("normal-feedback-opened", created["interaction_id"], created["call_id"], 0)
