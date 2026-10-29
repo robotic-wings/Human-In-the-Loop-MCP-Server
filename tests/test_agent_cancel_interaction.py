@@ -65,16 +65,20 @@ def _event_rows(database: Path, call_id: str) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
-def _cancel_rpc(interaction_id: str, call_id: str, request_id: str) -> dict[str, Any]:
+def _cancel_rpc(
+    interaction_id: str, call_id: str, request_id: str | None = None
+) -> dict[str, Any]:
+    arguments: dict[str, str] = {
+        "interaction_id": interaction_id,
+        "call_id": call_id,
+    }
+    if request_id is not None:
+        arguments["request_id"] = request_id
     return _rpc(
         "tools/call",
         {
             "name": "cancel_interaction",
-            "arguments": {
-                "interaction_id": interaction_id,
-                "call_id": call_id,
-                "request_id": request_id,
-            },
+            "arguments": arguments,
         },
         41,
     )
@@ -223,6 +227,73 @@ def test_tls_mcp_lists_and_executes_original_caller_cancel_without_leaking_other
     assert wrong_status == unknown_status == 200
     assert wrong == unknown
     assert wrong["error"] == {"code": -32602, "message": "invalid params"}
+
+
+def test_tls_original_caller_can_cancel_without_request_id_once_and_free_busy_slot(
+    tmp_path: Path,
+) -> None:
+    """An omitted operation ID cancels, but cannot replay or revive a terminal call."""
+    port = _free_port()
+    config, certificate = _write_gateway_config(tmp_path, port)
+    database = tmp_path / "data" / "calls.sqlite3"
+    process = _start(config)
+    _wait_for_listener(process, port)
+    try:
+        listed_status, listed, _ = _post(
+            port, certificate, _rpc("tools/list", {}), "test-token-alpha"
+        )
+        specification = next(
+            tool for tool in listed["result"]["tools"]
+            if tool["name"] == "cancel_interaction"
+        )
+        assert set(specification["inputSchema"]["required"]) == {"interaction_id", "call_id"}
+        assert "request_id" in specification["inputSchema"]["properties"]
+        assert "request_id" not in specification["inputSchema"]["required"]
+
+        _, created_response, _ = _post(
+            port, certificate, _call("cancel-without-request-id"), "test-token-alpha"
+        )
+        created = _structured(created_response)
+        call_id = created["call_id"]
+        interaction_id = created["interaction_id"]
+        assert isinstance(call_id, str) and isinstance(interaction_id, str)
+        cancelled_status, cancelled_response, _ = _post(
+            port, certificate, _cancel_rpc(interaction_id, call_id), "test-token-alpha"
+        )
+        with sqlite3.connect(database) as connection:
+            state_after_cancel = connection.execute(
+                "SELECT state FROM calls WHERE call_id = ?", (call_id,)
+            ).fetchone()
+            events_after_cancel = connection.execute(
+                "SELECT event_seq, result FROM events WHERE call_id = ? ORDER BY event_seq", (call_id,)
+            ).fetchall()
+
+        _, replacement_response, _ = _post(
+            port, certificate, _call("after-omitted-cancel"), "test-token-beta"
+        )
+        repeated_status, repeated_response, _ = _post(
+            port, certificate, _cancel_rpc(interaction_id, call_id), "test-token-alpha"
+        )
+        with sqlite3.connect(database) as connection:
+            state_after_repeat = connection.execute(
+                "SELECT state FROM calls WHERE call_id = ?", (call_id,)
+            ).fetchone()
+            events_after_repeat = connection.execute(
+                "SELECT event_seq, result FROM events WHERE call_id = ? ORDER BY event_seq", (call_id,)
+            ).fetchall()
+    finally:
+        _stop(process)
+
+    cancelled = _structured(cancelled_response)
+    assert listed_status == cancelled_status == repeated_status == 200
+    assert cancelled["status"] == cancelled["call_state"] == "cancelled"
+    assert cancelled["reason"] == "agent_cancelled"
+    assert state_after_cancel == state_after_repeat == ("cancelled",)
+    assert events_after_cancel == events_after_repeat
+    assert [event[0] for event in events_after_cancel] == [1]
+    assert _structured(replacement_response)["status"] == "ringing"
+    # No-ID retries carry no replay guarantee, but may never make a second terminal event.
+    assert repeated_response.get("error", {}).get("code") in {None, -32602}
 
 
 def test_tls_mcp_rejects_invalid_cancel_request_ids_without_mutating_the_exact_call(
