@@ -18,7 +18,7 @@ from test_mcp_continuation import _continuation
 def _handler(source: str) -> str:
     match = re.search(
         r"const button=document\.querySelector\('button\[data-text-input\]'\);"
-        r"button\.addEventListener\('click',\(\)=>\{(?P<body>.*?)\}\)\);",
+        r"button\.addEventListener\('click',\(\)=>\{(?P<body>.*?)\}\);",
         source,
         re.DOTALL,
     )
