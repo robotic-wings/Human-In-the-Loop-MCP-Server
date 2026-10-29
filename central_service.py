@@ -261,6 +261,7 @@ _TOOL_SPECS = (
             "max_result_bytes": {"type": "integer"},
             "context_note": {"type": "string"},
             "expected_task_version": {"type": "integer", "minimum": 0},
+            "revision_id": {"type": "string"},
             "request_id": {"type": "string"},
         },
         ("task_title", "task_description", "request_id"),
@@ -697,6 +698,8 @@ class _McpGateway:
                 rpc_id,
                 {"content": [], "structuredContent": _invalid_result_budget()},
             )
+        if spec.name == "assign_task_to_human" and "revision_id" in safe_arguments:
+            return self._revise_task_tool(rpc_id, safe_arguments, caller_id)
         if call_id is not None or after_event_seq is not None:
             if spec.name == "assign_task_to_human" and any(
                 field in safe_arguments
@@ -758,6 +761,58 @@ class _McpGateway:
                     envelope, safe_arguments.get("max_result_bytes", _DEFAULT_RESULT_BYTES)
                 ),
             },
+        )
+
+    def _revise_task_tool(
+        self, rpc_id: object, arguments: dict[str, object], caller_id: str
+    ) -> dict[str, object]:
+        """Create an explicit post-final task round without treating it as a continuation."""
+        task_id = arguments.get("task_id")
+        call_id = arguments.get("call_id")
+        revision_id = arguments.get("revision_id")
+        request_id = arguments.get("request_id")
+        if not all(isinstance(value, str) and value for value in (task_id, call_id, revision_id, request_id)):
+            return _rpc_error(rpc_id, -32602, "invalid params")
+        assert isinstance(task_id, str) and isinstance(call_id, str)
+        assert isinstance(revision_id, str) and isinstance(request_id, str)
+        if any(len(value) > 128 or not value.isascii() for value in (revision_id, request_id)):
+            return _rpc_error(rpc_id, -32602, "invalid params")
+        after_event_seq = arguments.get("after_event_seq", 0)
+        if (
+            not isinstance(after_event_seq, int)
+            or isinstance(after_event_seq, bool)
+            or after_event_seq != 0
+        ):
+            return _rpc_result(
+                rpc_id,
+                {"content": [], "structuredContent": {
+                    "success": False, "status": "invalid_cursor", "needs_continuation": False,
+                }},
+            )
+        revision_arguments = {
+            key: value for key, value in arguments.items()
+            if key not in {
+                "request_id", "revision_id", "after_event_seq", "max_result_bytes",
+            }
+        }
+        envelope = self._coordinator.revise_task(
+            caller_id=caller_id,
+            interaction_id=task_id,
+            prior_call_id=call_id,
+            revision_id=revision_id,
+            message=json.dumps(
+                {"tool": "assign_task_to_human", "arguments": revision_arguments},
+                ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ),
+            ring_timeout_seconds=60,
+            desktop_route_device_id=self._desktop_route_device_id,
+            bark_enabled=self._bark_enabled,
+        )
+        return _rpc_result(
+            rpc_id,
+            {"content": [], "structuredContent": _input_transport_view(
+                envelope, arguments.get("max_result_bytes", _DEFAULT_RESULT_BYTES)
+            )},
         )
 
     def _update_active_task_tool(
