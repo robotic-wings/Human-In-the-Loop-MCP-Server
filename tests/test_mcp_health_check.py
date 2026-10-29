@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from call_coordinator import CallCoordinator
+from central_service import _McpGateway
 from test_bark_delivery_outbox import (
     _BarkReceiver,
     _configure_phone_bark,
@@ -32,6 +35,11 @@ from test_mcp_wait_leg import _with_timeout
 
 
 HEALTH_CHECK = "health_check"
+
+
+class _Clock:
+    def now_utc(self) -> datetime:
+        return datetime.now(UTC)
 
 
 def _snapshot(database: Path, config: Path) -> tuple[dict[str, int], bytes]:
@@ -172,3 +180,60 @@ def test_health_check_reports_degraded_bark_delivery_without_exposing_its_url_or
     rendered = json.dumps(report, sort_keys=True).lower()
     assert bark_url not in rendered
     assert "device-key" not in rendered
+
+
+def test_closed_storage_with_configured_desktop_and_bark_returns_non_secret_degraded_health_without_mutation(
+    tmp_path: Path,
+) -> None:
+    """Every health query stays structured even when every optional read is unavailable."""
+    port = _free_port()
+    config, _ = _write_gateway_config(tmp_path, port)
+    database = tmp_path / "closed.sqlite3"
+    coordinator = CallCoordinator(database, clock=_Clock())
+    gateway = _McpGateway(
+        coordinator,
+        {"test-token-alpha": "agent-alpha", "test-token-beta": "agent-beta"},
+        desktop_route_device_id="configured-desktop",
+        bark_enabled=True,
+    )
+    caller = gateway.caller_for("Bearer test-token-alpha")
+    assert caller == "agent-alpha"
+    before = _snapshot(database, config)
+    coordinator.close()
+    first = gateway.handle(
+        _rpc("tools/call", {"name": HEALTH_CHECK, "arguments": {}}), caller
+    )
+    second = gateway.handle(
+        _rpc("tools/call", {"name": HEALTH_CHECK, "arguments": {}}), caller
+    )
+    after = _snapshot(database, config)
+
+    expected = {
+        "success": True,
+        "status": "degraded",
+        "storage": {"status": "unavailable"},
+        "scheduler": {"status": "stopped"},
+        "desktop_terminal": {
+            "configured": True,
+            "online": False,
+            "status": "unavailable",
+        },
+        "bark": {
+            "configured": True,
+            "status": "unavailable",
+            "recent_delivery_status": "unavailable",
+        },
+    }
+    for response in (first, second):
+        assert _structured(response) == expected
+        rendered = json.dumps(response, sort_keys=True).lower()
+        for forbidden in (
+            "configured-desktop",
+            "test-token",
+            "agent-alpha",
+            "calls.sqlite",
+            "data_dir",
+            "web_base_url",
+        ):
+            assert forbidden not in rendered
+    assert after == before
