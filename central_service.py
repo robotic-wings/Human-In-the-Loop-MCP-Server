@@ -2225,18 +2225,20 @@ class _PublicHandler(BaseHTTPRequestHandler):
                     )
                 elif _is_confirmation_message(state.get("message")):
                     controls = (
+                        '<p data-confirmation-status="ready">Ready to confirm</p>'
                         f'<button data-confirmed="true" data-endpoint="{endpoint}/submissions">Yes</button>'
                         f'<button data-confirmed="false" data-endpoint="{endpoint}/submissions">No</button>'
                     )
                     submission_script = (
+                        "const confirmationStatus=document.querySelector('[data-confirmation-status]');"
                         "document.querySelectorAll('button[data-confirmed]').forEach((button)=>"
-                        "button.addEventListener('click',async()=>{"
+                        "{button.onclick=async()=>{"
                         "const confirmed=button.dataset.confirmed==='true';"
                         "const response=await fetch(button.dataset.endpoint,{method:'POST',credentials:'same-origin',"
                         "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},"
                         "body:JSON.stringify({submission_id:crypto.randomUUID(),confirmed:confirmed})});"
-                        "if(response.ok)location.reload();"
-                        "}));"
+                        "if(response.ok)location.reload();if(response.ok){}else{confirmationStatus.dataset.confirmationStatus='not-submitted';confirmationStatus.textContent='not-submitted: conflict or unavailable';}"
+                        "};});</script><script>"
                     )
                 else:
                     draft = state.get("_draft")
