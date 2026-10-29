@@ -302,6 +302,7 @@ _TOOL_SPECS = (
             "prompt": {"type": "string"},
             "default_value": {"type": "string"},
             "client_timeout_seconds": {"type": "integer"},
+            "max_result_bytes": {"type": "integer"},
             "interaction_id": {"type": "string"},
             "request_id": {"type": "string"},
         },
@@ -680,9 +681,9 @@ class _McpGateway:
         call_id = safe_arguments.get("call_id")
         after_event_seq = safe_arguments.get("after_event_seq")
         if (
-            spec.name == "get_user_input"
+            spec.name in ("get_user_input", "get_multiline_input")
             and "max_result_bytes" in safe_arguments
-            and not _valid_ordinary_text_result_budget(safe_arguments["max_result_bytes"])
+            and not _valid_text_input_result_budget(safe_arguments["max_result_bytes"])
         ):
             return _rpc_result(
                 rpc_id,
@@ -745,7 +746,7 @@ class _McpGateway:
             rpc_id,
             {
                 "content": [],
-                "structuredContent": _ordinary_text_transport_view(
+                "structuredContent": _text_input_transport_view(
                     envelope, safe_arguments.get("max_result_bytes", _DEFAULT_RESULT_BYTES)
                 ),
             },
@@ -866,7 +867,7 @@ class _McpGateway:
             rpc_id,
             {
                 "content": [],
-                "structuredContent": _ordinary_text_transport_view(
+                "structuredContent": _text_input_transport_view(
                     envelope, safe_arguments.get("max_result_bytes", _DEFAULT_RESULT_BYTES)
                 ),
             },
@@ -924,7 +925,7 @@ def _invalid_client_timeout() -> dict[str, object]:
     }
 
 
-def _valid_ordinary_text_result_budget(value: object) -> bool:
+def _valid_text_input_result_budget(value: object) -> bool:
     return (
         isinstance(value, int)
         and not isinstance(value, bool)
@@ -940,15 +941,15 @@ def _invalid_result_budget() -> dict[str, object]:
     }
 
 
-def _ordinary_text_transport_view(envelope: dict[str, object], budget: object) -> dict[str, object]:
-    """Return an ordinary-text result within the caller's transport budget.
+def _text_input_transport_view(envelope: dict[str, object], budget: object) -> dict[str, object]:
+    """Return a text-input result within the caller's transport budget.
 
     Coordinator events and submission results remain canonical.  This is only
     the MCP representation, so a later authorized read can page the complete
     persisted body.
     """
     if (
-        not _valid_ordinary_text_result_budget(budget)
+        not _valid_text_input_result_budget(budget)
         or not isinstance(envelope.get("user_input"), str)
         or len(json.dumps(envelope, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= budget
     ):
