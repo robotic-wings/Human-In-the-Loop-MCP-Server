@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from test_central_mcp_gateway import _free_port, _post, _start, _stop, _structured, _wait_for_listener
+from test_iphone_browser_drafts import _writer_headers
 from test_iphone_web_acceptance import _create_call, _login, _request, _write_operator_config
 from test_iphone_web_decline import _configure_phone_route, _headers
 from test_mcp_continuation import _continuation
@@ -68,6 +69,7 @@ def test_tls_accepted_iphone_owner_heartbeat_refreshes_only_liveness(tmp_path: P
         assert isinstance(call_id, str)
         cookie, csrf = _login(port, certificate)
         assert _accept(port, certificate, call_id, _headers(cookie, csrf, port))[0] == 200
+        writer = _writer_headers(port, certificate, call_id, _headers(cookie, csrf, port), "heartbeat-owner")
         active_page = _request(port, certificate, "GET", f"/calls/{call_id}", headers={"Cookie": cookie})
         with sqlite3.connect(database) as connection:
             connection.execute(
@@ -84,7 +86,7 @@ def test_tls_accepted_iphone_owner_heartbeat_refreshes_only_liveness(tmp_path: P
         page = _request(port, certificate, "GET", f"/calls/{call_id}", headers={"Cookie": cookie})
         poll = _request(port, certificate, "GET", f"/api/calls/{call_id}", headers={"Cookie": cookie})
         after_reads = _call_row(database, call_id)
-        refreshed = _heartbeat(port, certificate, call_id, _headers(cookie, csrf, port))
+        refreshed = _heartbeat(port, certificate, call_id, writer)
         after = _call_row(database, call_id)
         business_after = _business_evidence(database, call_id)
     finally:
@@ -152,6 +154,7 @@ def test_tls_late_iphone_heartbeat_settles_disconnect_and_releases_busy_after_re
         assert isinstance(call_id, str) and isinstance(interaction_id, str)
         cookie, csrf = _login(port, certificate)
         assert _accept(port, certificate, call_id, _headers(cookie, csrf, port))[0] == 200
+        writer = _writer_headers(port, certificate, call_id, _headers(cookie, csrf, port), "heartbeat-expiry")
         with sqlite3.connect(database) as connection:
             connection.execute(
                 "UPDATE calls SET terminal_last_seen_at = ?, terminal_disconnect_deadline = ? WHERE call_id = ?",
@@ -168,7 +171,7 @@ def test_tls_late_iphone_heartbeat_settles_disconnect_and_releases_busy_after_re
     process = _start(config)
     _wait_for_listener(process, port)
     try:
-        late = _heartbeat(port, certificate, call_id, _headers(cookie, csrf, port))
+        late = _heartbeat(port, certificate, call_id, writer)
         after_original_owner = _call_row(database, call_id)
         restarted_cookie, restarted_csrf = _login(port, certificate)
         takeover = _heartbeat(port, certificate, call_id, _headers(restarted_cookie, restarted_csrf, port))
