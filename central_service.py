@@ -327,6 +327,7 @@ _TOOL_SPECS = (
             "title": {"type": "string"},
             "message": {"type": "string"},
             "client_timeout_seconds": {"type": "integer"},
+            "max_result_bytes": {"type": "integer"},
             "interaction_id": {"type": "string"},
             "request_id": {"type": "string"},
         },
@@ -686,7 +687,7 @@ class _McpGateway:
         if (
             spec.name in (
                 "get_user_input", "get_multiline_input", "get_user_choice",
-                "get_feedback_from_user", "show_confirmation_dialog",
+                "get_feedback_from_user", "show_confirmation_dialog", "show_info_message",
             )
             and "max_result_bytes" in safe_arguments
             and not _valid_text_input_result_budget(safe_arguments["max_result_bytes"])
