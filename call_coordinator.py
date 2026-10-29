@@ -162,6 +162,78 @@ class CallCoordinator:
             )
             return result
 
+    def revise_task(
+        self, *, caller_id: str, interaction_id: str, prior_call_id: str,
+        revision_id: str, message: str, ring_timeout_seconds: int,
+        desktop_route_device_id: str | None, bark_enabled: bool,
+    ) -> dict[str, Any]:
+        """Atomically admit one explicitly requested revision of the latest final task round."""
+        payload = self._canonical({
+            "prior_call_id": prior_call_id, "message": message,
+        })
+        with self._write_transaction() as connection:
+            replay = connection.execute(
+                "SELECT payload, result FROM revision_operations "
+                "WHERE caller_id = ? AND interaction_id = ? AND revision_id = ?",
+                (caller_id, interaction_id, revision_id),
+            ).fetchone()
+            if replay is not None:
+                if replay["payload"] == payload:
+                    return self._decode(replay["result"])
+                return {"success": False, "status": "revision_conflict", "needs_continuation": False}
+            prior = self._owned_call(connection, caller_id, interaction_id, prior_call_id)
+            if prior is None:
+                return self._session_not_found()
+            self._settle_if_expired(connection, prior)
+            prior = self._call_or_raise(connection, prior_call_id)
+            latest = connection.execute(
+                "SELECT call_id FROM calls WHERE caller_id = ? AND interaction_id = ? "
+                "ORDER BY rowid DESC LIMIT 1",
+                (caller_id, interaction_id),
+            ).fetchone()
+            if (
+                latest is None or latest["call_id"] != prior_call_id
+                or prior["state"] not in {"completed", "failed"}
+            ):
+                return {"success": False, "status": "revision_not_allowed", "needs_continuation": False}
+            active = connection.execute(
+                "SELECT 1 FROM calls WHERE operator_id = ? AND state IN ('ringing', 'accepted', 'in_progress') LIMIT 1",
+                (prior["operator_id"],),
+            ).fetchone()
+            if active is not None:
+                return self._busy()
+            call_id = str(uuid.uuid4())
+            now = self._now()
+            deadline = now + timedelta(seconds=ring_timeout_seconds)
+            connection.execute(
+                "INSERT INTO calls (call_id, operator_id, caller_id, interaction_id, message, state, "
+                "created_at, ring_deadline, version, desktop_route_device_id) "
+                "VALUES (?, ?, ?, ?, ?, 'ringing', ?, ?, 1, ?)",
+                (call_id, prior["operator_id"], caller_id, interaction_id, message,
+                 self._stamp(now), self._stamp(deadline), desktop_route_device_id),
+            )
+            result = self._envelope(
+                status="ringing", call_state="ringing", interaction_id=interaction_id,
+                call_id=call_id, retryable=False, event_seq=0,
+            )
+            result["task_id"] = interaction_id
+            if bark_enabled:
+                connection.execute(
+                    "INSERT INTO bark_deliveries (call_id, state, attempt_count) VALUES (?, 'pending', 0)",
+                    (call_id,),
+                )
+            if desktop_route_device_id is not None:
+                connection.execute(
+                    "INSERT INTO terminal_callback_deliveries (call_id, state, attempt_count) VALUES (?, 'pending', 0)",
+                    (call_id,),
+                )
+            connection.execute(
+                "INSERT INTO revision_operations (caller_id, interaction_id, revision_id, payload, result) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (caller_id, interaction_id, revision_id, payload, self._canonical(result)),
+            )
+            return result
+
     def claim_next_bark_delivery(self) -> dict[str, str] | None:
         """Atomically claim one fresh phone delivery without changing call state."""
         with self._write_transaction() as connection:
@@ -1378,6 +1450,13 @@ class CallCoordinator:
             if replay is not None:
                 return self._decode(replay["result"]) if replay["payload"] == payload else self._conflict()
             if row["state"] not in {"accepted", "in_progress"}:
+                newer = connection.execute(
+                    "SELECT 1 FROM calls WHERE interaction_id = ? AND rowid > "
+                    "(SELECT rowid FROM calls WHERE call_id = ?) LIMIT 1",
+                    (row["interaction_id"], call_id),
+                ).fetchone()
+                if newer is not None:
+                    return {"success": False, "status": "superseded", "needs_continuation": False}
                 return self._current_result(connection, row)
             if row["task_version"] != task_version:
                 return {
@@ -2939,6 +3018,11 @@ class CallCoordinator:
             CREATE TABLE IF NOT EXISTS create_operations (
                 caller_id TEXT NOT NULL, request_id TEXT NOT NULL, payload TEXT NOT NULL,
                 result TEXT NOT NULL, PRIMARY KEY (caller_id, request_id)
+            );
+            CREATE TABLE IF NOT EXISTS revision_operations (
+                caller_id TEXT NOT NULL, interaction_id TEXT NOT NULL, revision_id TEXT NOT NULL,
+                payload TEXT NOT NULL, result TEXT NOT NULL,
+                PRIMARY KEY (caller_id, interaction_id, revision_id)
             );
             CREATE TABLE IF NOT EXISTS action_operations (
                 action_id TEXT PRIMARY KEY, payload TEXT NOT NULL, result TEXT NOT NULL
