@@ -518,13 +518,17 @@ _HUMAN_LOOP_PROMPT_GUIDANCE = """# Central human-loop MCP protocol
 
 Use the authenticated HTTPS `/mcp` endpoint. It is the only supported transport: stdio and local fallback modes are not supported.
 
-Start an interaction with the relevant tool call. Its first response identifies the durable `interaction_id` and `call_id`. Every continuation and event read must use that same pair together with the last successfully received `after_event_seq`; do not create another call to continue waiting.
+Start an interaction with the relevant tool call and supply a stable `request_id`; retry a lost response with the same normalized request and the same `request_id` so it replays instead of creating another call. Its first response identifies the durable `interaction_id` and `call_id`.
+
+Every continuation and event read must use that same `interaction_id` (or `task_id` for a task) together with `call_id` and the last successfully received `after_event_seq`; do not create another call to continue waiting. Events are returned in increasing `event_seq` order. Reuse the cursor after a lost response to read the earliest unacknowledged event.
 
 Human acceptance produces an `opened` event. Human task progress produces an `in_progress` event. A human answer, completion, failure, decline, timeout, cancellation, or disconnect produces the final event/result. These non-heartbeat events have monotonically increasing `event_seq` values and are durable, so an unacknowledged event can be replayed after a lost response by reusing the cursor.
 
 A `heartbeat` reports current waiting state but creates no event and does not advance `event_seq`. `needs_continuation:true` means either the interaction is still waiting or another durable readable event remains after the current cursor; it does not by itself mean a new call should be created. A final result with no unread event has `needs_continuation:false`.
 
-Final statuses and their structured results are durable. Reading or replaying an event never re-notifies the human or creates another interaction. Malformed or rejected requests continue to return the established structured JSON-RPC or authentication errors."""
+Each interaction tool accepts optional `max_result_bytes`, defaulting to 1000000 bytes; values below the 16384-byte minimum are rejected before notifying a human. This is a response budget, not an upload limit. If a complete result does not fit, omitted body or attachments remain available only through authorized reads and are not replaced by a server file path.
+
+Use `read_interaction_result(interaction_id, result_id, cursor?, max_result_bytes)` to page an authorized saved result, and `read_interaction_attachment(interaction_id, attachment_id, offset_bytes?, max_result_bytes)` to read an authorized attachment by byte offset. Both report whether reading is complete and the next cursor or offset; attachment reads also include the complete length and integrity checksum. Reading or replaying never re-notifies the human, creates another interaction, or mutates call state. Authentication and caller access controls apply to every operation. Malformed or rejected requests continue to return the established structured JSON-RPC or authentication errors."""
 
 
 class _McpGateway:
