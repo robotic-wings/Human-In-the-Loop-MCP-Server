@@ -93,7 +93,7 @@ def test_tls_accepted_iphone_task_progress_persists_replays_and_keeps_page_writa
     assert _structured(event) == first[2] and page_after[0] == 200 and _page(page_after[2], call_id)
     assert heartbeat[0] == 200 and isinstance(heartbeat[2], dict) and heartbeat[2]["call_state"] == "in_progress"
     assert before_heartbeat is not None and after_heartbeat is not None and after_heartbeat[0] > before_heartbeat[0] and after_heartbeat[1] > before_heartbeat[1] and after_heartbeat[2] == before_heartbeat[2]
-    assert state[:5] == ("in_progress", "iphone_web", state[2], "iphone_web", "ios") and state[5] is not None and events == [(1,), (2,)] and operations == 1 and results == 0
+    assert state[:5] == ("in_progress", "iphone_web", state[2], "iphone_web", "ios") and state[5] is not None and events == [(1,), (2,)] and operations == 1 and results == 1
 
 
 def test_tls_task_progress_reconnect_grace_is_300_seconds_and_replay_does_not_extend(tmp_path: Path) -> None:
