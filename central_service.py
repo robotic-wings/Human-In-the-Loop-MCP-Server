@@ -373,6 +373,7 @@ _TOOL_SPECS = (
         ("interaction_id", "attachment_id", "max_result_bytes"),
     ),
     ToolSpec("health_check", (), ()),
+    ToolSpec("get_operator_profile", (), ()),
 )
 
 
@@ -531,6 +532,7 @@ class _McpGateway:
         self, coordinator: CallCoordinator, credentials: dict[str, str], desktop_route_device_id: str | None = None,
         bark_enabled: bool = False, operator_id: str = "operator-default",
         scheduler: "RingingDeadlineScheduler | None" = None,
+        operator_profile_id: str | None = None,
     ) -> None:
         self._coordinator = coordinator
         self._credentials = credentials
@@ -538,6 +540,7 @@ class _McpGateway:
         self._bark_enabled = bark_enabled
         self._operator_id = operator_id
         self._scheduler = scheduler
+        self._operator_profile_id = operator_profile_id
 
     def caller_for(self, authorization: str | None) -> str | None:
         if not isinstance(authorization, str) or not authorization.startswith("Bearer "):
@@ -654,6 +657,10 @@ class _McpGateway:
             if arguments:
                 return _rpc_error(rpc_id, -32602, "invalid params")
             return self._health_check_tool(rpc_id)
+        if spec.name == "get_operator_profile":
+            if arguments:
+                return _rpc_error(rpc_id, -32602, "invalid params")
+            return self._operator_profile_tool(rpc_id)
         # Callback routing and its credential are managed terminal configuration,
         # never Agent-controlled tool arguments.
         if {"callback_url", "callback_auth_token"} & arguments.keys():
@@ -781,6 +788,13 @@ class _McpGateway:
         if report["storage"] != {"status": "healthy"} or not scheduler_running:
             report["status"] = "degraded"
         return _rpc_result(rpc_id, {"content": [], "structuredContent": report})
+
+    def _operator_profile_tool(self, rpc_id: object) -> dict[str, object]:
+        """Return the configured operator identifier without reading or changing state."""
+        profile: dict[str, object] = {"operator_id": self._operator_profile_id}
+        if self._operator_profile_id is None:
+            profile["status"] = "not_configured"
+        return _rpc_result(rpc_id, {"content": [], "structuredContent": profile})
 
     def _revise_task_tool(
         self, rpc_id: object, arguments: dict[str, object], caller_id: str
@@ -3301,6 +3315,7 @@ def _serve(config: ServiceConfig) -> None:
         gateway = _McpGateway(
             coordinator, credentials, configured_desktop_route_device_id, config.bark_enabled, operator_id,
             scheduler,
+            operator_record["operator_id"] if isinstance(operator_record, dict) else None,
         )
         terminal_gateway = _TerminalGateway(
             coordinator,
