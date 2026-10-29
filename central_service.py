@@ -68,6 +68,8 @@ _DEFAULT_ATTACHMENT_MAX_FILE_BYTES = 20 * 1024 * 1024
 _DEFAULT_ATTACHMENT_MAX_SUBMISSION_BYTES = 50 * 1024 * 1024
 _DEFAULT_ATTACHMENT_MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024
 _MULTIPART_OVERHEAD_BYTES = 64 * 1024
+_MIN_RESULT_BYTES = 16_384
+_DEFAULT_RESULT_BYTES = 1_000_000
 
 
 def _required_string(config: dict[str, object], name: str) -> str:
@@ -274,6 +276,7 @@ _TOOL_SPECS = (
                 "enum": ["text", "integer", "float"],
             },
             "client_timeout_seconds": {"type": "integer"},
+            "max_result_bytes": {"type": "integer"},
             "interaction_id": {"type": "string"},
             "request_id": {"type": "string"},
         },
@@ -676,6 +679,15 @@ class _McpGateway:
             )
         call_id = safe_arguments.get("call_id")
         after_event_seq = safe_arguments.get("after_event_seq")
+        if (
+            spec.name == "get_user_input"
+            and "max_result_bytes" in safe_arguments
+            and not _valid_ordinary_text_result_budget(safe_arguments["max_result_bytes"])
+        ):
+            return _rpc_result(
+                rpc_id,
+                {"content": [], "structuredContent": _invalid_result_budget()},
+            )
         if call_id is not None or after_event_seq is not None:
             if spec.name == "assign_task_to_human" and any(
                 field in safe_arguments
@@ -729,7 +741,15 @@ class _McpGateway:
                 continuation_payload,
                 client_timeout_seconds,
             )
-        return _rpc_result(rpc_id, {"content": [], "structuredContent": envelope})
+        return _rpc_result(
+            rpc_id,
+            {
+                "content": [],
+                "structuredContent": _ordinary_text_transport_view(
+                    envelope, safe_arguments.get("max_result_bytes", _DEFAULT_RESULT_BYTES)
+                ),
+            },
+        )
 
     def _update_active_task_tool(
         self,
@@ -842,7 +862,15 @@ class _McpGateway:
         if envelope["status"] == "session_not_found":
             # Keep unknown and unauthorized calls indistinguishable.
             return _rpc_error(rpc_id, -32602, "invalid params")
-        return _rpc_result(rpc_id, {"content": [], "structuredContent": envelope})
+        return _rpc_result(
+            rpc_id,
+            {
+                "content": [],
+                "structuredContent": _ordinary_text_transport_view(
+                    envelope, safe_arguments.get("max_result_bytes", _DEFAULT_RESULT_BYTES)
+                ),
+            },
+        )
 
     def _wait_for_leg(
         self,
@@ -894,6 +922,41 @@ def _invalid_client_timeout() -> dict[str, object]:
         "status": "invalid_client_timeout",
         "needs_continuation": False,
     }
+
+
+def _valid_ordinary_text_result_budget(value: object) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value >= _MIN_RESULT_BYTES
+    )
+
+
+def _invalid_result_budget() -> dict[str, object]:
+    return {
+        "success": False,
+        "status": "invalid_result_budget",
+        "needs_continuation": False,
+    }
+
+
+def _ordinary_text_transport_view(envelope: dict[str, object], budget: object) -> dict[str, object]:
+    """Return an ordinary-text result within the caller's transport budget.
+
+    Coordinator events and submission results remain canonical.  This is only
+    the MCP representation, so a later authorized read can page the complete
+    persisted body.
+    """
+    if (
+        not _valid_ordinary_text_result_budget(budget)
+        or not isinstance(envelope.get("user_input"), str)
+        or len(json.dumps(envelope, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= budget
+    ):
+        return envelope
+    rendered = dict(envelope)
+    rendered["user_input"] = None
+    rendered["body_omitted_for_size"] = True
+    return rendered
 
 
 def _rpc_error(request_id: object, code: int, message: str) -> dict[str, object]:
