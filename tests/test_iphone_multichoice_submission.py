@@ -10,6 +10,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 from test_central_mcp_gateway import _free_port, _post, _start, _stop, _structured, _wait_for_listener
+from test_iphone_browser_drafts import _writer_headers
 from test_iphone_web_acceptance import _login, _request, _write_operator_config
 from test_iphone_web_decline import _configure_phone_route, _headers
 from test_mcp_continuation import _continuation
@@ -62,7 +63,7 @@ class _Page(HTMLParser):
             self.csrf = values.get("content")
         if tag == "input" and values.get("type") == "checkbox" and values.get("data-choice"):
             self.choices.add(values["data-choice"])
-        if values.get("data-endpoint"):
+        if tag == "button" and "data-multiple-choice" in values and values.get("data-endpoint"):
             self.endpoint = values["data-endpoint"]
 
 
@@ -98,9 +99,10 @@ def test_tls_accepted_iphone_multichoice_canonicalizes_replays_and_delivers_agen
         assert _accept(port, certificate, call_id, headers)[0] == 200
         endpoint, rendered_csrf = _page(_request(port, certificate, "GET", f"/calls/{call_id}", headers={"Cookie": cookie})[2], call_id)
         rendered_headers = _headers(cookie, rendered_csrf, port)
-        first = _submit(port, certificate, call_id, "multi-1", ["Gamma", "<script>Alpha</script>"], rendered_headers)
-        replay = _submit(port, certificate, call_id, "multi-1", ["<script>Alpha</script>", "Gamma"], rendered_headers)
-        conflict = _submit(port, certificate, call_id, "multi-1", ["Beta", "Gamma"], rendered_headers)
+        writer_headers = _writer_headers(port, certificate, call_id, rendered_headers, "multi-answer")
+        first = _submit(port, certificate, call_id, "multi-1", ["Gamma", "<script>Alpha</script>"], writer_headers)
+        replay = _submit(port, certificate, call_id, "multi-1", ["<script>Alpha</script>", "Gamma"], writer_headers)
+        conflict = _submit(port, certificate, call_id, "multi-1", ["Beta", "Gamma"], writer_headers)
         _, continuation, _ = _post(port, certificate, _continuation("multi-event", interaction_id, call_id, 1), "test-token-alpha")
         with sqlite3.connect(database) as connection:
             events = connection.execute("SELECT event_seq, result FROM events WHERE call_id = ? ORDER BY event_seq", (call_id,)).fetchall()
@@ -122,12 +124,15 @@ def test_tls_iphone_multichoice_rejects_invalid_foreign_and_wrong_form_writers_w
         created = _call(port, certificate, "multi-security"); call_id = created["call_id"]; assert isinstance(call_id, str)
         owner_cookie, owner_csrf = _login(port, certificate); other_cookie, other_csrf = _login(port, certificate); owner = _headers(owner_cookie, owner_csrf, port)
         preaccept = _submit(port, certificate, call_id, "pre", ["Beta"], owner); assert _accept(port, certificate, call_id, owner)[0] == 200
-        bad = (_submit(port, certificate, call_id, "not-list", {"choice": "Beta"}, owner), _submit(port, certificate, call_id, "non-string", ["Beta", 7], owner), _submit(port, certificate, call_id, "empty", [], owner), _submit(port, certificate, call_id, "dup", ["Beta", "Beta"], owner), _submit(port, certificate, call_id, "foreign", ["outside"], owner), _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "text", "user_input": "Beta"}, headers=owner), _submit(port, certificate, call_id, "other", ["Beta"], _headers(other_cookie, other_csrf, port)), _submit(port, certificate, call_id, "cross", ["Beta"], {"Cookie": owner_cookie, "X-CSRF-Token": owner_csrf, "Origin": "https://evil.example"}))
+        writer = _writer_headers(port, certificate, call_id, owner, "multi-security")
+        bad = (_submit(port, certificate, call_id, "not-list", {"choice": "Beta"}, writer), _submit(port, certificate, call_id, "non-string", ["Beta", 7], writer), _submit(port, certificate, call_id, "empty", [], writer), _submit(port, certificate, call_id, "dup", ["Beta", "Beta"], writer), _submit(port, certificate, call_id, "foreign", ["outside"], writer), _request(port, certificate, "POST", f"/api/calls/{call_id}/submissions", body={"submission_id": "text", "user_input": "Beta"}, headers=writer), _submit(port, certificate, call_id, "other", ["Beta"], _headers(other_cookie, other_csrf, port)), _submit(port, certificate, call_id, "cross", ["Beta"], {"Cookie": owner_cookie, "X-CSRF-Token": owner_csrf, "Origin": "https://evil.example"}))
+        tokenless = _submit(port, certificate, call_id, "tokenless", ["Beta"], owner)
         with sqlite3.connect(database) as connection:
             state = connection.execute("SELECT state, owner_session_id FROM calls WHERE call_id = ?", (call_id,)).fetchone(); operations = connection.execute("SELECT count(*) FROM submission_operations WHERE call_id = ?", (call_id,)).fetchone()[0]; events = connection.execute("SELECT event_seq FROM events WHERE call_id = ? ORDER BY event_seq", (call_id,)).fetchall()
     finally:
         _stop(process)
     assert preaccept[0] in {400, 401, 403, 409}
+    assert tokenless[0] == 403
     assert all(response[0] in {400, 401, 403, 404, 409} for response in bad)
     assert state is not None and state[0] == "accepted" and operations == 0 and events == [(1,)]
     _opaque(bad[6][2], call_id)
@@ -154,10 +159,11 @@ def test_tls_multichoice_route_exclusion_and_expiry_settlement_are_authoritative
     try:
         created = _call(port, certificate, "multi-expiry"); call_id, interaction_id = created["call_id"], created["interaction_id"]; assert isinstance(call_id, str) and isinstance(interaction_id, str)
         cookie, csrf = _login(port, certificate); headers = _headers(cookie, csrf, port); assert _accept(port, certificate, call_id, headers)[0] == 200
+        writer = _writer_headers(port, certificate, call_id, headers, "multi-expiry")
         with sqlite3.connect(database) as connection:
             connection.execute("UPDATE calls SET terminal_last_seen_at = ?, terminal_disconnect_deadline = ? WHERE call_id = ?", ((datetime.now(UTC) - timedelta(seconds=181)).isoformat(), (datetime.now(UTC) - timedelta(seconds=1)).isoformat(), call_id)); connection.commit()
         _stop(process); process = _start(config); _wait_for_listener(process, port)
-        late = _submit(port, certificate, call_id, "late", ["Beta", "Gamma"], headers)
+        late = _submit(port, certificate, call_id, "late", ["Beta", "Gamma"], writer)
         _, terminal_event, _ = _post(port, certificate, _continuation("multi-terminal", interaction_id, call_id, 1), "test-token-alpha")
         next_call = _call(port, certificate, "multi-after-expiry")
         with sqlite3.connect(database) as connection:
