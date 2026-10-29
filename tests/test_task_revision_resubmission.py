@@ -13,7 +13,7 @@ from pathlib import Path
 from test_central_mcp_gateway import _free_port, _post, _start, _stop, _structured, _wait_for_listener
 from test_iphone_browser_drafts import _writer_headers
 from test_iphone_task_progress_submission import _accept, _continuation_for_task, _submit
-from test_iphone_web_acceptance import _login, _write_operator_config
+from test_iphone_web_acceptance import _login, _request, _write_operator_config
 from test_iphone_web_decline import _configure_phone_route, _headers
 from test_mcp_wait_leg import _with_timeout
 
