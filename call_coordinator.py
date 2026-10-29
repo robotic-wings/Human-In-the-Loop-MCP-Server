@@ -1927,7 +1927,10 @@ class CallCoordinator:
         archived_bytes = connection.execute(
             "SELECT COALESCE(SUM(byte_count), 0) FROM attachments"
         ).fetchone()[0]
-        occupied_bytes = max(archived_bytes, self._attachment_bytes_on_disk())
+        try:
+            occupied_bytes = max(archived_bytes, self._attachment_bytes_on_disk())
+        except OSError:
+            return self._attachment_rejected("archive_unavailable")
         if occupied_bytes + byte_count > self._attachment_max_archive_bytes:
             return self._attachment_rejected("archive_capacity_exceeded")
 
