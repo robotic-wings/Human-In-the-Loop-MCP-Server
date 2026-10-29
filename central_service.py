@@ -360,7 +360,7 @@ _TOOL_SPECS = (
             "cursor": {"type": "integer", "minimum": 0},
             "max_result_bytes": {"type": "integer"},
         },
-        ("interaction_id", "result_id", "max_result_bytes"),
+        ("interaction_id", "result_id"),
     ),
     _tool_spec(
         "read_interaction_attachment",
@@ -370,7 +370,7 @@ _TOOL_SPECS = (
             "offset_bytes": {"type": "integer", "minimum": 0},
             "max_result_bytes": {"type": "integer"},
         },
-        ("interaction_id", "attachment_id", "max_result_bytes"),
+        ("interaction_id", "attachment_id"),
     ),
     ToolSpec("health_check", (), ()),
     ToolSpec("get_operator_profile", (), ()),
@@ -878,7 +878,7 @@ class _McpGateway:
             arguments.get("interaction_id"),
             arguments.get("result_id"),
             arguments.get("cursor", 0),
-            arguments.get("max_result_bytes"),
+            arguments.get("max_result_bytes", _DEFAULT_RESULT_BYTES),
         )
         return _rpc_result(rpc_id, {"content": [], "structuredContent": result})
 
@@ -890,7 +890,7 @@ class _McpGateway:
             arguments.get("interaction_id"),
             arguments.get("attachment_id"),
             arguments.get("offset_bytes", 0),
-            arguments.get("max_result_bytes"),
+            arguments.get("max_result_bytes", _DEFAULT_RESULT_BYTES),
         )
         return _rpc_result(rpc_id, {"content": [], "structuredContent": result})
 
