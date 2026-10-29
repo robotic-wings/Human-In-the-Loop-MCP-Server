@@ -2189,7 +2189,7 @@ class _PublicHandler(BaseHTTPRequestHandler):
                         "}));"
                     )
                 elif choice_options is not None:
-                    controls = "".join(
+                    controls = '<p data-choice-status="ready">Ready to submit</p>' + "".join(
                         f'<button data-choice="{html.escape(choice, quote=True)}" '
                         f'data-endpoint="{endpoint}/submissions"><input type="radio" '
                         f'data-choice="{html.escape(choice, quote=True)}">{html.escape(choice)}</button>'
@@ -2198,11 +2198,12 @@ class _PublicHandler(BaseHTTPRequestHandler):
                     submission_script = (
                         "document.querySelectorAll('button[data-choice]').forEach((button)=>"
                         "button.addEventListener('click',()=>{"
+                        "const choiceStatus=document.querySelector('[data-choice-status]');"
                         "const selected=button.dataset.choice;"
                         "fetch(button.dataset.endpoint,{method:'POST',credentials:'same-origin',"
                         "headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},"
                         "body:JSON.stringify({submission_id:crypto.randomUUID(),selected_choices:[selected])})"
-                        ".then((response)=>{if(response.ok)location.reload();});"
+                        ".then((response)=>{if(response.ok)location.reload();if(response.ok){}else{choiceStatus.dataset.choiceStatus='not-submitted';choiceStatus.textContent='not-submitted: conflict or unavailable';}});"
                         "}));"
                     )
                 elif _is_info_message(state.get("message")):
