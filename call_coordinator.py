@@ -1944,7 +1944,7 @@ class CallCoordinator:
                     storage_path.unlink(missing_ok=True)
                 except (AttributeError, OSError):
                     pass
-            return {"success": False, "status": "archive_unavailable"}
+            return self._attachment_rejected("archive_unavailable")
         connection.execute(
             "INSERT INTO attachments "
             "(attachment_id, call_id, original_name, media_type, byte_count, sha256, storage_path) "
