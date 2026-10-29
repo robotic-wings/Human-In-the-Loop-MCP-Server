@@ -390,3 +390,63 @@ def test_tls_attachment_reader_offsets_authorization_and_budget_are_nonleaking(t
         assert _persisted_snapshot(tmp_path / "data", created["call_id"]) == before
     finally:
         _stop(process)
+
+
+def test_tls_authorized_readers_default_the_result_budget_and_positions_without_mutation(
+    tmp_path: Path,
+) -> None:
+    """Omitted reader budgets and cursors use safe defaults, not a protocol error."""
+    attachment = b"\x00\xffdefault-reader-attachment"
+    port, certificate, process, created, fixture = _completed_fixture(
+        tmp_path,
+        request_id="reader-default-budget",
+        owner_session_id="reader-default-owner",
+        body="small authorized default-budget result",
+        attachment=attachment,
+    )
+    try:
+        submitted = fixture["submitted"]
+        attachment_id = fixture["uploaded"]["attachment"]["attachment_id"]
+        before = _persisted_snapshot(tmp_path / "data", created["call_id"])
+
+        listed_status, listed, _ = _post(
+            port, certificate, _rpc("tools/list", {}, 71), "test-token-alpha"
+        )
+        for name in ("read_interaction_result", "read_interaction_attachment"):
+            tool = next(item for item in listed["result"]["tools"] if item["name"] == name)
+            assert "max_result_bytes" in tool["inputSchema"]["properties"]
+            assert "max_result_bytes" not in tool["inputSchema"].get("required", [])
+
+        result_status, result_response = _tool_call(
+            port,
+            certificate,
+            "test-token-alpha",
+            "read_interaction_result",
+            {
+                "interaction_id": created["interaction_id"],
+                "result_id": submitted["result_id"],
+            },
+        )
+        attachment_status, attachment_response = _tool_call(
+            port,
+            certificate,
+            "test-token-alpha",
+            "read_interaction_attachment",
+            {
+                "interaction_id": created["interaction_id"],
+                "attachment_id": attachment_id,
+            },
+        )
+
+        assert listed_status == result_status == attachment_status == 200
+        result = _structured(result_response)
+        attachment_page = _structured(attachment_response)
+        assert result["body"] == "small authorized default-budget result"
+        assert result["complete"] is True and result["next_cursor"] is None
+        assert result.get("body_omitted_for_size") is not True
+        assert attachment_page["complete"] is True
+        assert attachment_page["next_offset_bytes"] is None
+        assert base64.b64decode(attachment_page["data_base64"], validate=True) == attachment
+        assert _persisted_snapshot(tmp_path / "data", created["call_id"]) == before
+    finally:
+        _stop(process)
