@@ -1644,6 +1644,8 @@ class CallCoordinator:
                 return self._not_found_read()
             body = result.get("user_input")
             if not isinstance(body, str):
+                body = result.get("feedback_text")
+            if not isinstance(body, str):
                 body = result.get("report")
             attachments = self._result_attachments(row["call_id"], result)
             if isinstance(body, str):

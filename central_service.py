@@ -335,6 +335,7 @@ _TOOL_SPECS = (
         "get_feedback_from_user",
         {
             "client_timeout_seconds": {"type": "integer"},
+            "max_result_bytes": {"type": "integer"},
             "interaction_id": {"type": "string"},
             "request_id": {"type": "string"},
         },
@@ -682,7 +683,7 @@ class _McpGateway:
         call_id = safe_arguments.get("call_id")
         after_event_seq = safe_arguments.get("after_event_seq")
         if (
-            spec.name in ("get_user_input", "get_multiline_input", "get_user_choice")
+            spec.name in ("get_user_input", "get_multiline_input", "get_user_choice", "get_feedback_from_user")
             and "max_result_bytes" in safe_arguments
             and not _valid_text_input_result_budget(safe_arguments["max_result_bytes"])
         ):
@@ -954,7 +955,12 @@ def _input_transport_view(envelope: dict[str, object], budget: object) -> dict[s
         or len(json.dumps(envelope, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= budget
     ):
         return envelope
-    field = "user_input" if isinstance(envelope.get("user_input"), str) else "selected_choices"
+    if isinstance(envelope.get("user_input"), str):
+        field = "user_input"
+    elif isinstance(envelope.get("feedback_text"), str):
+        field = "feedback_text"
+    else:
+        field = "selected_choices"
     if field == "selected_choices" and not isinstance(envelope.get(field), list):
         return envelope
     rendered = dict(envelope)
