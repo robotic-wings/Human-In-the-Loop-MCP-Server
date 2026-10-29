@@ -37,8 +37,8 @@ def _assert_failure_ui(page: object, kind: str) -> None:
     # else branch on the page. The branch therefore represents a failed PUT from
     # this textarea, and its absence of an assignment preserves the local edit.
     handler = re.search(
-        r"draftSave\.addEventListener\('click',async\(\)=>\{(?P<body>.*?)\}\);"
-        r"document\.querySelectorAll\(",
+        r"draftSave\.addEventListener\('click',async\(\)=>\{(?P<body>.*?\}\}\);)"
+        r"(?=const (?:multilineInputStatus|textInputStatus)=)",
         source,
         re.DOTALL,
     )
