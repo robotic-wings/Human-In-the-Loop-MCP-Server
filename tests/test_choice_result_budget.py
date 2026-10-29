@@ -7,6 +7,7 @@ behavior to their existing contracts.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -97,22 +98,36 @@ def test_tls_oversized_unicode_choices_omit_transport_list_and_keep_authorized_a
         continuation["params"]["arguments"]["max_result_bytes"] = MIN_BUDGET
         _, response, _ = _post(port, certificate, continuation, "test-token-alpha")
         delivered = _structured(response)
-        read = {
-            "jsonrpc": "2.0", "id": "choice-read", "method": "tools/call",
-            "params": {"name": "read_interaction_result", "arguments": {
-                "interaction_id": created["interaction_id"], "result_id": submitted["result_id"],
-                "cursor": 0, "max_result_bytes": MIN_BUDGET,
-            }},
-        }
-        _, read_response, _ = _post(port, certificate, read, "test-token-alpha")
+        cursor: int | None = None
+        reconstructed: list[str] = []
+        while True:
+            read = {
+                "jsonrpc": "2.0", "id": f"choice-read-{cursor}", "method": "tools/call",
+                "params": {"name": "read_interaction_result", "arguments": {
+                    "interaction_id": created["interaction_id"], "result_id": submitted["result_id"],
+                    "cursor": cursor or 0, "max_result_bytes": MIN_BUDGET,
+                }},
+            }
+            _, read_response, _ = _post(port, certificate, read, "test-token-alpha")
+            page = _structured(read_response)
+            assert page["success"] is True
+            assert page["result_id"] == submitted["result_id"]
+            assert isinstance(page["body"], list)
+            assert len(json.dumps(page, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= MIN_BUDGET
+            reconstructed.extend(page["body"])
+            if page["complete"]:
+                assert page["next_cursor"] is None
+                break
+            assert isinstance(page["next_cursor"], int)
+            assert page["next_cursor"] > (cursor or 0)
+            cursor = page["next_cursor"]
     finally:
         _stop(process)
     assert delivered["status"] == "answered"
     assert delivered["result_id"] == submitted["result_id"]
     assert delivered["selected_choices"] is None
     assert delivered["body_omitted_for_size"] is True
-    archived = _structured(read_response)
-    assert archived["body"] == choices
+    assert reconstructed == choices
 
 
 def test_tls_choice_sufficient_budget_replay_and_foreign_caller_boundary_remain_intact(tmp_path: Path) -> None:
