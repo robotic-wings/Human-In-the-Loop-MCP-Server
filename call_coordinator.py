@@ -1933,9 +1933,18 @@ class CallCoordinator:
 
         attachment_id = str(uuid.uuid4())
         digest = hashlib.sha256(content).hexdigest()
-        self._attachment_directory.mkdir(parents=True, exist_ok=True)
-        storage_path = self._attachment_directory / attachment_id
-        storage_path.write_bytes(content)
+        storage_path: Path | None = None
+        try:
+            self._attachment_directory.mkdir(parents=True, exist_ok=True)
+            storage_path = self._attachment_directory / attachment_id
+            storage_path.write_bytes(content)
+        except OSError:
+            if storage_path is not None:
+                try:
+                    storage_path.unlink(missing_ok=True)
+                except (AttributeError, OSError):
+                    pass
+            return {"success": False, "status": "archive_unavailable"}
         connection.execute(
             "INSERT INTO attachments "
             "(attachment_id, call_id, original_name, media_type, byte_count, sha256, storage_path) "
