@@ -92,7 +92,22 @@ class CallCoordinator:
             self._notify(notification)
         return outcome
 
-    def accept(self, call_id: str, device_id: str) -> dict[str, object]:
+    def accept(
+        self,
+        call_id: str,
+        device_id: str,
+        terminal_category: str,
+        terminal_platform: str | None = None,
+    ) -> dict[str, object]:
+        """Accept a ringing call for an explicitly identified terminal type.
+
+        ``device_id`` is an opaque owner identity.  It deliberately carries no
+        presentation or platform semantics: those arrive from the authenticated
+        terminal boundary as separate metadata.
+        """
+
+        if terminal_category not in {"desktop", "iphone_web"}:
+            raise ValueError("terminal_category must be 'desktop' or 'iphone_web'")
         with self._transaction() as connection:
             call = self._get_call_locked(connection, call_id)
             if call is None:
@@ -109,18 +124,25 @@ class CallCoordinator:
             if call["call_state"] == "not_accepted":
                 return self._expired()
 
-            handled_on = "iphone_web" if device_id.startswith("iphone") else "desktop"
             outcome = {
                 "success": True,
                 "status": "opened",
                 "call_state": "accepted",
                 "call_id": call_id,
-                "handled_on": handled_on,
+                "handled_on": terminal_category,
+                "terminal_platform": terminal_platform,
             }
             connection.execute(
                 "UPDATE calls SET call_state = 'accepted', owner_device_id = ?, "
-                "accept_outcome_json = ? WHERE call_id = ?",
-                (device_id, self._dump_json(outcome), call_id),
+                "terminal_category = ?, terminal_platform = ?, accept_outcome_json = ? "
+                "WHERE call_id = ?",
+                (
+                    device_id,
+                    terminal_category,
+                    terminal_platform,
+                    self._dump_json(outcome),
+                    call_id,
+                ),
             )
             return outcome
 
@@ -173,6 +195,8 @@ class CallCoordinator:
                 result["reason"] = call["reason"]
             if call["owner_device_id"] is not None:
                 result["owner_device_id"] = call["owner_device_id"]
+            if call["terminal_platform"] is not None:
+                result["terminal_platform"] = call["terminal_platform"]
             return result
 
     def _initialize_schema(self) -> None:
@@ -185,6 +209,8 @@ class CallCoordinator:
                     call_state TEXT NOT NULL,
                     ring_deadline REAL NOT NULL,
                     owner_device_id TEXT,
+                    terminal_category TEXT,
+                    terminal_platform TEXT,
                     reason TEXT,
                     accept_outcome_json TEXT,
                     decline_outcome_json TEXT
@@ -200,6 +226,13 @@ class CallCoordinator:
                     ON calls (call_state);
                 """
             )
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(calls)").fetchall()
+            }
+            for column in ("terminal_category", "terminal_platform"):
+                if column not in columns:
+                    connection.execute(f"ALTER TABLE calls ADD COLUMN {column} TEXT")
 
     def _connection(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._database_path, timeout=5, isolation_level=None)
