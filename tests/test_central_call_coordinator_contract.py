@@ -11,6 +11,10 @@ representation is UTF-8 JSON with sorted object keys and compact separators
 (``json.dumps(payload, sort_keys=True, separators=(",", ":"),
 ensure_ascii=False)``). Object insertion order is therefore not significant;
 values, arrays, and types remain significant.
+
+Likewise, terminal identity is explicit input: ``terminal_category`` is either
+``iphone_web`` or ``desktop``, and ``terminal_platform`` is a reported platform
+such as ``ios`` or ``linux``. Neither value may be derived from ``device_id``.
 """
 
 from __future__ import annotations
@@ -159,6 +163,7 @@ def test_accept_before_deadline_wins_and_late_decline_cannot_cancel_it(
         call_id=call_id,
         device_id="registered-terminal-42",
         terminal_category="iphone_web",
+        terminal_platform="ios",
     )
     declined = coordinator.decline(call_id=call_id, device_id="desktop-1")
 
@@ -173,14 +178,17 @@ def test_accept_before_deadline_wins_and_late_decline_cannot_cancel_it(
 
 
 @pytest.mark.parametrize(
-    ("device_id", "terminal_category"),
+    ("device_id", "terminal_category", "terminal_platform"),
     [
-        ("opaque-device-7", "iphone_web"),
-        ("not-a-desktop-name", "desktop"),
+        ("opaque-device-7", "iphone_web", "ios"),
+        ("not-a-desktop-name", "desktop", "linux"),
     ],
 )
-def test_accept_uses_explicit_terminal_category_not_device_id_spelling(
-    coordinator: CallCoordinator, device_id: str, terminal_category: str
+def test_accept_uses_explicit_terminal_identity_not_device_id_spelling(
+    coordinator: CallCoordinator,
+    device_id: str,
+    terminal_category: str,
+    terminal_platform: str,
 ) -> None:
     call_id = create(coordinator)["call_id"]
 
@@ -188,11 +196,15 @@ def test_accept_uses_explicit_terminal_category_not_device_id_spelling(
         call_id=call_id,
         device_id=device_id,
         terminal_category=terminal_category,
+        terminal_platform=terminal_platform,
     )
 
     assert accepted["status"] == "opened"
     assert accepted["handled_on"] == terminal_category
-    assert coordinator.get_call(call_id)["owner_device_id"] == device_id
+    assert accepted["terminal_platform"] == terminal_platform
+    persisted = coordinator.get_call(call_id)
+    assert persisted["owner_device_id"] == device_id
+    assert persisted["terminal_platform"] == terminal_platform
 
 
 def test_duplicate_accept_replays_saved_outcome_without_changing_owner(
@@ -204,11 +216,13 @@ def test_duplicate_accept_replays_saved_outcome_without_changing_owner(
         call_id=call_id,
         device_id="opaque-owner-a",
         terminal_category="iphone_web",
+        terminal_platform="ios",
     )
     replay = coordinator.accept(
         call_id=call_id,
         device_id="opaque-owner-a",
         terminal_category="iphone_web",
+        terminal_platform="ios",
     )
 
     assert replay == accepted
@@ -272,6 +286,7 @@ def test_separate_sqlite_clients_race_accept_and_decline_with_one_winner(
                 call_id=call_id,
                 device_id="terminal-without-iphone-in-its-id",
                 terminal_category="iphone_web",
+                terminal_platform="ios",
             ),
         ),
     )
@@ -297,6 +312,7 @@ def test_separate_sqlite_clients_race_accept_and_decline_with_one_winner(
     assert terminal["call_state"] in {"accepted", "declined"}
     if terminal["call_state"] == "accepted":
         assert terminal["owner_device_id"] == "terminal-without-iphone-in-its-id"
+        assert terminal["terminal_platform"] == "ios"
         assert outcomes["decline"]["status"] == "already_accepted"
     else:
         assert terminal["reason"] == "human_declined"
@@ -315,6 +331,7 @@ def test_deadline_is_strict_and_expiry_is_persisted_as_not_accepted(
         call_id=call_id,
         device_id="opaque-late-device",
         terminal_category="iphone_web",
+        terminal_platform="ios",
     )
     assert late_accept == {
         "success": False,
