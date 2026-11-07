@@ -25,13 +25,17 @@ class TerminalCallService:
                 terminal_category TEXT NOT NULL, terminal_platform TEXT NOT NULL
               );
               CREATE TABLE IF NOT EXISTS terminal_calls (
-                call_id TEXT PRIMARY KEY, channels TEXT NOT NULL
+                call_id TEXT PRIMARY KEY, channels TEXT NOT NULL,
+                owner_session_id TEXT
               );
               CREATE TABLE IF NOT EXISTS terminal_operations (
                 session_id TEXT NOT NULL, operation_id TEXT NOT NULL, outcome TEXT NOT NULL,
                 PRIMARY KEY (session_id, operation_id)
               );
             """)
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(terminal_calls)")}
+            if "owner_session_id" not in columns:
+                conn.execute("ALTER TABLE terminal_calls ADD COLUMN owner_session_id TEXT")
 
     @contextmanager
     def _connection(self):
@@ -59,7 +63,10 @@ class TerminalCallService:
 
     def track_call(self, *, call_id: str, enabled_channels: set[str]) -> None:
         with self._connection() as conn:
-            conn.execute("INSERT OR IGNORE INTO terminal_calls VALUES (?, ?)", (call_id, ",".join(sorted(enabled_channels))))
+            conn.execute(
+                "INSERT OR IGNORE INTO terminal_calls (call_id, channels) VALUES (?, ?)",
+                (call_id, ",".join(sorted(enabled_channels))),
+            )
 
     def read_mobile_state(self, *, call_id: str, session_id: str) -> dict[str, object]:
         session = self.session_state(session_id=session_id)
@@ -69,8 +76,12 @@ class TerminalCallService:
         if call is None:
             return self._hidden()
         state = str(call["call_state"])
+        if state == "accepted" and not self._is_owner(call_id, session_id):
+            return self._hidden()
         result: dict[str, object] = {"success": True, "call_id": call_id, "call_state": state,
                                      "can_accept": state == "ringing", "can_decline": state == "ringing"}
+        if state == "accepted":
+            result["can_write"] = True
         if "handled_on" in call:
             result["handled_on"] = call["handled_on"]
         if "terminal_platform" in call:
@@ -81,10 +92,14 @@ class TerminalCallService:
         session = self.session_state(session_id=session_id)
         if session is None or not self._eligible_for_session(call_id, session):
             return self._hidden()
+        if self._owner_is_other_mobile_session(call_id, session_id, session):
+            return self._hidden()
         replay = self._replay(session_id, operation_id)
         if replay is not None:
             return replay
         outcome = self._coordinator.accept(call_id, str(session["device_id"]), str(session["terminal_category"]), str(session["terminal_platform"]))
+        if outcome.get("success") is True:
+            self._persist_owner(call_id, session_id)
         self._save(session_id, operation_id, outcome)
         if outcome.get("success") is True:
             self._on_update({"call_id": call_id, "call_state": "accepted"})
@@ -93,6 +108,8 @@ class TerminalCallService:
     def decline(self, *, call_id: str, session_id: str, operation_id: str) -> dict[str, object]:
         session = self.session_state(session_id=session_id)
         if session is None or not self._eligible_for_session(call_id, session):
+            return self._hidden()
+        if self._owner_is_other_mobile_session(call_id, session_id, session):
             return self._hidden()
         replay = self._replay(session_id, operation_id)
         if replay is not None:
@@ -111,6 +128,41 @@ class TerminalCallService:
         with self._connection() as conn:
             row = conn.execute("SELECT channels FROM terminal_calls WHERE call_id=?", (call_id,)).fetchone()
         return row is not None and channel in str(row["channels"]).split(",")
+
+    def _is_owner(self, call_id: str, session_id: str) -> bool:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT owner_session_id FROM terminal_calls WHERE call_id=?", (call_id,)
+            ).fetchone()
+        return row is not None and row["owner_session_id"] == session_id
+
+    def _persist_owner(self, call_id: str, session_id: str) -> None:
+        with self._connection() as conn:
+            conn.execute(
+                "UPDATE terminal_calls SET owner_session_id=? "
+                "WHERE call_id=? AND owner_session_id IS NULL",
+                (session_id, call_id),
+            )
+
+    def _owner_is_other_mobile_session(
+        self, call_id: str, session_id: str, session: Mapping[str, object]
+    ) -> bool:
+        """Keep accepted iPhone calls bound to their original browser session.
+
+        The existing desktop race contract retains its coordinator-level
+        ``already_accepted`` result.  Mobile read/write surfaces, which carry
+        the browser session capability, must not disclose or transfer an
+        accepted call to a distinct browser session.
+        """
+        return (
+            session["terminal_category"] == "iphone_web"
+            and not self._is_owner(call_id, session_id)
+            and self._call_is_accepted(call_id)
+        )
+
+    def _call_is_accepted(self, call_id: str) -> bool:
+        call = self._coordinator.get_call(call_id)
+        return call is not None and call.get("call_state") == "accepted"
 
     def _replay(self, session_id: str, operation_id: str) -> dict[str, object] | None:
         import json
