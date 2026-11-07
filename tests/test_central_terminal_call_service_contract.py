@@ -85,6 +85,11 @@ def _service(
                 "terminal_category": "iphone_web",
                 "terminal_platform": "ios",
             },
+            "second-iphone-session-secret": {
+                "device_id": "opaque-mobile-device-2",
+                "terminal_category": "iphone_web",
+                "terminal_platform": "ios",
+            },
             "desktop-session-secret": {
                 "device_id": "opaque-desktop-device",
                 "terminal_category": "desktop",
@@ -247,3 +252,46 @@ def test_owner_session_and_state_update_persist_across_restart_after_accept(tmp_
     assert recovered["call_state"] == "accepted"
     assert recovered["handled_on"] == "iphone_web"
     assert recovered["terminal_platform"] == "ios"
+
+
+def test_accept_persists_non_secret_owner_session_binding_without_exposing_session_id(
+    tmp_path: Path,
+) -> None:
+    """Only the accepting authenticated session may write after restart.
+
+    SPEC §§3/8 require ownership to be tied to a session, not just an opaque
+    device string.  The binding itself is durable server state, but no agent or
+    read-only terminal representation may expose the session bearer value.
+    """
+
+    clock, updates = FakeClock(), []
+    coordinator = _coordinator(tmp_path, clock)
+    call_id = _create_call(coordinator)
+    service = _service(tmp_path, clock, coordinator, updates)
+    service.track_call(call_id=call_id, enabled_channels={"bark"})
+    owner_session = _session(service, "iphone-session-secret")
+    other_session = _session(service, "second-iphone-session-secret")
+
+    accepted = service.accept(
+        call_id=call_id, session_id=owner_session, operation_id="owner-accept"
+    )
+    assert accepted["success"] is True
+    assert "session_id" not in accepted
+    assert "owner_session_id" not in accepted
+    assert "session_id" not in coordinator.get_call(call_id)
+    assert "owner_session_id" not in coordinator.get_call(call_id)
+
+    reopened = _service(tmp_path, clock, coordinator, [])
+    owner_view = reopened.read_mobile_state(call_id=call_id, session_id=owner_session)
+    assert owner_view["can_write"] is True
+    assert "session_id" not in owner_view
+    assert "owner_session_id" not in owner_view
+
+    # A valid but distinct authenticated terminal session must neither take
+    # over the accepted call nor distinguish it from a nonexistent call.
+    denied = reopened.read_mobile_state(call_id=call_id, session_id=other_session)
+    unknown = reopened.read_mobile_state(call_id="unknown-call", session_id=other_session)
+    assert denied == unknown == {"success": False, "status": "session_not_found"}
+    assert reopened.accept(
+        call_id=call_id, session_id=other_session, operation_id="foreign-takeover"
+    ) == {"success": False, "status": "session_not_found"}
