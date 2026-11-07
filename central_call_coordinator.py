@@ -34,7 +34,9 @@ class CallCoordinator:
         notify: Notification,
         ring_timeout_seconds: float = 60,
     ) -> None:
-        self._database_path = str(database_path)
+        database_file = Path(database_path)
+        database_file.parent.mkdir(parents=True, exist_ok=True)
+        self._database_path = str(database_file)
         self._clock = clock
         self._notify = notify
         self._ring_timeout_seconds = ring_timeout_seconds
@@ -221,6 +223,8 @@ class CallCoordinator:
             result["reason"] = call["reason"]
         if call["owner_device_id"] is not None:
             result["owner_device_id"] = call["owner_device_id"]
+        if call["terminal_category"] is not None:
+            result["handled_on"] = call["terminal_category"]
         if call["terminal_platform"] is not None:
             result["terminal_platform"] = call["terminal_platform"]
         return result
