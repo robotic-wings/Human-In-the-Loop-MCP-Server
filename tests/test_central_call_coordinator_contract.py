@@ -155,7 +155,11 @@ def test_accept_before_deadline_wins_and_late_decline_cannot_cancel_it(
     call_id = created["call_id"]
     clock.advance(59.999)
 
-    accepted = coordinator.accept(call_id=call_id, device_id="iphone-1")
+    accepted = coordinator.accept(
+        call_id=call_id,
+        device_id="registered-terminal-42",
+        terminal_category="iphone_web",
+    )
     declined = coordinator.decline(call_id=call_id, device_id="desktop-1")
 
     assert accepted["status"] == "opened"
@@ -168,17 +172,48 @@ def test_accept_before_deadline_wins_and_late_decline_cannot_cancel_it(
     }
 
 
+@pytest.mark.parametrize(
+    ("device_id", "terminal_category"),
+    [
+        ("opaque-device-7", "iphone_web"),
+        ("not-a-desktop-name", "desktop"),
+    ],
+)
+def test_accept_uses_explicit_terminal_category_not_device_id_spelling(
+    coordinator: CallCoordinator, device_id: str, terminal_category: str
+) -> None:
+    call_id = create(coordinator)["call_id"]
+
+    accepted = coordinator.accept(
+        call_id=call_id,
+        device_id=device_id,
+        terminal_category=terminal_category,
+    )
+
+    assert accepted["status"] == "opened"
+    assert accepted["handled_on"] == terminal_category
+    assert coordinator.get_call(call_id)["owner_device_id"] == device_id
+
+
 def test_duplicate_accept_replays_saved_outcome_without_changing_owner(
     coordinator: CallCoordinator,
 ) -> None:
     call_id = create(coordinator)["call_id"]
 
-    accepted = coordinator.accept(call_id=call_id, device_id="iphone-1")
-    replay = coordinator.accept(call_id=call_id, device_id="iphone-1")
+    accepted = coordinator.accept(
+        call_id=call_id,
+        device_id="opaque-owner-a",
+        terminal_category="iphone_web",
+    )
+    replay = coordinator.accept(
+        call_id=call_id,
+        device_id="opaque-owner-a",
+        terminal_category="iphone_web",
+    )
 
     assert replay == accepted
     assert coordinator.get_call(call_id)["call_state"] == "accepted"
-    assert coordinator.get_call(call_id)["owner_device_id"] == "iphone-1"
+    assert coordinator.get_call(call_id)["owner_device_id"] == "opaque-owner-a"
 
 
 def test_duplicate_decline_replays_saved_outcome_without_state_reversal(
@@ -231,7 +266,14 @@ def test_separate_sqlite_clients_race_accept_and_decline_with_one_winner(
 
     accept_thread = threading.Thread(
         target=race,
-        args=("accept", lambda: accept_client.accept(call_id, "iphone-1")),
+        args=(
+            "accept",
+            lambda: accept_client.accept(
+                call_id=call_id,
+                device_id="terminal-without-iphone-in-its-id",
+                terminal_category="iphone_web",
+            ),
+        ),
     )
     decline_thread = threading.Thread(
         target=race,
@@ -254,7 +296,7 @@ def test_separate_sqlite_clients_race_accept_and_decline_with_one_winner(
     terminal = creator.get_call(call_id)
     assert terminal["call_state"] in {"accepted", "declined"}
     if terminal["call_state"] == "accepted":
-        assert terminal["owner_device_id"] == "iphone-1"
+        assert terminal["owner_device_id"] == "terminal-without-iphone-in-its-id"
         assert outcomes["decline"]["status"] == "already_accepted"
     else:
         assert terminal["reason"] == "human_declined"
@@ -269,7 +311,11 @@ def test_deadline_is_strict_and_expiry_is_persisted_as_not_accepted(
     clock.advance(60)
 
     # A request path must settle expiry even if a scheduler has not run yet.
-    late_accept = coordinator.accept(call_id=call_id, device_id="iphone-1")
+    late_accept = coordinator.accept(
+        call_id=call_id,
+        device_id="opaque-late-device",
+        terminal_category="iphone_web",
+    )
     assert late_accept == {
         "success": False,
         "status": "expired",
