@@ -23,6 +23,7 @@ import ast
 import importlib
 import inspect
 import json
+import tempfile
 import threading
 from pathlib import Path
 
@@ -399,6 +400,44 @@ def test_restart_recovery_keeps_original_deadline_and_expires_without_reringing(
     }]
     assert restarted.get_call(created["call_id"])["call_state"] == "not_accepted"
     assert len(notifications) == 1
+
+
+def test_close_releases_windows_sqlite_handles_after_persisted_restart(
+    clock: FakeClock,
+) -> None:
+    """Leaving this TemporaryDirectory is the Windows handle-release assertion.
+
+    Windows cannot remove an open SQLite database file.  The reopened coordinator
+    must see the saved ringing call before both instances are closed, and then the
+    context manager must remove its database directory without ``PermissionError``.
+    """
+    notifications: list[dict[str, object]] = []
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        database_path = Path(temporary_directory) / "coordinator.sqlite3"
+        first = CallCoordinator(
+            database_path=database_path,
+            clock=clock,
+            notify=notifications.append,
+            ring_timeout_seconds=60,
+        )
+        created = create(first, request_id="windows-handle-create")
+        persisted_deadline = created["ring_deadline"]
+        first.close()
+
+        restarted = CallCoordinator(
+            database_path=database_path,
+            clock=clock,
+            notify=notifications.append,
+            ring_timeout_seconds=60,
+        )
+        assert restarted.get_call(created["call_id"])["call_state"] == "ringing"
+        replay = restarted.create_call(
+            caller_id="agent-a",
+            request_id="windows-handle-create",
+            payload={"tool": "get_text_input", "prompt": "Proceed?"},
+        )
+        assert replay["ring_deadline"] == persisted_deadline
+        restarted.close()
 
 
 def test_central_coordinator_module_has_no_tk_dependency() -> None:
