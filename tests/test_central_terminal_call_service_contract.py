@@ -247,4 +247,3 @@ def test_owner_session_and_state_update_persist_across_restart_after_accept(tmp_
     assert recovered["call_state"] == "accepted"
     assert recovered["handled_on"] == "iphone_web"
     assert recovered["terminal_platform"] == "ios"
-
