@@ -179,6 +179,8 @@ class CentralHttpApplication:
         )
         if outcome.get("status") == "busy":
             return 200, outcome
+        if outcome.get("status") == "request_conflict":
+            return 409, outcome
         call_id_value = outcome["call_id"]
         assert isinstance(call_id_value, str)
         stable_interaction_id = self._interaction_id_for(call_id_value)
