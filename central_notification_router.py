@@ -129,7 +129,17 @@ class NotificationRouter:
         decisions: dict[str, str] = {}
         for call_id in {str(row["call_id"]) for row in rows}:
             states = {entry["state"] for entry in self.delivery_states(call_id)}
-            decisions[call_id] = "unreachable" if states and states <= {"failed", "skipped"} else "ringing"
+            # A skipped record means the authoritative call already left the
+            # invitation phase (or its absolute deadline elapsed).  It is not
+            # delivery evidence and must never recategorize that call as
+            # unreachable.  Only a still-ringing call whose every channel
+            # definitely failed has that result.
+            if states and states <= {"failed"}:
+                state = self._call_state(call_id) if self._call_state else "ringing"
+                if state == "ringing":
+                    decisions[call_id] = "unreachable"
+            elif "skipped" not in states:
+                decisions[call_id] = "ringing"
         return {"call_decisions": decisions}
 
     async def _dispatch_row(self, row: dict[str, object]) -> None:
