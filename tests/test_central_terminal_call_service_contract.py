@@ -295,3 +295,44 @@ def test_accept_persists_non_secret_owner_session_binding_without_exposing_sessi
     assert reopened.accept(
         call_id=call_id, session_id=other_session, operation_id="foreign-takeover"
     ) == {"success": False, "status": "session_not_found"}
+
+
+def test_owner_binding_failure_cannot_leave_a_durably_accepted_call_after_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Accept and owner-session persistence form one durable state transition.
+
+    SPEC §§3/8 forbid a crash boundary where the coordinator records
+    ``accepted`` but the authenticated owner-session binding is missing.  The
+    private seam deliberately models a failed owner-binding write: whether the
+    implementation rolls back or orders the writes differently, a reopened
+    central service must not expose an accepted call without its owner.
+    """
+
+    clock, updates = FakeClock(), []
+    coordinator = _coordinator(tmp_path, clock)
+    call_id = _create_call(coordinator)
+    service = _service(tmp_path, clock, coordinator, updates)
+    service.track_call(call_id=call_id, enabled_channels={"bark"})
+    owner_session = _session(service, "iphone-session-secret")
+
+    def fail_owner_binding(_: str, __: str) -> None:
+        raise OSError("simulated owner-session persistence failure")
+
+    monkeypatch.setattr(service, "_persist_owner", fail_owner_binding)
+    try:
+        service.accept(
+            call_id=call_id, session_id=owner_session, operation_id="atomic-owner-accept"
+        )
+    except OSError:
+        # A failure may be surfaced, but it must not commit coordinator-only
+        # acceptance before the service can durably bind the owner session.
+        pass
+
+    reopened = _service(tmp_path, clock, coordinator, [])
+    durable_state = coordinator.get_call(call_id)
+    assert durable_state["call_state"] != "accepted"
+    assert reopened.read_mobile_state(call_id=call_id, session_id=owner_session)[
+        "call_state"
+    ] != "accepted"
+    assert updates == []
