@@ -188,16 +188,42 @@ class CallCoordinator:
     def get_call(self, call_id: str) -> dict[str, object] | None:
         with self._managed_connection() as connection:
             call = self._get_call_locked(connection, call_id)
-            if call is None:
-                return None
-            result: dict[str, object] = {"call_id": call_id, "call_state": call["call_state"]}
-            if call["reason"] is not None:
-                result["reason"] = call["reason"]
-            if call["owner_device_id"] is not None:
-                result["owner_device_id"] = call["owner_device_id"]
-            if call["terminal_platform"] is not None:
-                result["terminal_platform"] = call["terminal_platform"]
-            return result
+            return self._call_summary(call_id, call)
+
+    def get_call_for_caller(
+        self, *, caller_id: str, call_id: str
+    ) -> dict[str, object] | None:
+        """Return a call only when the authenticated caller owns it.
+
+        The HTTP boundary uses this lookup for continuation so a caller cannot
+        use a guessed call ID to distinguish another caller's call from a
+        nonexistent one.
+        """
+
+        with self._managed_connection() as connection:
+            call = connection.execute(
+                "SELECT * FROM calls WHERE call_id = ? AND caller_id = ?",
+                (call_id, caller_id),
+            ).fetchone()
+            return self._call_summary(call_id, call)
+
+    @staticmethod
+    def _call_summary(
+        call_id: str, call: sqlite3.Row | None
+    ) -> dict[str, object] | None:
+        if call is None:
+            return None
+        result: dict[str, object] = {
+            "call_id": call_id,
+            "call_state": call["call_state"],
+        }
+        if call["reason"] is not None:
+            result["reason"] = call["reason"]
+        if call["owner_device_id"] is not None:
+            result["owner_device_id"] = call["owner_device_id"]
+        if call["terminal_platform"] is not None:
+            result["terminal_platform"] = call["terminal_platform"]
+        return result
 
     def _initialize_schema(self) -> None:
         with self._schema_lock, self._managed_connection() as connection:

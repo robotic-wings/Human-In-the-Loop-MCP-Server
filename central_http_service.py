@@ -125,15 +125,15 @@ class CentralHttpApplication:
             )
             return
 
-        response = self._dispatch(caller_id, payload)
+        status, response = self._dispatch(caller_id, payload)
         await send(
             {
                 "type": "http.response.start",
-                "status": 200,
+                "status": status,
                 "headers": [(b"content-type", b"application/json; charset=utf-8")],
             }
         )
-        if response.get("needs_continuation"):
+        if status == 200 and response.get("needs_continuation"):
             await self._wait(self._wait_leg_seconds(float(timeout)))
         await send(
             {
@@ -143,34 +143,56 @@ class CentralHttpApplication:
             }
         )
 
-    def _dispatch(self, caller_id: str, request: Mapping[str, object]) -> dict[str, object]:
+    def _dispatch(
+        self, caller_id: str, request: Mapping[str, object]
+    ) -> tuple[int, dict[str, object]]:
         request_id = request.get("request_id")
         if not isinstance(request_id, str) or not request_id:
-            return {"success": False, "status": "invalid_request", "needs_continuation": False}
+            return 400, {
+                "success": False,
+                "status": "invalid_request",
+                "needs_continuation": False,
+            }
         interaction_id = request.get("interaction_id")
         call_id = request.get("call_id")
         if interaction_id is not None or call_id is not None:
             if not isinstance(interaction_id, str) or not isinstance(call_id, str):
-                return {"success": False, "status": "missing_call_id", "needs_continuation": False}
-            call = self._coordinator.get_call(call_id)
+                return 400, self._hidden_continuation_error("missing_interaction_id")
+            call = self._coordinator.get_call_for_caller(
+                caller_id=caller_id, call_id=call_id
+            )
             if call is None:
-                return {"success": False, "status": "session_not_found", "needs_continuation": False}
-            return self._heartbeat(interaction_id, call_id, call)
+                return 404, self._hidden_continuation_error("session_not_found")
+            if interaction_id != self._interaction_id_for(call_id):
+                return 400, self._hidden_continuation_error("mismatched_interaction_id")
+            return 200, self._heartbeat(interaction_id, call_id, call)
 
         body = request.get("payload")
         if not isinstance(body, Mapping):
-            return {"success": False, "status": "invalid_request", "needs_continuation": False}
+            return 400, {
+                "success": False,
+                "status": "invalid_request",
+                "needs_continuation": False,
+            }
         outcome = self._coordinator.create_call(
             caller_id=caller_id, request_id=request_id, payload=body
         )
         if outcome.get("status") == "busy":
-            return outcome
+            return 200, outcome
         call_id_value = outcome["call_id"]
         assert isinstance(call_id_value, str)
-        stable_interaction_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"hitl:{call_id_value}"))
-        return self._heartbeat(
+        stable_interaction_id = self._interaction_id_for(call_id_value)
+        return 200, self._heartbeat(
             stable_interaction_id, call_id_value, outcome, caller_id=caller_id
         )
+
+    @staticmethod
+    def _interaction_id_for(call_id: str) -> str:
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"hitl:{call_id}"))
+
+    @staticmethod
+    def _hidden_continuation_error(status: str) -> dict[str, object]:
+        return {"success": False, "status": status, "needs_continuation": False}
 
     @staticmethod
     def _heartbeat(
