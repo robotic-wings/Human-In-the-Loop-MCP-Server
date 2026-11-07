@@ -244,6 +244,66 @@ def test_mcp_ingress_replays_request_and_returns_busy_without_queueing(tmp_path:
     assert len(notifications) == 1
 
 
+def test_same_authenticated_request_id_replays_canonical_payload_or_returns_conflict(
+    tmp_path: Path,
+) -> None:
+    """SPEC §7.1: replay is canonical, while a changed operation never crashes."""
+
+    clock = FakeClock()
+    notifications: list[dict[str, object]] = []
+    waiter = RecordingWait(clock)
+    app = make_app(tmp_path, clock, notifications, waiter)
+    original_payload = {
+        "tool": "get_text_input",
+        "prompt": "Proceed?",
+        "constraints": {"required": True, "max_length": 40},
+    }
+    canonical_equivalent_payload = {
+        "constraints": {"max_length": 40, "required": True},
+        "prompt": "Proceed?",
+        "tool": "get_text_input",
+    }
+    first = post(
+        app,
+        {
+            "request_id": "same-operation",
+            "payload": original_payload,
+            "client_timeout_seconds": 4,
+        },
+    )
+    replay = post(
+        app,
+        {
+            "request_id": "same-operation",
+            "payload": canonical_equivalent_payload,
+            "client_timeout_seconds": 4,
+        },
+    )
+    notification_count, wait_count = len(notifications), len(waiter.seconds)
+
+    conflict = post(
+        app,
+        {
+            "request_id": "same-operation",
+            "payload": {**canonical_equivalent_payload, "prompt": "Different"},
+            "client_timeout_seconds": 4,
+        },
+    )
+
+    assert first.status_code == 200
+    assert replay.status_code == 200
+    assert replay.json() == first.json()
+    assert notification_count == 1
+    assert conflict.status_code == 409
+    assert conflict.json() == {
+        "success": False,
+        "status": "request_conflict",
+        "needs_continuation": False,
+    }
+    assert len(notifications) == notification_count
+    assert len(waiter.seconds) == wait_count
+
+
 @pytest.mark.parametrize("token", [None, "wrong-token"])
 def test_mcp_rejects_missing_or_invalid_agent_credential_before_notification(
     tmp_path: Path, token: str | None
