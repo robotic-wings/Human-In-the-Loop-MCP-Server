@@ -5,24 +5,27 @@ public boundary so an implementation can be exercised without a GUI, a real
 network listener, or a production deployment:
 
 * ``CentralServiceConfig.from_mapping(mapping)`` validates the portable
-  ``listen_host``, ``listen_port``, ``web_base_url`` and ``data_dir`` values.
+  ``listen_host``, ``listen_port``, ``web_base_url``, ``data_dir``, agent
+  credential mapping, and TLS certificate/key *references*. This test does
+  not load a real certificate or start TLS.
 * ``create_app(config, *, clock, notify, wait)`` returns an ASGI application.
   ``notify`` is the outbound notification seam; ``wait(seconds)`` is an async
   clock/test seam used only to make the MCP wait-leg observable without a
   wall-clock sleep.
-* ``POST /mcp`` accepts the deliberately minimal JSON ingress used in this
-  slice: ``caller_id``, ``request_id``, ``payload`` and
-  ``client_timeout_seconds``.  A continuation additionally supplies
-  ``interaction_id`` and ``call_id``.  This is an adapter contract, not a
+* ``POST /mcp`` accepts a Bearer credential plus the deliberately minimal JSON
+  ingress used in this slice: ``request_id``, ``payload`` and
+  ``client_timeout_seconds``. The credential mapping, not a body value,
+  determines ``caller_id``. A continuation additionally supplies
+  ``interaction_id`` and ``call_id``. This is an adapter contract, not a
   claim that the final MCP wire representation is complete.
 * ``main(argv)`` starts only the central HTTP entry and rejects legacy
   ``--stdio`` and ``--local`` options explicitly.
 
 The bounded tests below cover only SPEC §§2.1, 2.4, 6.1, 7, 7.1 and 10.3:
-configuration, central ingress, coordinator replay/busy delegation, response
-headers and wait-leg calculation, restart replay, and old-entry rejection.
-They do not claim authentication, HTTPS, Bark, desktop/mobile UX, attachments,
-or full MCP protocol compliance.
+configuration, credential-derived central ingress, coordinator replay/busy
+delegation, streamed response headers and wait-leg calculation, restart replay,
+and old-entry rejection. They do not claim production credential storage, real
+TLS deployment, Bark, desktop/mobile UX, attachments, or full MCP compliance.
 """
 
 from __future__ import annotations
@@ -66,12 +69,31 @@ class RecordingWait:
         self.clock.advance(seconds)
 
 
+class HeaderGateWait:
+    """Keep a wait leg pending until the ASGI response-start event is sent."""
+
+    def __init__(self) -> None:
+        self.seconds: list[float] = []
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.completed_at: float | None = None
+
+    async def __call__(self, seconds: float) -> None:
+        self.seconds.append(seconds)
+        self.entered.set()
+        await self.release.wait()
+        self.completed_at = time.monotonic()
+
+
 def config_mapping(tmp_path: Path, **overrides: object) -> dict[str, object]:
     config: dict[str, object] = {
         "listen_host": "127.0.0.1",
         "listen_port": 8765,
         "web_base_url": "https://10.0.0.1:8765",
         "data_dir": str(tmp_path / "central-data"),
+        "agent_credentials": {"agent-a": "token-a", "agent-b": "token-b"},
+        "tls_cert_file": "test-cert-reference.pem",
+        "tls_key_file": "test-key-reference.pem",
     }
     config.update(overrides)
     return config
@@ -93,11 +115,18 @@ def make_app(
     )
 
 
-def post(app: Any, payload: dict[str, object]) -> httpx.Response:
+def post(
+    app: Any, payload: dict[str, object], bearer_token: str | None = "token-a"
+) -> httpx.Response:
     async def request() -> httpx.Response:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-            return await client.post("/mcp", json=payload)
+            headers = (
+                {"Authorization": f"Bearer {bearer_token}"}
+                if bearer_token is not None
+                else {}
+            )
+            return await client.post("/mcp", json=payload, headers=headers)
 
     return asyncio.run(request())
 
@@ -117,6 +146,9 @@ def test_legacy_coordinator_control_remains_gui_free(tmp_path: Path) -> None:
         ({"listen_port": 0}, "listen_port"),
         ({"web_base_url": "not-a-url"}, "web_base_url"),
         ({"data_dir": ""}, "data_dir"),
+        ({"agent_credentials": {}}, "agent_credentials"),
+        ({"tls_cert_file": ""}, "tls_cert_file"),
+        ({"tls_key_file": ""}, "tls_key_file"),
     ],
 )
 def test_config_rejects_missing_or_invalid_environment_neutral_values(
@@ -125,6 +157,16 @@ def test_config_rejects_missing_or_invalid_environment_neutral_values(
     adapter = _adapter()
     with pytest.raises(ValueError, match=field):
         adapter.CentralServiceConfig.from_mapping(config_mapping(tmp_path, **override))
+
+
+def test_config_rejects_an_existing_file_as_data_directory(tmp_path: Path) -> None:
+    adapter = _adapter()
+    data_file = tmp_path / "not-a-directory"
+    data_file.write_text("not a directory", encoding="utf-8")
+    with pytest.raises(ValueError, match="data_dir"):
+        adapter.CentralServiceConfig.from_mapping(
+            config_mapping(tmp_path, data_dir=str(data_file))
+        )
 
 
 def test_adapter_source_has_no_gui_or_legacy_server_dependency() -> None:
@@ -142,7 +184,6 @@ def test_invalid_timeout_is_rejected_before_notification(tmp_path: Path) -> None
     response = post(
         make_app(tmp_path, clock, notifications, waiter),
         {
-            "caller_id": "agent-a",
             "request_id": "bad-timeout",
             "payload": {"tool": "get_text_input", "prompt": "Proceed?"},
             "client_timeout_seconds": 1,
@@ -161,28 +202,30 @@ def test_mcp_ingress_replays_request_and_returns_busy_without_queueing(tmp_path:
     waiter = RecordingWait(clock)
     app = make_app(tmp_path, clock, notifications, waiter)
     initial = {
-        "caller_id": "agent-a",
+        "caller_id": "spoofed-body-identity",
         "request_id": "call-1",
         "payload": {"tool": "get_text_input", "prompt": "Proceed?"},
         "client_timeout_seconds": 2,
     }
 
     first = post(app, initial)
-    replay = post(app, initial)
+    replay = post(app, {**initial, "caller_id": "another-spoofed-body-value"})
     busy = post(
         app,
         {
             **initial,
-            "caller_id": "agent-b",
+            "caller_id": "agent-a",
             "request_id": "call-2",
             "payload": {"tool": "get_confirmation", "prompt": "Busy?"},
         },
+        bearer_token="token-b",
     )
 
     assert first.status_code == 200
     assert replay.json() == first.json()
     assert first.json()["status"] == "heartbeat"
     assert first.json()["call_state"] == "ringing"
+    assert first.json()["caller_id"] == "agent-a"
     assert busy.status_code == 200
     assert busy.json() == {
         "success": True,
@@ -196,31 +239,97 @@ def test_mcp_ingress_replays_request_and_returns_busy_without_queueing(tmp_path:
     assert len(notifications) == 1
 
 
-def test_response_headers_arrive_within_one_second_and_wait_leg_is_safe(
-    tmp_path: Path,
+@pytest.mark.parametrize("token", [None, "wrong-token"])
+def test_mcp_rejects_missing_or_invalid_agent_credential_before_notification(
+    tmp_path: Path, token: str | None
 ) -> None:
     clock = FakeClock()
     notifications: list[dict[str, object]] = []
     waiter = RecordingWait(clock)
-    app = make_app(tmp_path, clock, notifications, waiter)
-    started = time.monotonic()
     response = post(
-        app,
+        make_app(tmp_path, clock, notifications, waiter),
         {
-            "caller_id": "agent-a",
-            "request_id": "call-1",
+            "caller_id": "spoofed-agent-a",
+            "request_id": "unauthorized",
             "payload": {"tool": "get_text_input", "prompt": "Proceed?"},
-            "client_timeout_seconds": 8,
+            "client_timeout_seconds": 2,
         },
+        bearer_token=token,
     )
-    elapsed = time.monotonic() - started
+    assert response.status_code == 401
+    assert notifications == []
+    assert waiter.seconds == []
 
-    assert response.status_code == 200
-    assert elapsed < 1
-    assert waiter.seconds == [6]
-    assert response.json()["status"] == "heartbeat"
-    assert response.json()["needs_continuation"] is True
-    assert response.json()["interaction_id"] == response.json()["call_id"]
+
+def test_response_headers_arrive_within_one_second_and_wait_leg_is_safe(
+    tmp_path: Path,
+) -> None:
+    """Observe ``http.response.start`` separately from the delayed body leg."""
+
+    async def exercise() -> tuple[HeaderGateWait, float, list[dict[str, object]]]:
+        import json
+
+        clock = FakeClock()
+        gate = HeaderGateWait()
+        app = make_app(tmp_path, clock, [], gate)
+        body = json.dumps(
+            {
+                "request_id": "call-1",
+                "payload": {"tool": "get_text_input", "prompt": "Proceed?"},
+                "client_timeout_seconds": 8,
+            }
+        ).encode()
+        sent_request = False
+        events: list[dict[str, object]] = []
+        response_started = asyncio.Event()
+        started_at: float | None = None
+
+        async def receive() -> dict[str, object]:
+            nonlocal sent_request
+            if not sent_request:
+                sent_request = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            await asyncio.sleep(3600)
+            raise AssertionError("request body has already been delivered")
+
+        async def send(event: dict[str, object]) -> None:
+            nonlocal started_at
+            events.append(event)
+            if event["type"] == "http.response.start":
+                started_at = time.monotonic()
+                response_started.set()
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/mcp",
+            "raw_path": b"/mcp",
+            "query_string": b"",
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"authorization", b"Bearer token-a"),
+            ],
+            "client": ("127.0.0.1", 12345),
+            "server": ("testserver", 80),
+        }
+        launch = time.monotonic()
+        task = asyncio.create_task(app(scope, receive, send))
+        await asyncio.wait_for(gate.entered.wait(), timeout=1)
+        await asyncio.wait_for(response_started.wait(), timeout=1)
+        assert started_at is not None
+        assert started_at - launch < 1
+        assert gate.completed_at is None
+        gate.release.set()
+        await task
+        return gate, started_at, events
+
+    gate, _, events = asyncio.run(exercise())
+    assert gate.seconds == [6]
+    assert gate.completed_at is not None
+    assert events[0]["type"] == "http.response.start"
 
 
 def test_continuation_uses_same_call_and_never_notifies_again_after_restart(
@@ -233,7 +342,6 @@ def test_continuation_uses_same_call_and_never_notifies_again_after_restart(
     initial = post(
         first_app,
         {
-            "caller_id": "agent-a",
             "request_id": "call-1",
             "payload": {"tool": "get_text_input", "prompt": "Proceed?"},
             "client_timeout_seconds": 4,
@@ -246,7 +354,6 @@ def test_continuation_uses_same_call_and_never_notifies_again_after_restart(
     continuation = post(
         restarted_app,
         {
-            "caller_id": "agent-a",
             "request_id": "continue-1",
             "interaction_id": initial["interaction_id"],
             "call_id": initial["call_id"],
@@ -256,6 +363,10 @@ def test_continuation_uses_same_call_and_never_notifies_again_after_restart(
     )
 
     assert continuation.status_code == 200
+    assert initial["interaction_id"] != initial["call_id"]
+    assert initial["interaction_id"]
+    assert initial["call_id"]
+    assert continuation.json()["interaction_id"] == initial["interaction_id"]
     assert continuation.json()["call_id"] == initial["call_id"]
     assert continuation.json()["status"] == "heartbeat"
     assert first_notifications and restarted_notifications == []
