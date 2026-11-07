@@ -97,7 +97,7 @@ class CallCoordinator:
         call_id: str,
         device_id: str,
         terminal_category: str,
-        terminal_platform: str | None = None,
+        terminal_platform: str,
     ) -> dict[str, object]:
         """Accept a ringing call for an explicitly identified terminal type.
 
