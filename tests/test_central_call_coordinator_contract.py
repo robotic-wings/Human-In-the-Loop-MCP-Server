@@ -5,6 +5,12 @@ tests define the small, persistent coordinator API that will replace no part of 
 legacy GUI yet: ``central_call_coordinator.CallCoordinator`` with ``create_call``,
 ``accept``, ``decline`` and ``expire_due``.  Returned values are mappings so the
 HTTP/MCP layers can later serialise them without leaking ORM objects.
+
+The request payload boundary is a JSON-like mapping.  Its canonical comparison
+representation is UTF-8 JSON with sorted object keys and compact separators
+(``json.dumps(payload, sort_keys=True, separators=(",", ":"),
+ensure_ascii=False)``). Object insertion order is therefore not significant;
+values, arrays, and types remain significant.
 """
 
 from __future__ import annotations
@@ -12,6 +18,8 @@ from __future__ import annotations
 import ast
 import importlib
 import inspect
+import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -80,9 +88,34 @@ def test_creating_call_persists_one_absolute_deadline_and_dispatches_once(
 def test_same_request_id_with_different_normalized_payload_is_a_conflict(
     coordinator: CallCoordinator,
 ) -> None:
-    create(coordinator)
+    first_payload = {
+        "tool": "get_text_input",
+        "prompt": "Proceed?",
+        "constraints": {"required": True, "max_length": 40},
+    }
+    # Deliberately different construction/insertion order, same canonical JSON.
+    same_canonical_payload = {
+        "constraints": {"max_length": 40, "required": True},
+        "prompt": "Proceed?",
+        "tool": "get_text_input",
+    }
+    assert list(first_payload) != list(same_canonical_payload)
+    assert json.dumps(first_payload, sort_keys=True, separators=(",", ":")) == json.dumps(
+        same_canonical_payload, sort_keys=True, separators=(",", ":")
+    )
+    first = coordinator.create_call(
+        caller_id="agent-a", request_id="create-1", payload=first_payload
+    )
+    replay = coordinator.create_call(
+        caller_id="agent-a", request_id="create-1", payload=same_canonical_payload
+    )
+    assert replay == first
 
-    conflict = create(coordinator, prompt="A different question")
+    conflict = coordinator.create_call(
+        caller_id="agent-a",
+        request_id="create-1",
+        payload={**same_canonical_payload, "prompt": "A different question"},
+    )
 
     assert conflict == {
         "success": False,
@@ -133,6 +166,99 @@ def test_accept_before_deadline_wins_and_late_decline_cannot_cancel_it(
         "status": "already_accepted",
         "call_state": "accepted",
     }
+
+
+def test_duplicate_accept_replays_saved_outcome_without_changing_owner(
+    coordinator: CallCoordinator,
+) -> None:
+    call_id = create(coordinator)["call_id"]
+
+    accepted = coordinator.accept(call_id=call_id, device_id="iphone-1")
+    replay = coordinator.accept(call_id=call_id, device_id="iphone-1")
+
+    assert replay == accepted
+    assert coordinator.get_call(call_id)["call_state"] == "accepted"
+    assert coordinator.get_call(call_id)["owner_device_id"] == "iphone-1"
+
+
+def test_duplicate_decline_replays_saved_outcome_without_state_reversal(
+    coordinator: CallCoordinator,
+) -> None:
+    call_id = create(coordinator)["call_id"]
+
+    declined = coordinator.decline(call_id=call_id, device_id="desktop-1")
+    replay = coordinator.decline(call_id=call_id, device_id="desktop-1")
+
+    assert replay == declined
+    assert coordinator.get_call(call_id) == {
+        "call_id": call_id,
+        "call_state": "declined",
+        "reason": "human_declined",
+    }
+
+
+def test_separate_sqlite_clients_race_accept_and_decline_with_one_winner(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    """The database transaction, not local process state, decides the winner."""
+    database_path = tmp_path / "calls.sqlite3"
+    notifications: list[dict[str, object]] = []
+    creator = CallCoordinator(
+        database_path=database_path,
+        clock=clock,
+        notify=notifications.append,
+        ring_timeout_seconds=60,
+    )
+    call_id = create(creator)["call_id"]
+    accept_client = CallCoordinator(
+        database_path=database_path,
+        clock=clock,
+        notify=lambda _event: None,
+        ring_timeout_seconds=60,
+    )
+    decline_client = CallCoordinator(
+        database_path=database_path,
+        clock=clock,
+        notify=lambda _event: None,
+        ring_timeout_seconds=60,
+    )
+    barrier = threading.Barrier(3)
+    outcomes: dict[str, dict[str, object]] = {}
+
+    def race(name: str, operation) -> None:
+        barrier.wait()
+        outcomes[name] = operation()
+
+    accept_thread = threading.Thread(
+        target=race,
+        args=("accept", lambda: accept_client.accept(call_id, "iphone-1")),
+    )
+    decline_thread = threading.Thread(
+        target=race,
+        args=("decline", lambda: decline_client.decline(call_id, "desktop-1")),
+    )
+    accept_thread.start()
+    decline_thread.start()
+    barrier.wait()
+    accept_thread.join(timeout=5)
+    decline_thread.join(timeout=5)
+
+    assert not accept_thread.is_alive()
+    assert not decline_thread.is_alive()
+    winners = [
+        outcome
+        for outcome in outcomes.values()
+        if outcome["status"] in {"opened", "declined"}
+    ]
+    assert len(winners) == 1
+    terminal = creator.get_call(call_id)
+    assert terminal["call_state"] in {"accepted", "declined"}
+    if terminal["call_state"] == "accepted":
+        assert terminal["owner_device_id"] == "iphone-1"
+        assert outcomes["decline"]["status"] == "already_accepted"
+    else:
+        assert terminal["reason"] == "human_declined"
+        assert outcomes["accept"]["status"] == "already_declined"
 
 
 def test_deadline_is_strict_and_expiry_is_persisted_as_not_accepted(
