@@ -186,7 +186,7 @@ class CallCoordinator:
             return self._expire_due_locked(connection, self._clock())
 
     def get_call(self, call_id: str) -> dict[str, object] | None:
-        with self._connection() as connection:
+        with self._managed_connection() as connection:
             call = self._get_call_locked(connection, call_id)
             if call is None:
                 return None
@@ -200,7 +200,7 @@ class CallCoordinator:
             return result
 
     def _initialize_schema(self) -> None:
-        with self._schema_lock, self._connection() as connection:
+        with self._schema_lock, self._managed_connection() as connection:
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS calls (
@@ -240,6 +240,22 @@ class CallCoordinator:
         connection.execute("PRAGMA busy_timeout = 5000")
         connection.execute("PRAGMA journal_mode = WAL")
         return connection
+
+    @contextmanager
+    def _managed_connection(self):
+        """Close read/schema connections as well as transactional connections.
+
+        ``sqlite3.Connection``'s context manager commits or rolls back, but does
+        not close the underlying handle.  Explicit closure matters on Windows,
+        where an open handle prevents a temporary coordinator database from
+        being removed after ``close()`` and restart verification.
+        """
+
+        connection = self._connection()
+        try:
+            yield connection
+        finally:
+            connection.close()
 
     @contextmanager
     def _transaction(self):
