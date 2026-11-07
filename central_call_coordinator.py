@@ -100,6 +100,7 @@ class CallCoordinator:
         device_id: str,
         terminal_category: str,
         terminal_platform: str,
+        owner_session_id: str | None = None,
     ) -> dict[str, object]:
         """Accept a ringing call for an explicitly identified terminal type.
 
@@ -136,10 +137,11 @@ class CallCoordinator:
             }
             connection.execute(
                 "UPDATE calls SET call_state = 'accepted', owner_device_id = ?, "
-                "terminal_category = ?, terminal_platform = ?, accept_outcome_json = ? "
+                "owner_session_id = ?, terminal_category = ?, terminal_platform = ?, accept_outcome_json = ? "
                 "WHERE call_id = ?",
                 (
                     device_id,
+                    owner_session_id,
                     terminal_category,
                     terminal_platform,
                     self._dump_json(outcome),
@@ -147,6 +149,13 @@ class CallCoordinator:
                 ),
             )
             return outcome
+
+    def owner_session_matches(self, *, call_id: str, session_id: str) -> bool:
+        """Check the private terminal-session owner binding without exporting it."""
+
+        with self._managed_connection() as connection:
+            call = self._get_call_locked(connection, call_id)
+            return call is not None and call["owner_session_id"] == session_id
 
     def decline(self, call_id: str, device_id: str) -> dict[str, object]:
         del device_id  # Ownership is relevant after acceptance, not to a ringing decline.
@@ -239,6 +248,7 @@ class CallCoordinator:
                     call_state TEXT NOT NULL,
                     ring_deadline REAL NOT NULL,
                     owner_device_id TEXT,
+                    owner_session_id TEXT,
                     terminal_category TEXT,
                     terminal_platform TEXT,
                     reason TEXT,
@@ -260,7 +270,7 @@ class CallCoordinator:
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(calls)").fetchall()
             }
-            for column in ("terminal_category", "terminal_platform"):
+            for column in ("terminal_category", "terminal_platform", "owner_session_id"):
                 if column not in columns:
                     connection.execute(f"ALTER TABLE calls ADD COLUMN {column} TEXT")
 
