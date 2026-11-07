@@ -26,6 +26,11 @@ configuration, credential-derived central ingress, coordinator replay/busy
 delegation, streamed response headers and wait-leg calculation, restart replay,
 and old-entry rejection. They do not claim production credential storage, real
 TLS deployment, Bark, desktop/mobile UX, attachments, or full MCP compliance.
+
+Continuation authorization additionally covers SPEC §§7.1 and 9.3: both IDs
+must identify the same call owned by the credential-derived caller. An invalid
+pair is a non-success, non-disclosing error; it must not reveal call state,
+results, or identifiers, emit a notification, or begin a wait leg.
 """
 
 from __future__ import annotations
@@ -371,6 +376,115 @@ def test_continuation_uses_same_call_and_never_notifies_again_after_restart(
     assert continuation.json()["status"] == "heartbeat"
     assert first_notifications and restarted_notifications == []
     assert restarted_waiter.seconds == [3]
+
+
+def assert_hidden_continuation_error(response: httpx.Response) -> None:
+    """Bound an invalid continuation to a non-success, non-disclosing result."""
+
+    assert response.status_code in {400, 404}
+    body = response.json()
+    assert body["success"] is False
+    assert body["status"] in {
+        "session_not_found",
+        "missing_interaction_id",
+        "mismatched_interaction_id",
+    }
+    for key in ("interaction_id", "call_id", "call_state", "result_id"):
+        assert body.get(key) is None
+
+
+def start_call(
+    app: Any, request_id: str, *, bearer_token: str = "token-a"
+) -> dict[str, object]:
+    response = post(
+        app,
+        {
+            "request_id": request_id,
+            "payload": {"tool": "get_text_input", "prompt": request_id},
+            "client_timeout_seconds": 4,
+        },
+        bearer_token=bearer_token,
+    )
+    assert response.status_code == 200
+    return response.json()
+
+
+def test_other_agent_cannot_continue_a_genuine_call_or_learn_its_identifiers(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    notifications: list[dict[str, object]] = []
+    waiter = RecordingWait(clock)
+    app = make_app(tmp_path, clock, notifications, waiter)
+    initial = start_call(app, "call-1")
+    notification_count, wait_count = len(notifications), len(waiter.seconds)
+
+    response = post(
+        app,
+        {
+            "request_id": "continue-by-other-agent",
+            "interaction_id": initial["interaction_id"],
+            "call_id": initial["call_id"],
+            "after_event_seq": 0,
+            "client_timeout_seconds": 4,
+        },
+        bearer_token="token-b",
+    )
+
+    assert_hidden_continuation_error(response)
+    assert len(notifications) == notification_count
+    assert len(waiter.seconds) == wait_count
+
+
+def test_owner_cannot_continue_with_an_arbitrary_interaction_id(tmp_path: Path) -> None:
+    clock = FakeClock()
+    notifications: list[dict[str, object]] = []
+    waiter = RecordingWait(clock)
+    app = make_app(tmp_path, clock, notifications, waiter)
+    initial = start_call(app, "call-1")
+    notification_count, wait_count = len(notifications), len(waiter.seconds)
+
+    response = post(
+        app,
+        {
+            "request_id": "bad-interaction-id",
+            "interaction_id": "not-the-created-interaction",
+            "call_id": initial["call_id"],
+            "after_event_seq": 0,
+            "client_timeout_seconds": 4,
+        },
+    )
+
+    assert_hidden_continuation_error(response)
+    assert len(notifications) == notification_count
+    assert len(waiter.seconds) == wait_count
+
+
+def test_owner_cannot_mix_interaction_and_call_ids_from_two_calls(tmp_path: Path) -> None:
+    clock = FakeClock()
+    notifications: list[dict[str, object]] = []
+    waiter = RecordingWait(clock)
+    app = make_app(tmp_path, clock, notifications, waiter)
+    first = start_call(app, "call-1")
+    clock.advance(60)
+    second = start_call(app, "call-2")
+    notification_count, wait_count = len(notifications), len(waiter.seconds)
+
+    response = post(
+        app,
+        {
+            "request_id": "mixed-pair",
+            "interaction_id": first["interaction_id"],
+            "call_id": second["call_id"],
+            "after_event_seq": 0,
+            "client_timeout_seconds": 4,
+        },
+    )
+
+    assert first["interaction_id"] != second["interaction_id"]
+    assert_hidden_continuation_error(response)
+    assert len(notifications) == notification_count
+    assert len(waiter.seconds) == wait_count
 
 
 @pytest.mark.parametrize("legacy_option", ["--stdio", "--local"])
