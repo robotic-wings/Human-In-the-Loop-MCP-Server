@@ -68,6 +68,7 @@ def _router(
     desktop_dispatch,
     bark_dispatch,
     route_mode: str = "both",
+    call_state=None,
 ):
     return _routing_module().NotificationRouter(
         database_path=tmp_path / "routing.sqlite3",
@@ -78,6 +79,7 @@ def _router(
         route_mode=route_mode,
         desktop_timeout_seconds=2.5,
         bark_timeout_seconds=2.5,
+        call_state=call_state,
     )
 
 
@@ -344,3 +346,83 @@ def test_restart_preserves_outbox_and_never_blindly_resends_uncertain_transport(
     asyncio.run(reopened.dispatch_pending())
     assert calls == ["restart"]
     assert reopened.delivery_states("restart")[0]["state"] == "uncertain"
+
+
+def test_route_snapshot_is_persisted_at_enqueue_and_later_settings_only_affect_new_calls(
+    tmp_path: Path,
+) -> None:
+    """SPEC 10.2: routing changes are prospective, including after restart."""
+
+    clock = FakeClock()
+    sent: list[str] = []
+
+    async def desktop(_: dict[str, object]) -> dict[str, object]:
+        sent.append("desktop")
+        return {"accepted": True}
+
+    async def bark(_: dict[str, object]) -> dict[str, object]:
+        sent.append("bark")
+        return {"http_status": 200, "business_success": True}
+
+    registry = _registry(tmp_path, clock)
+    first_settings = _router(
+        tmp_path,
+        clock,
+        registry,
+        desktop_dispatch=desktop,
+        bark_dispatch=bark,
+        route_mode="desktop",
+    )
+    first_settings.enqueue(_event("old-call"))
+    assert [row["channel"] for row in first_settings.delivery_states("old-call")] == ["desktop"]
+
+    # A reopened service with changed settings must consume the durable original
+    # route rather than recalculate it as iphone/Bark.
+    changed_settings = _router(
+        tmp_path,
+        clock,
+        _registry(tmp_path, clock),
+        desktop_dispatch=desktop,
+        bark_dispatch=bark,
+        route_mode="iphone",
+    )
+    asyncio.run(changed_settings.dispatch_pending())
+    assert sent == ["desktop"]
+    assert [row["channel"] for row in changed_settings.delivery_states("old-call")] == ["desktop"]
+
+    changed_settings.enqueue(_event("new-call"))
+    assert [row["channel"] for row in changed_settings.delivery_states("new-call")] == ["bark"]
+
+
+@pytest.mark.parametrize("ended_state", ["accepted", "declined", "not_accepted", "answered"])
+def test_authoritative_call_state_prevents_late_dispatch_after_state_changes(
+    tmp_path: Path, ended_state: str
+) -> None:
+    """SPEC §§3/5.1: router state is not authoritative; recheck central call state."""
+
+    clock = FakeClock()
+    calls: list[str] = []
+
+    async def desktop(_: dict[str, object]) -> dict[str, object]:
+        calls.append("desktop")
+        return {"accepted": True}
+
+    async def bark(_: dict[str, object]) -> dict[str, object]:
+        calls.append("bark")
+        return {"http_status": 200, "business_success": True}
+
+    authoritative_state = {"call-after-transition": "ringing"}
+    router = _router(
+        tmp_path,
+        clock,
+        _registry(tmp_path, clock),
+        desktop_dispatch=desktop,
+        bark_dispatch=bark,
+        call_state=lambda call_id: authoritative_state.get(call_id),
+    )
+    router.enqueue(_event("call-after-transition", clock() + 60))
+    authoritative_state["call-after-transition"] = ended_state
+
+    asyncio.run(router.dispatch_pending())
+    assert calls == []
+    assert {row["state"] for row in router.delivery_states("call-after-transition")} == {"skipped"}
