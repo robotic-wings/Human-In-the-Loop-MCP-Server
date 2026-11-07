@@ -307,9 +307,10 @@ def test_stale_desktop_readiness_gets_one_bounded_attempt_and_send_rechecks_call
     assert len(attempted) == 1
 
     router.enqueue(_event("expired", clock()))
-    asyncio.run(router.dispatch_pending())
+    result = asyncio.run(router.dispatch_pending())
     assert len(attempted) == 1
     assert router.delivery_states("expired")[0]["state"] == "skipped"
+    assert result["call_decisions"].get("expired") != "unreachable"
 
 
 def test_restart_preserves_outbox_and_never_blindly_resends_uncertain_transport(
@@ -423,6 +424,9 @@ def test_authoritative_call_state_prevents_late_dispatch_after_state_changes(
     router.enqueue(_event("call-after-transition", clock() + 60))
     authoritative_state["call-after-transition"] = ended_state
 
-    asyncio.run(router.dispatch_pending())
+    result = asyncio.run(router.dispatch_pending())
     assert calls == []
     assert {row["state"] for row in router.delivery_states("call-after-transition")} == {"skipped"}
+    # A non-ringing central state means the notification is stale.  It is not
+    # evidence that every delivery channel is unreachable.
+    assert result["call_decisions"].get("call-after-transition") != "unreachable"
