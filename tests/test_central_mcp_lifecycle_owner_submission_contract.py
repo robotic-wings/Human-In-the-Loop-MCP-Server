@@ -55,10 +55,6 @@ def components(tmp_path: Path, *, clock: Clock | None = None, route_mode: str = 
         actor_role="management", device_id="desktop-owner",
         endpoint="https://desktop.test/events", callback_credential="callback-secret", gui_ready=False,
     )
-    registry.register_desktop(
-        actor_role="management", device_id="desktop-other",
-        endpoint="https://desktop-other.test/events", callback_credential="other-callback-secret", gui_ready=False,
-    )
     registration = DesktopRegistrationStateService(
         registry=registry, clock=clock,
         registered_credentials={
@@ -114,18 +110,33 @@ def create(app: Any, request_id: str = "create") -> dict[str, object]:
 
 
 def terminal_session(app: Any, credential: str = "desktop-secret") -> str:
+    endpoint = (
+        "https://desktop-other.test/events"
+        if credential == "other-desktop-secret"
+        else "https://desktop.test/events"
+    )
     response = request(app, "POST", "/api/terminals/register", body={
-        "endpoint": "https://desktop.test/events", "gui_ready": True,
+        "endpoint": endpoint, "gui_ready": True,
     })
     if response.status_code != 201:
         async def register() -> httpx.Response:
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://central.test") as client:
                 return await client.post("/api/terminals/register", headers={"authorization": f"Terminal {credential}"}, json={
-                    "endpoint": "https://desktop.test/events", "gui_ready": True,
+                    "endpoint": endpoint, "gui_ready": True,
                 })
         response = asyncio.run(register())
     assert response.status_code == 201
     return str(response.json()["session_id"])
+
+
+def configure_foreign_desktop_after_routing(app: Any) -> None:
+    """Make a second credential valid without changing the already-routed call."""
+    registration = app._desktop_registration_service
+    assert registration is not None
+    registration._registry.register_desktop(
+        actor_role="management", device_id="desktop-other",
+        endpoint="https://desktop-other.test/events", callback_credential="other-callback-secret", gui_ready=False,
+    )
 
 
 def accept_desktop(app: Any, call: dict[str, object], session: str) -> None:
@@ -217,6 +228,9 @@ def test_browser_owner_submission_and_unauthorized_or_preaccept_attempts_are_ine
     assert submitted.json()["handled_on"] == "iphone_web"
     assert continuation(app, call, after=1)["result"] == {"user_input": "from iphone"}
 
+    # The call was already created and routed before this distinct device is
+    # configured, so it cannot displace desktop-owner as the invited device.
+    configure_foreign_desktop_after_routing(app)
     other = terminal_session(app, "other-desktop-secret")
     hidden(request(app, "POST", f"/api/calls/{call['call_id']}/submissions", terminal=other, body={
         "submission_id": "other", "result": {"user_input": "steal"},
