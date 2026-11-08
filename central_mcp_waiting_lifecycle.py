@@ -130,6 +130,11 @@ class WaitingLifecycle:
                     return self._load(event["body_json"]) if event else self._error("expired")
                 if status == "opened" and call["call_state"] != "ringing":
                     return self._error("already_accepted")
+                # A final answer cannot establish ownership by itself.  The
+                # accepted event is the durable ownership transition and must
+                # precede every terminal result.
+                if status != "opened" and call["call_state"] != "accepted":
+                    return self._error("not_accepted")
                 conn.execute("UPDATE lifecycle_calls SET call_state=?, reason=? WHERE call_id=?", (state, reason, call_id))
                 seq = int(conn.execute("SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call_id,)).fetchone()["n"])
                 body: dict[str, object] = {"success": True, "status": status, "call_state": state, "event_seq": seq,
