@@ -137,8 +137,18 @@ class WaitingLifecycle:
                 elif call["call_state"] in {"ringing", "accepted", "in_progress"}:
                     outcome = self._heartbeat(interaction_id, call_id, call["call_state"])
                 else:
-                    # A terminal state always has an event, but retain a safe fallback.
-                    outcome = self._terminal(interaction_id, call_id, call["call_state"], call["reason"], int(last))
+                    # Preserve the original immutable terminal event rather
+                    # than synthesizing a reduced fallback.  In particular,
+                    # cancellation records ``human_action:false`` and that
+                    # required control field must survive restart and later
+                    # continuation reads even after its event was confirmed.
+                    terminal = conn.execute(
+                        "SELECT body_json FROM lifecycle_events WHERE call_id=? ORDER BY event_seq DESC LIMIT 1",
+                        (call_id,),
+                    ).fetchone()
+                    outcome = self._load(terminal["body_json"]) if terminal is not None else self._terminal(
+                        interaction_id, call_id, call["call_state"], call["reason"], int(last),
+                    )
                 conn.execute(
                     "INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?, 'continuation')",
                     (caller_id, request_id, encoded, self._dump(outcome)),
