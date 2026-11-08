@@ -36,7 +36,8 @@ class WaitingLifecycle:
                 call_id TEXT PRIMARY KEY, interaction_id TEXT NOT NULL, caller_id TEXT NOT NULL,
                 call_state TEXT NOT NULL, ring_deadline REAL NOT NULL, reason TEXT,
                 owner_device_id TEXT, owner_session_id TEXT, handled_on TEXT,
-                terminal_platform TEXT, version INTEGER NOT NULL DEFAULT 1
+                terminal_platform TEXT, invited_desktop_id TEXT,
+                version INTEGER NOT NULL DEFAULT 1
               );
               CREATE TABLE IF NOT EXISTS lifecycle_requests (
                 caller_id TEXT NOT NULL, request_id TEXT NOT NULL, payload_json TEXT NOT NULL,
@@ -68,6 +69,7 @@ class WaitingLifecycle:
         for column, definition in (
             ("owner_device_id", "TEXT"), ("owner_session_id", "TEXT"),
             ("handled_on", "TEXT"), ("terminal_platform", "TEXT"),
+            ("invited_desktop_id", "TEXT"),
             ("version", "INTEGER NOT NULL DEFAULT 1"),
         ):
             if column not in columns:
@@ -76,7 +78,8 @@ class WaitingLifecycle:
         if "operation_kind" not in request_columns:
             conn.execute("ALTER TABLE lifecycle_requests ADD COLUMN operation_kind TEXT NOT NULL DEFAULT 'create'")
 
-    def create(self, caller_id: str, request_id: str, payload: Mapping[str, object]) -> dict[str, object]:
+    def create(self, caller_id: str, request_id: str, payload: Mapping[str, object],
+               invited_desktop_id: str | None = None) -> dict[str, object]:
         encoded = self._dump(payload)
         notification: dict[str, object] | None = None
         with self._connection() as conn:
@@ -96,9 +99,9 @@ class WaitingLifecycle:
                     deadline = self._clock() + self._ring_timeout
                     conn.execute(
                         "INSERT INTO lifecycle_calls "
-                        "(call_id, interaction_id, caller_id, call_state, ring_deadline, reason, agent_reconnect_deadline) "
-                        "VALUES (?, ?, ?, 'ringing', ?, NULL, NULL)",
-                        (call_id, interaction_id, caller_id, deadline),
+                        "(call_id, interaction_id, caller_id, call_state, ring_deadline, reason, agent_reconnect_deadline, invited_desktop_id) "
+                        "VALUES (?, ?, ?, 'ringing', ?, NULL, NULL, ?)",
+                        (call_id, interaction_id, caller_id, deadline, invited_desktop_id),
                     )
                     outcome = self._heartbeat(interaction_id, call_id, "ringing")
                     notification = {"call_id": call_id, "ring_deadline": deadline}
@@ -315,9 +318,9 @@ class WaitingLifecycle:
                 raise
 
     def terminal_action(self, *, call_id: str, device_id: str, session_id: str, terminal_platform: str,
-                        operation_id: str, action: str, desktop_routed: bool) -> dict[str, object]:
+                        operation_id: str, action: str) -> dict[str, object]:
         """Apply a desktop session action to the central call authority."""
-        if action not in {"accept", "decline"} or not desktop_routed:
+        if action not in {"accept", "decline"}:
             return self._error("session_not_found")
         encoded = self._dump({"call_id": call_id, "action": action})
         actor = f"terminal:{session_id}"
@@ -333,6 +336,11 @@ class WaitingLifecycle:
                 self._settle_due(conn)
                 call = conn.execute("SELECT * FROM lifecycle_calls WHERE call_id=?", (call_id,)).fetchone()
                 if call is None:
+                    return self._error("session_not_found")
+                # A desktop channel is not a transferable invitation: the
+                # selected device is persisted with the call and is the only
+                # desktop allowed to act on that call.
+                if call["invited_desktop_id"] != device_id:
                     return self._error("session_not_found")
                 if call["call_state"] != "ringing":
                     event = conn.execute("SELECT body_json FROM lifecycle_events WHERE call_id=? ORDER BY event_seq DESC LIMIT 1", (call_id,)).fetchone()
@@ -592,7 +600,7 @@ class Application:
         device_id, platform = context
         response = self.lifecycle.terminal_action(
             call_id=parts[3], device_id=device_id, session_id=session, terminal_platform=platform,
-            operation_id=operation_id, action=parts[4], desktop_routed=self._desktop_routed(parts[3]),
+            operation_id=operation_id, action=parts[4],
         )
         await self._send(send, 200 if response.get("success") else 404, response)
 
@@ -613,15 +621,17 @@ class Application:
                 return device_id, str(platform) if isinstance(platform, str) else "unknown"
         return None
 
-    def _desktop_routed(self, call_id: str) -> bool:
+    def _invited_desktop_id(self) -> str | None:
         router = self._notification_router
-        states = getattr(router, "delivery_states", None) if router is not None else None
-        if not callable(states):
-            return False
-        return any(
-            isinstance(item, Mapping) and item.get("channel") == "desktop"
-            for item in states(call_id)
-        )
+        if getattr(router, "_route_mode", None) not in {"desktop", "both"}:
+            return None
+        registry = getattr(router, "_registry", None) if router is not None else None
+        ready_desktop = getattr(registry, "ready_desktop", None)
+        if not callable(ready_desktop):
+            return None
+        terminal = ready_desktop()
+        device_id = terminal.get("device_id") if isinstance(terminal, Mapping) else None
+        return device_id if isinstance(device_id, str) else None
 
     async def _lifespan(self, receive: Any, send: Any) -> None:
         while True:
@@ -679,7 +689,8 @@ class Application:
             # slot, or disclose an active call when no human channel is
             # enabled for this new call.
             return self._error("no_enabled_channel"), False
-        return self.lifecycle.create(caller, request_id, payload), not replay
+        invited_desktop_id = self._invited_desktop_id() if not replay else None
+        return self.lifecycle.create(caller, request_id, payload, invited_desktop_id), not replay
 
     def _route_is_enabled(self) -> bool:
         """Accept only the central configuration's affirmative route result."""
