@@ -135,10 +135,13 @@ def test_preconfigured_desktop_credential_authenticates_registration_before_dura
     )
     assert accepted["success"] is True
     assert isinstance(accepted["session_id"], str)
+    # Registration gives the desktop only its opaque session.  The distinct
+    # central-to-desktop callback credential remains server-side metadata.
+    assert set(accepted) == {"success", "status", "session_id"}
     assert registry.desktop_state("desktop-61") == {
         "device_id": "desktop-61",
         "endpoint": "https://10.0.0.61:9100/terminal/events",
-        "callback_credential": accepted["callback_credential"],
+        "callback_credential": "central-callback-secret",
         "gui_ready": True,
         "fresh": True,
     }
