@@ -147,6 +147,64 @@ class WaitingLifecycle:
             finally:
                 conn.commit()
 
+    def cancel(self, caller_id: str, request_id: str, interaction_id: str, call_id: str) -> dict[str, object]:
+        """Cancel exactly one active call round for its original caller.
+
+        Cancellation is an Agent action, not a transport failure: it has an
+        immutable terminal event, releases the single busy slot, and shares
+        the caller/request-id namespace with every other MCP operation.
+        """
+        encoded = self._dump({"interaction_id": interaction_id, "call_id": call_id})
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = conn.execute(
+                    "SELECT payload_json, outcome_json, operation_kind FROM lifecycle_requests "
+                    "WHERE caller_id=? AND request_id=?",
+                    (caller_id, request_id),
+                ).fetchone()
+                if existing is not None:
+                    if existing["operation_kind"] != "cancel" or existing["payload_json"] != encoded:
+                        return self._error("request_conflict")
+                    return self._load(existing["outcome_json"])
+                self._settle_due(conn)
+                call = conn.execute(
+                    "SELECT * FROM lifecycle_calls WHERE call_id=? AND caller_id=?",
+                    (call_id, caller_id),
+                ).fetchone()
+                if call is None or call["interaction_id"] != interaction_id:
+                    return self._error("session_not_found")
+                if call["call_state"] not in {"ringing", "accepted", "in_progress"}:
+                    event = conn.execute(
+                        "SELECT body_json FROM lifecycle_events WHERE call_id=? ORDER BY event_seq DESC LIMIT 1",
+                        (call_id,),
+                    ).fetchone()
+                    outcome = self._load(event["body_json"]) if event else self._error("expired")
+                else:
+                    conn.execute(
+                        "UPDATE lifecycle_calls SET call_state='cancelled', reason='agent_cancelled' WHERE call_id=?",
+                        (call_id,),
+                    )
+                    seq = int(conn.execute(
+                        "SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?",
+                        (call_id,),
+                    ).fetchone()["n"])
+                    outcome = self._terminal(interaction_id, call_id, "cancelled", "agent_cancelled", seq)
+                    outcome["human_action"] = False
+                    conn.execute(
+                        "INSERT INTO lifecycle_events VALUES (?, ?, ?)",
+                        (call_id, seq, self._dump(outcome)),
+                    )
+                conn.execute(
+                    "INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?, 'cancel')",
+                    (caller_id, request_id, encoded, self._dump(outcome)),
+                )
+                conn.commit()
+                return outcome
+            except BaseException:
+                conn.rollback()
+                raise
+
     def response_delivered(self, caller_id: str, response: Mapping[str, object]) -> None:
         """Persist grace only after a newly executed resumable response is sent."""
         status, state = response.get("status"), response.get("call_state")
@@ -414,6 +472,10 @@ class Application:
         if not isinstance(request_id, str) or not request_id:
             return self._error("invalid_request"), False
         interaction, call_id = body.get("interaction_id"), body.get("call_id")
+        if body.get("operation") == "cancel_interaction":
+            if not isinstance(interaction, str) or not isinstance(call_id, str):
+                return self._error("session_not_found"), False
+            return self.lifecycle.cancel(caller, request_id, interaction, call_id), False
         if interaction is not None or call_id is not None:
             after = body.get("after_event_seq", 0)
             if not isinstance(interaction, str) or not isinstance(call_id, str) or isinstance(after, bool) or not isinstance(after, int):
