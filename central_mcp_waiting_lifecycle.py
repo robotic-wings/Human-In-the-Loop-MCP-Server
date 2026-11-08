@@ -672,6 +672,7 @@ class Application:
         self._browser_cookie_authenticator = browser_cookie_authenticator
         self._mobile_html_renderer = mobile_html_renderer
         self._trusted_browser_origin = trusted_browser_origin
+        self._browser_entries: dict[str, str] = {}
         if notification_router is not None:
             sink_setter = getattr(notification_router, "set_delivery_decision_sink", None)
             if callable(sink_setter):
@@ -713,6 +714,9 @@ class Application:
             return
         if isinstance(path, str) and path.startswith("/calls/"):
             await self._browser_call_api(method, path, scope.get("headers", []), receive, send)
+            return
+        if path == "/operator/login":
+            await self._browser_login_api(method, scope.get("headers", []), receive, send)
             return
         if method != "POST" or path != "/mcp":
             await self._send(send, 404, self._error("not_found")); return
@@ -822,6 +826,14 @@ class Application:
             await self._send(send, 404, self._error("not_found")); return
         session = self._browser_session(headers)
         if session is None:
+            if method == "GET" and self._browser_login_is_configured():
+                entry = uuid.uuid4().hex
+                self._browser_entries[entry] = str(path)
+                await self._send_html(
+                    send, 401, self._render_login_entry(),
+                    headers=[(b"set-cookie", self._browser_entry_cookie(entry).encode("ascii"))],
+                )
+                return
             await self._send(send, 401, self._terminal_error("session_not_found")); return
         operator_id, browser_session_id, csrf_token = session
         cookie_mode = self._browser_cookie_authenticator is not None
@@ -870,6 +882,43 @@ class Application:
             await self._send_html(send, self._action_status(response), self._render_browser_page(view, csrf_token, response))
         else:
             await self._send(send, self._action_status(response), response)
+
+    async def _browser_login_api(self, method: object, headers: object, receive: Any, send: Any) -> None:
+        """Establish a browser cookie only from an opaque, same-origin entry."""
+        if method != "POST" or not self._browser_login_is_configured():
+            await self._send(send, 404, self._error("not_found")); return
+        if not self._browser_write_is_trusted(headers):
+            await self._send(send, 403, self._terminal_error("session_not_found")); return
+        entry = self._cookie(headers, "browser_entry")
+        destination = self._browser_entries.get(entry or "")
+        body = await self._form_body(receive)
+        credential = body.get("credential") if body is not None else None
+        authenticate = getattr(self._browser_cookie_authenticator, "authenticate_login", None)
+        session_cookie = authenticate(credential) if callable(authenticate) else None
+        if not isinstance(destination, str) or not isinstance(session_cookie, str) or not session_cookie:
+            await self._send(send, 401, self._terminal_error("session_not_found")); return
+        del self._browser_entries[entry]
+        await self._send_redirect(
+            send, destination,
+            headers=[(b"set-cookie", self._operator_session_cookie(session_cookie).encode("ascii"))],
+        )
+
+    def _browser_login_is_configured(self) -> bool:
+        return callable(getattr(self._browser_cookie_authenticator, "authenticate_login", None))
+
+    @staticmethod
+    def _browser_entry_cookie(value: str) -> str:
+        return f"browser_entry={value}; Path=/; Secure; HttpOnly; SameSite=Lax"
+
+    @staticmethod
+    def _operator_session_cookie(value: str) -> str:
+        return f"operator_session={value}; Path=/; Secure; HttpOnly; SameSite=Lax"
+
+    @staticmethod
+    def _render_login_entry() -> str:
+        return ("<html><body><form method=\"post\" action=\"/operator/login\">"
+                "<input type=\"password\" name=\"credential\">"
+                "<button>login</button></form></body></html>")
 
     def _browser_call_view(self, call_id: str, operator_id: str,
                            browser_session_id: str | None = None) -> dict[str, object]:
@@ -1152,9 +1201,18 @@ class Application:
         await send({"type": "http.response.body", "body": json.dumps(body).encode(), "more_body": False})
 
     @staticmethod
-    async def _send_html(send: Any, status: int, body: str) -> None:
-        await send({"type": "http.response.start", "status": status, "headers": [(b"content-type", b"text/html; charset=utf-8")]})
+    async def _send_html(send: Any, status: int, body: str,
+                         headers: list[tuple[bytes, bytes]] | None = None) -> None:
+        response_headers = [(b"content-type", b"text/html; charset=utf-8"), *(headers or [])]
+        await send({"type": "http.response.start", "status": status, "headers": response_headers})
         await send({"type": "http.response.body", "body": body.encode("utf-8"), "more_body": False})
+
+    @staticmethod
+    async def _send_redirect(send: Any, location: str,
+                             headers: list[tuple[bytes, bytes]] | None = None) -> None:
+        await send({"type": "http.response.start", "status": 303,
+                    "headers": [(b"location", location.encode("ascii")), *(headers or [])]})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
 
 
 def create_app(*, database_path: str | Path, credentials: Mapping[str, str], clock: Clock, notify: Notifier,
