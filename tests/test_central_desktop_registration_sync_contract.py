@@ -116,7 +116,8 @@ def test_preconfigured_desktop_credential_authenticates_registration_before_dura
     tmp_path: Path,
 ) -> None:
     clock, states = FakeClock(), {"desktop-61": []}
-    service, registry, _ = _service(tmp_path, clock, states)
+    service, registry, _ = _managed_service(tmp_path, clock, states)
+    managed = registry.desktop_state("desktop-61")
 
     denied = service.register(
         credential="forged-desktop-secret",
@@ -124,7 +125,7 @@ def test_preconfigured_desktop_credential_authenticates_registration_before_dura
         gui_ready=True,
     )
     assert denied == {"success": False, "status": "terminal_not_authenticated"}
-    assert registry.desktop_state("desktop-61") is None
+    assert registry.desktop_state("desktop-61") == managed
 
     accepted = service.register(
         credential="desktop-secret",
@@ -144,7 +145,7 @@ def test_preconfigured_desktop_credential_authenticates_registration_before_dura
 
 def test_gui_ready_heartbeat_is_durable_fresh_for_30_seconds_across_service_restart(tmp_path: Path) -> None:
     clock, states = FakeClock(), {"desktop-61": []}
-    service, registry, _ = _service(tmp_path, clock, states)
+    service, registry, _ = _managed_service(tmp_path, clock, states)
     registered = service.register(
         credential="desktop-secret",
         endpoint="https://10.0.0.61:9100/terminal/events",
@@ -164,7 +165,7 @@ def test_startup_and_wake_record_authenticated_registration_or_heartbeat_before_
 ) -> None:
     clock = FakeClock()
     states = {"desktop-61": [_ringing("call-1", 3)]}
-    service, registry, audit = _service(tmp_path, clock, states)
+    service, registry, audit = _managed_service(tmp_path, clock, states)
     presenter, ring = FakePresenter(), FakeRing()
     client = _client(service, presenter, ring)
 
@@ -192,7 +193,7 @@ def test_startup_and_wake_record_authenticated_registration_or_heartbeat_before_
 def test_missed_callback_remote_accept_or_end_closes_known_alert_without_action_or_takeover(tmp_path: Path) -> None:
     clock = FakeClock()
     states = {"desktop-61": [_ringing("call-1", 1)]}
-    service, _, _ = _service(tmp_path, clock, states)
+    service, _, _ = _managed_service(tmp_path, clock, states)
     presenter, ring = FakePresenter(), FakeRing()
     client = _client(service, presenter, ring)
     client.start()
@@ -216,7 +217,7 @@ def test_missed_callback_remote_accept_or_end_closes_known_alert_without_action_
 def test_stale_or_duplicate_versions_never_reopen_or_rering_after_authoritative_dismissal(tmp_path: Path) -> None:
     clock = FakeClock()
     states = {"desktop-61": [_ringing("call-1", 2)]}
-    service, _, _ = _service(tmp_path, clock, states)
+    service, _, _ = _managed_service(tmp_path, clock, states)
     presenter, ring = FakePresenter(), FakeRing()
     client = _client(service, presenter, ring)
     client.start()
@@ -270,6 +271,20 @@ def test_device_credential_cannot_replace_management_preconfigured_callback_endp
     assert state["callback_credential"] == "central-callback-secret"
 
 
+def test_unregistered_device_cannot_create_callback_target_with_a_valid_credential(tmp_path: Path) -> None:
+    clock, states = FakeClock(), {"desktop-61": []}
+    service, registry, _ = _service(tmp_path, clock, states)
+
+    denied = service.register(
+        credential="desktop-secret",
+        endpoint="https://attacker.invalid/terminal/events",
+        gui_ready=True,
+    )
+
+    assert denied == {"success": False, "status": "endpoint_not_preconfigured"}
+    assert registry.desktop_state("desktop-61") is None
+
+
 def test_callback_requires_separate_central_credential_before_presentation_or_ringing(tmp_path: Path) -> None:
     clock = FakeClock()
     states = {"desktop-61": []}
@@ -302,3 +317,27 @@ def test_callback_requires_separate_central_credential_before_presentation_or_ri
     }
     assert presenter.shown == ["forged"]
     assert ring.started == ["forged"]
+
+
+def test_missing_callback_credential_configuration_fails_closed_before_presentation_or_ringing(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    service, _, _ = _managed_service(tmp_path, clock, {"desktop-61": []})
+    presenter, ring = FakePresenter(), FakeRing()
+    client = _adapter().DesktopRegistrationSyncClient(
+        config={
+            "terminal_credential": "desktop-secret",
+            "listener_endpoint": "https://10.0.0.61:9100/terminal/events",
+        },
+        central=service,
+        presenter=presenter,
+        ring=ring,
+    )
+
+    assert client.receive_callback(
+        _ringing("forged-without-local-callback-secret", 1),
+        callback_credential="central-callback-secret",
+    ) == {"success": False, "status": "callback_not_authenticated"}
+    assert presenter.shown == []
+    assert ring.started == []
