@@ -108,12 +108,16 @@ def _make_app(state: RuntimeState, *, route_mode: str) -> Any:
 
 
 def _request(app: Any, method: str, path: str, *, cookie: str | None = None,
+             raw_cookie: str | None = None,
              form: Mapping[str, str] | None = None, headers: Mapping[str, str] | None = None,
              bearer: str | None = None) -> httpx.Response:
     async def run() -> httpx.Response:
         actual = dict(headers or {})
+        assert cookie is None or raw_cookie is None
         if cookie is not None:
             actual["cookie"] = f"operator_session={cookie}"
+        if raw_cookie is not None:
+            actual["cookie"] = raw_cookie
         if bearer is not None:
             actual["authorization"] = f"Bearer {bearer}"
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://central.example.test") as client:
@@ -330,7 +334,7 @@ def test_configured_bark_call_link_establishes_authenticated_cookie_without_expo
     # The login write is bound to the central HTTPS origin.  A foreign Origin
     # cannot mint a browser cookie or advance this call.
     rejected = _request(
-        app, "POST", "/operator/login", cookie=f"browser_entry={entry_token}",
+        app, "POST", "/operator/login", raw_cookie=f"browser_entry={entry_token}",
         form={"credential": "operator-login-secret"},
         headers={"origin": "https://evil.example", "host": "evil.example"},
     )
@@ -338,7 +342,7 @@ def test_configured_bark_call_link_establishes_authenticated_cookie_without_expo
     assert "operator_session=" not in rejected.headers.get("set-cookie", "")
 
     established = _request(
-        app, "POST", "/operator/login", cookie=f"browser_entry={entry_token}",
+        app, "POST", "/operator/login", raw_cookie=f"browser_entry={entry_token}",
         form={"credential": "operator-login-secret"},
         headers={"origin": "https://central.example.test", "host": "central.example.test"},
     )
