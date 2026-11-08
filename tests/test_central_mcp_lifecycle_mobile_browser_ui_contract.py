@@ -108,12 +108,16 @@ def _make_app(state: RuntimeState, *, route_mode: str) -> Any:
 
 
 def _request(app: Any, method: str, path: str, *, cookie: str | None = None,
+             raw_cookie: str | None = None,
              form: Mapping[str, str] | None = None, headers: Mapping[str, str] | None = None,
              bearer: str | None = None) -> httpx.Response:
     async def run() -> httpx.Response:
         actual = dict(headers or {})
+        assert cookie is None or raw_cookie is None
         if cookie is not None:
             actual["cookie"] = f"operator_session={cookie}"
+        if raw_cookie is not None:
+            actual["cookie"] = raw_cookie
         if bearer is not None:
             actual["authorization"] = f"Bearer {bearer}"
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://central.example.test") as client:
@@ -158,6 +162,12 @@ def _configured_lifecycle_app(tmp_path: Path) -> Any:
                 "browser_session_id": "browser-62",
                 "csrf_token": "csrf-62",
             },
+        },
+        # This is a protected configuration reference for the operator's
+        # login credential, deliberately distinct from the browser cookie.
+        # The contract does not prescribe its storage implementation.
+        "operator_login_credentials": {
+            "operator-login-secret": "operator-cookie",
         },
     })
     verifier = _ConfiguredOperatorSessionVerifier(config.operator_sessions)
@@ -278,3 +288,84 @@ def test_configured_runtime_composition_uses_cookie_html_not_legacy_header_json(
     )
     assert bad_origin.status_code in {401, 403, 404}
     assert _request(app, "GET", f"/calls/{call['call_id']}", cookie="operator-cookie").text == page.text
+
+
+def test_configured_bark_call_link_establishes_authenticated_cookie_without_exposing_credentials(tmp_path: Path) -> None:
+    """A Bark link starts a protected browser entry flow, not a header-only API.
+
+    An iPhone has no preexisting cookie when it opens the central call link.
+    It must authenticate through a server-side login entry, receive a secure
+    cookie, and then return to the lifecycle-owned ringing view.  The raw link
+    and unauthenticated login page must not disclose credentials, browser
+    session, CSRF value, or call state.
+    """
+    app = _configured_lifecycle_app(tmp_path)
+    call = _create(app, request_id="configured-login-entry")
+    call_path = f"/calls/{call['call_id']}"
+
+    records = app._notification_router.outbox_records(str(call["call_id"]))
+    bark_payload = next(record["payload"] for record in records if record["channel"] == "bark")
+    assert bark_payload == {
+        "call_id": call["call_id"],
+        "url": f"https://central.example.test{call_path}",
+    }
+    assert "operator-login-secret" not in str(bark_payload)
+    assert "operator-cookie" not in str(bark_payload)
+
+    # A bare link gives an unauthenticated browser a generic HTML login entry,
+    # never session_not_found JSON or a call state.  Its opaque entry value is
+    # the only continuation state supplied to the login form.
+    entry = _request(app, "GET", call_path)
+    assert entry.status_code == 401
+    assert entry.headers["content-type"].startswith("text/html")
+    assert "<form" in entry.text.lower()
+    assert "operator-login-secret" not in entry.text
+    assert "operator-cookie" not in entry.text
+    assert "csrf-61" not in entry.text
+    assert "ringing" not in entry.text.lower()
+    assert call["call_id"] not in entry.text
+    entry_cookie = entry.headers.get("set-cookie", "")
+    assert "browser_entry=" in entry_cookie
+    assert "httponly" in entry_cookie.lower()
+    assert "secure" in entry_cookie.lower()
+    assert "samesite=lax" in entry_cookie.lower()
+    entry_token = entry_cookie.split("browser_entry=", 1)[1].split(";", 1)[0]
+
+    # The login write is bound to the central HTTPS origin.  A foreign Origin
+    # cannot mint a browser cookie or advance this call.
+    rejected = _request(
+        app, "POST", "/operator/login", raw_cookie=f"browser_entry={entry_token}",
+        form={"credential": "operator-login-secret"},
+        headers={"origin": "https://evil.example", "host": "evil.example"},
+    )
+    assert rejected.status_code in {401, 403, 404}
+    assert "operator_session=" not in rejected.headers.get("set-cookie", "")
+
+    established = _request(
+        app, "POST", "/operator/login", raw_cookie=f"browser_entry={entry_token}",
+        form={"credential": "operator-login-secret"},
+        headers={"origin": "https://central.example.test", "host": "central.example.test"},
+    )
+    assert established.status_code in {302, 303}
+    assert established.headers["location"] == call_path
+    session_cookie = established.headers["set-cookie"]
+    assert "operator_session=" in session_cookie
+    assert "httponly" in session_cookie.lower()
+    assert "secure" in session_cookie.lower()
+    assert "samesite=lax" in session_cookie.lower()
+    session_token = session_cookie.split("operator_session=", 1)[1].split(";", 1)[0]
+    assert session_token != "operator-login-secret"
+
+    # Following the redirect authenticates the same operator into the true
+    # lifecycle state.  Reading remains inert and yields the existing CSRF
+    # protected explicit action form rather than implicit acceptance.
+    page = _request(app, "GET", call_path, cookie=session_token)
+    assert page.status_code == 200
+    assert page.headers["content-type"].startswith("text/html")
+    assert "csrf-61" in page.text
+    assert "accept" in page.text.lower()
+    assert _request(app, "GET", call_path, cookie=session_token).text == page.text
+
+    foreign = _request(app, "GET", call_path, cookie="foreign-cookie")
+    assert foreign.status_code in {401, 404}
+    assert call["call_id"] not in foreign.text
