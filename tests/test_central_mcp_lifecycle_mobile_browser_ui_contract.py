@@ -15,6 +15,7 @@ from typing import Any, Mapping
 
 import httpx
 
+from central_http_service import CentralServiceConfig, _ConfiguredOperatorSessionVerifier, create_lifecycle_app
 from central_desktop_registration_sync import DesktopRegistrationStateService
 from central_mcp_waiting_lifecycle import create_app
 from central_notification_router import NotificationRouter, TerminalRegistry
@@ -133,6 +134,48 @@ def _create(app: Any, request_id: str = "create") -> dict[str, object]:
     return response.json()
 
 
+def _configured_lifecycle_app(tmp_path: Path) -> Any:
+    """Exercise the central runtime factory, not a direct lifecycle seam."""
+    config = CentralServiceConfig.from_mapping({
+        "listen_host": "127.0.0.1",
+        "listen_port": 8443,
+        "web_base_url": "https://central.example.test",
+        "data_dir": str(tmp_path / "configured-central"),
+        "agent_credentials": {"agent-a": "agent-secret"},
+        "tls_cert_file": "test-cert.pem",
+        "tls_key_file": "test-key.pem",
+        "route_mode": "iphone",
+        "bark_endpoint": "https://bark.example.test/push",
+        "bark_credential": "bark-secret",
+        "operator_sessions": {
+            "operator-cookie": {
+                "operator_id": "only-operator",
+                "browser_session_id": "browser-61",
+                "csrf_token": "csrf-61",
+            },
+            "foreign-cookie": {
+                "operator_id": "foreign",
+                "browser_session_id": "browser-62",
+                "csrf_token": "csrf-62",
+            },
+        },
+    })
+    verifier = _ConfiguredOperatorSessionVerifier(config.operator_sessions)
+
+    async def delivered(_payload: Mapping[str, object]) -> Mapping[str, object]:
+        return {"accepted": True, "http_status": 200, "business_success": True}
+
+    # Passing the configured verifier through both browser seams is the
+    # production composition requirement.  The lifecycle must therefore use
+    # cookie HTML mode rather than silently falling back to x-operator-session.
+    return create_lifecycle_app(
+        config, clock=Clock(), wait=_no_wait, bark_dispatch=delivered,
+        desktop_dispatch=delivered, operator_session_verifier=verifier,
+        browser_cookie_authenticator=verifier,
+        scheduler_sleep=_no_wait, notification_scheduler_sleep=_no_wait,
+    )
+
+
 def test_cookie_authenticated_initial_page_is_html_and_inert_while_link_or_foreign_session_is_opaque(tmp_path: Path) -> None:
     app, _state = _components(tmp_path, route_mode="iphone")
     call = _create(app)
@@ -203,3 +246,35 @@ def test_refresh_after_desktop_ownership_is_truthful_and_reconstruction_keeps_fo
     with sqlite3.connect(state.root / "router.sqlite3") as conn:
         deliveries = conn.execute("SELECT count(*) FROM notification_outbox WHERE call_id=?", (call["call_id"],)).fetchone()[0]
     assert deliveries == 2
+
+
+def test_configured_runtime_composition_uses_cookie_html_not_legacy_header_json(tmp_path: Path) -> None:
+    """Configured iPhone routing must activate the protected browser path."""
+    app = _configured_lifecycle_app(tmp_path)
+    call = _create(app, request_id="configured-cookie-call")
+
+    page = _request(app, "GET", f"/calls/{call['call_id']}", cookie="operator-cookie")
+    assert page.status_code == 200
+    assert page.headers["content-type"].startswith("text/html")
+    assert "csrf-61" in page.text
+    assert "accept" in page.text.lower()
+
+    # A legacy header cannot bypass the configured cookie session, and neither
+    # a missing nor a foreign cookie can reveal or mutate this call.
+    header_only = _request(
+        app, "GET", f"/calls/{call['call_id']}",
+        headers={"x-operator-session": "operator-cookie"},
+    )
+    assert header_only.status_code in {401, 404}
+    for cookie in (None, "foreign-cookie"):
+        denied = _request(app, "GET", f"/calls/{call['call_id']}", cookie=cookie)
+        assert denied.status_code in {401, 404}
+        assert call["call_id"] not in denied.text
+
+    bad_origin = _request(
+        app, "POST", f"/calls/{call['call_id']}/accept", cookie="operator-cookie",
+        form={"operation_id": "accept", "csrf_token": "csrf-61"},
+        headers={"origin": "https://evil.example", "host": "evil.example"},
+    )
+    assert bad_origin.status_code in {401, 403, 404}
+    assert _request(app, "GET", f"/calls/{call['call_id']}", cookie="operator-cookie").text == page.text
