@@ -69,6 +69,7 @@ def _router(
     bark_dispatch,
     route_mode: str = "both",
     call_state=None,
+    web_base_url: str | None = "https://central.example.test",
 ):
     return _routing_module().NotificationRouter(
         database_path=tmp_path / "routing.sqlite3",
@@ -80,6 +81,7 @@ def _router(
         desktop_timeout_seconds=2.5,
         bark_timeout_seconds=2.5,
         call_state=call_state,
+        web_base_url=web_base_url,
     )
 
 
