@@ -8,13 +8,14 @@ coordinator or presentation code.
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from pathlib import Path
 from typing import Any
 
 import httpx
 
 from central_desktop_registration_sync import DesktopRegistrationStateService
-from central_notification_router import TerminalRegistry
+from central_notification_router import NotificationRouter, TerminalRegistry
 from central_mcp_waiting_lifecycle import create_app
 
 
@@ -33,7 +34,7 @@ async def _no_wait(_: float) -> None:
     return None
 
 
-def _components(tmp_path: Path) -> tuple[Any, TerminalRegistry, FakeClock]:
+def _components(tmp_path: Path, *, route_mode: str = "desktop") -> tuple[Any, TerminalRegistry, FakeClock]:
     clock = FakeClock()
     registry = TerminalRegistry(database_path=tmp_path / "registry.sqlite3", clock=clock)
     registry.register_desktop(
@@ -51,12 +52,41 @@ def _components(tmp_path: Path) -> tuple[Any, TerminalRegistry, FakeClock]:
         },
         device_state=lambda _device_id: [],
     )
+    lifecycle_path = tmp_path / "lifecycle.sqlite3"
+
+    async def desktop_dispatch(_: dict[str, object]) -> dict[str, object]:
+        return {"accepted": True}
+
+    async def bark_dispatch(_: dict[str, object]) -> dict[str, object]:
+        return {"http_status": 200, "business_success": True}
+
+    def call_state(call_id: str) -> str | None:
+        if not lifecycle_path.exists():
+            return None
+        with sqlite3.connect(lifecycle_path) as conn:
+            row = conn.execute(
+                "SELECT call_state FROM lifecycle_calls WHERE call_id=?", (call_id,)
+            ).fetchone()
+        return None if row is None else str(row[0])
+
+    router = NotificationRouter(
+        database_path=tmp_path / "routing.sqlite3",
+        clock=clock,
+        registry=registry,
+        desktop_dispatch=desktop_dispatch,
+        bark_dispatch=bark_dispatch,
+        route_mode=route_mode,
+        call_state=call_state,
+        web_base_url="https://central.example.test",
+    )
     app = create_app(
-        database_path=tmp_path / "lifecycle.sqlite3",
+        database_path=lifecycle_path,
         credentials={"agent-a": "agent-secret", "agent-b": "agent-b-secret"},
         clock=clock,
-        notify=lambda _event: None,
+        notify=router.enqueue,
         wait=_no_wait,
+        route_admission=router.validate_route,
+        notification_router=router,
         desktop_registration_service=service,
     )
     return app, registry, clock
@@ -188,11 +218,14 @@ def test_terminal_action_auth_deadline_route_and_race_are_opaque_or_single_winne
         assert response.json()["success"] is False
         assert _request(app, "GET", "/api/terminals/state", session=owner).json() == before
 
-    # A route excluded from this desktop is indistinguishable from an unknown
-    # target and cannot take ownership.
+    # This call is admitted through the actual central iPhone-only route, so
+    # no desktop was invited.  A registered desktop session cannot seize it.
+    iphone_app, _iphone_registry, _iphone_clock = _components(tmp_path / "iphone", route_mode="iphone")
+    iphone_session = _register(iphone_app)
+    iphone_call = _ringing_call(iphone_app, "iphone-only-call")
     excluded = _request(
-        app, "POST", f"/api/calls/{call['call_id']}/accept", session=owner,
-        body={"operation_id": "excluded", "route": "iphone"},
+        iphone_app, "POST", f"/api/calls/{iphone_call['call_id']}/accept", session=iphone_session,
+        body={"operation_id": "excluded"},
     )
     assert excluded.status_code in {400, 404}
     assert excluded.json()["success"] is False
