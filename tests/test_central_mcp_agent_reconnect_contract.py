@@ -164,6 +164,25 @@ def test_reconnect_grace_starts_when_the_heartbeat_is_delivered_not_when_wait_be
     assert terminal["reason"] == "ring_timeout"
 
 
+def test_replayed_initial_heartbeat_does_not_extend_reconnect_deadline(tmp_path: Path) -> None:
+    clock, notifications = FakeClock(), []
+    app = make_app(tmp_path, clock, notifications, ring_timeout=120)
+
+    # The initial heartbeat arms a 30-second reconnect grace once. Retrying
+    # the identical create operation replays that response; it must not make
+    # a new delivery or move the already-persisted deadline.
+    call = create(app, "replayed-create")
+    clock.advance(29)
+    replayed = create(app, "replayed-create")
+    assert replayed == call
+    assert notifications == [{"call_id": call["call_id"], "ring_deadline": 1_700_000_120.0}]
+
+    # The original grace expires at t=30, not t=59. A valid continuation at
+    # t=31 therefore receives the immutable disconnect result.
+    clock.advance(2)
+    assert post(app, continuation(call, "after-replay-expiry")) == expected_disconnected(call)
+
+
 def test_reconnect_expiry_is_immutable_across_restart_releases_busy_and_rejects_late_action(tmp_path: Path) -> None:
     clock, notifications = FakeClock(), []
     first = make_app(tmp_path, clock, notifications)
