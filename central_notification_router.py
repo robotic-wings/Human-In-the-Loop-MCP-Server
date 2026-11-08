@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 Clock = Callable[[], float]
 Dispatch = Callable[[dict[str, object]], object]
 CallState = Callable[[str], str | None]
+DecisionSink = Callable[[dict[str, str]], None]
 
 
 class _Store:
@@ -104,11 +105,17 @@ class NotificationRouter:
     def __init__(self, *, database_path: str | Path, clock: Clock, registry: TerminalRegistry,
                  desktop_dispatch: Dispatch, bark_dispatch: Dispatch, route_mode: str,
                  desktop_timeout_seconds: float = 2.5, bark_timeout_seconds: float = 2.5,
-                 call_state: CallState | None = None, web_base_url: str | None = None) -> None:
+                 call_state: CallState | None = None, web_base_url: str | None = None,
+                 decision_sink: DecisionSink | None = None) -> None:
         self._store, self._clock, self._registry = _Store(database_path), clock, registry
         self._desktop_dispatch, self._bark_dispatch, self._route_mode = desktop_dispatch, bark_dispatch, route_mode
         self._desktop_timeout, self._bark_timeout, self._call_state = desktop_timeout_seconds, bark_timeout_seconds, call_state
         self._web_base_url, self._invalid_web_base_url = self._normalize_web_base_url(web_base_url)
+        self._decision_sink = decision_sink
+
+    def set_delivery_decision_sink(self, sink: DecisionSink | None) -> None:
+        """Install the central lifecycle consumer for dispatch decisions."""
+        self._decision_sink = sink
 
     @staticmethod
     def _normalize_web_base_url(value: str | None) -> tuple[str | None, bool]:
@@ -150,6 +157,15 @@ class NotificationRouter:
                     call_id = str(event["call_id"])
                     payload = json.dumps({"call_id": call_id, "url": f"{self._web_base_url}/calls/{call_id}"},
                                          separators=(",", ":"))
+                elif channel == "desktop":
+                    # Preserve the lifecycle-owned event verbatim in the
+                    # outbox.  Registry attributes are added only when the
+                    # callback is delivered, so they retain their management
+                    # ownership while call state/version survive restarts.
+                    desktop_event = dict(event)
+                    desktop_event.setdefault("call_state", "ringing")
+                    desktop_event.setdefault("version", 1)
+                    payload = json.dumps(desktop_event, separators=(",", ":"))
                 conn.execute(
                     "INSERT OR IGNORE INTO notification_outbox "
                     "(call_id, channel, ring_deadline, state, created_at, payload) VALUES (?, ?, ?, 'pending', ?, ?)",
@@ -190,18 +206,11 @@ class NotificationRouter:
         await asyncio.gather(*(self._dispatch_row(dict(row)) for row in rows))
         decisions: dict[str, str] = {}
         for call_id in {str(row["call_id"]) for row in rows}:
-            states = {entry["state"] for entry in self.delivery_states(call_id)}
-            # A skipped record means the authoritative call already left the
-            # invitation phase (or its absolute deadline elapsed).  It is not
-            # delivery evidence and must never recategorize that call as
-            # unreachable.  Only a still-ringing call whose every channel
-            # definitely failed has that result.
-            if states and states <= {"failed"}:
-                state = self._call_state(call_id) if self._call_state else "ringing"
-                if state == "ringing":
-                    decisions[call_id] = "unreachable"
-            elif "skipped" not in states:
-                decisions[call_id] = "ringing"
+            decision = self._delivery_decision(call_id)
+            if decision is not None:
+                decisions[call_id] = decision
+        if self._decision_sink is not None:
+            self._decision_sink(decisions)
         return {"call_decisions": decisions}
 
     async def _dispatch_row(self, row: dict[str, object]) -> None:
@@ -212,7 +221,7 @@ class NotificationRouter:
             return
         payload: dict[str, object] = {"call_id": call_id, "ring_deadline": row["ring_deadline"]}
         dispatch, timeout = self._bark_dispatch, self._bark_timeout
-        if channel == "bark" and row.get("payload"):
+        if channel in {"bark", "desktop"} and row.get("payload"):
             payload = json.loads(str(row["payload"]))
         if channel == "desktop":
             terminal = self._registry.ready_desktop()
@@ -234,6 +243,26 @@ class NotificationRouter:
             self._set_state(call_id, channel, "uncertain")
         except Exception:
             self._set_state(call_id, channel, "failed")
+
+        decision = self._delivery_decision(call_id)
+        if decision is not None and self._decision_sink is not None:
+            # Publish in the same dispatch task immediately after the durable
+            # row update.  Consumers observing the outbox therefore cannot
+            # see an all-failed call before the authoritative lifecycle has
+            # received the corresponding decision.
+            self._decision_sink({call_id: decision})
+
+    def _delivery_decision(self, call_id: str) -> str | None:
+        states = {entry["state"] for entry in self.delivery_states(call_id)}
+        # A skipped record means the authoritative call already left the
+        # invitation phase (or its absolute deadline elapsed).  It is not
+        # delivery evidence and must never recategorize that call as
+        # unreachable.  Only a still-ringing call whose every channel
+        # definitely failed has that result.
+        if states and states <= {"failed"}:
+            state = self._call_state(call_id) if self._call_state else "ringing"
+            return "unreachable" if state == "ringing" else None
+        return "ringing" if "skipped" not in states else None
 
     def _set_state(self, call_id: str, channel: str, state: str) -> None:
         with self._store.connection() as conn:
