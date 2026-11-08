@@ -100,16 +100,20 @@ class FakePresenter:
         self.closed.append(call_id)
 
 
-def _client(*, central: FakeCentral, gui_ready: bool = True):
+def _client(
+    *, central: FakeCentral, gui_ready: bool = True, callback_credential: str | None = "central-callback-secret"
+):
+    config: dict[str, object] = {
+        "central_url": "https://10.0.0.1:8443",
+        "terminal_credential": "desktop-secret",
+        "listener_address": "10.0.0.61",
+        "listener_port": 9100,
+        "platform": "linux",
+    }
+    if callback_credential is not None:
+        config["callback_credential"] = callback_credential
     return _module().DesktopTerminalClient(
-        config={
-            "central_url": "https://10.0.0.1:8443",
-            "terminal_credential": "desktop-secret",
-            "callback_credential": "central-callback-secret",
-            "listener_address": "10.0.0.61",
-            "listener_port": 9100,
-            "platform": "linux",
-        },
+        config=config,
         central=central,
         listener=FakeListener(),
         gui_capability=lambda: gui_ready,
@@ -195,6 +199,26 @@ def test_notification_requires_distinct_configured_central_callback_credential()
         "success"
     ] is True
     assert client.listener.acknowledgements == [event]
+
+
+def test_missing_or_empty_callback_credential_is_inert_configuration_failure() -> None:
+    """Callback authentication cannot silently fall back to another secret."""
+
+    for callback_credential in (None, ""):
+        central = FakeCentral(states={"call-1": _ringing("call-1")})
+        client = _client(central=central, callback_credential=callback_credential)
+        assert client.start() == {"success": False, "status": "invalid_config"}
+        assert client.receive_notification(
+            {"call_id": "call-1", "version": 1},
+            callback_credential="central-callback-secret",
+        ) == {"success": False, "status": "notification_not_authenticated"}
+        assert central.issued_sessions == 0
+        assert central.reads == []
+        assert central.actions == []
+        assert client.listener.acknowledgements == []
+        assert client.presenter.shown == []
+        assert client.ring.started == []
+        assert central.states["call-1"]["call_state"] == "ringing"
 
 
 def test_accept_decline_and_dismiss_use_only_bound_terminal_session_and_whole_call_semantics() -> None:
