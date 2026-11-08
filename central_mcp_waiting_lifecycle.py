@@ -145,9 +145,12 @@ class WaitingLifecycle:
             finally:
                 conn.commit()
 
-    def heartbeat_delivered(self, caller_id: str, response: Mapping[str, object]) -> None:
-        """Persist ringing reconnect grace after a newly executed wait returns."""
-        if response.get("status") != "heartbeat" or response.get("call_state") != "ringing":
+    def response_delivered(self, caller_id: str, response: Mapping[str, object]) -> None:
+        """Persist grace only after a newly executed resumable response is sent."""
+        status, state = response.get("status"), response.get("call_state")
+        if state not in {"ringing", "accepted"}:
+            return
+        if status != "heartbeat" and not (status == "opened" and state == "accepted"):
             return
         interaction_id, call_id = response.get("interaction_id"), response.get("call_id")
         if not isinstance(interaction_id, str) or not isinstance(call_id, str):
@@ -160,7 +163,7 @@ class WaitingLifecycle:
                     "SELECT interaction_id, call_state FROM lifecycle_calls WHERE call_id=? AND caller_id=?",
                     (call_id, caller_id),
                 ).fetchone()
-                if call is not None and call["interaction_id"] == interaction_id and call["call_state"] == "ringing":
+                if call is not None and call["interaction_id"] == interaction_id and call["call_state"] == state:
                     conn.execute(
                         "UPDATE lifecycle_calls SET agent_reconnect_deadline=? WHERE call_id=?",
                         (self._clock() + self._agent_reconnect_seconds, call_id),
@@ -216,7 +219,7 @@ class WaitingLifecycle:
             body = self._terminal(call["interaction_id"], call["call_id"], "not_accepted", "ring_timeout", seq)
             conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call["call_id"], seq, self._dump(body)))
         rows = conn.execute(
-            "SELECT * FROM lifecycle_calls WHERE call_state='ringing' "
+            "SELECT * FROM lifecycle_calls WHERE call_state IN ('ringing', 'accepted') "
             "AND agent_reconnect_deadline IS NOT NULL AND agent_reconnect_deadline<=?",
             (now,),
         ).fetchall()
@@ -274,8 +277,8 @@ class Application:
         if waited:
             await self._wait(max(1, float(timeout) - min(30, max(1, float(timeout) // 4))))
         await send({"type": "http.response.body", "body": json.dumps(response, separators=(",", ":")).encode(), "more_body": False})
-        if waited:
-            self.lifecycle.heartbeat_delivered(caller, response)
+        if should_wait:
+            self.lifecycle.response_delivered(caller, response)
 
     def _dispatch(self, caller: str, body: Mapping[str, object]) -> tuple[dict[str, object], bool]:
         request_id = body.get("request_id")
