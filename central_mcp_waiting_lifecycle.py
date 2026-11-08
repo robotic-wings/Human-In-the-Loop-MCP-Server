@@ -7,12 +7,13 @@ boundaries.
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 import sqlite3
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from typing import Any
 Clock = Callable[[], float]
 Waiter = Callable[[float], Awaitable[None]]
 Notifier = Callable[[dict[str, object]], None]
+RouteAdmission = Callable[[], Mapping[str, object]]
 
 
 class WaitingLifecycle:
@@ -77,7 +79,7 @@ class WaitingLifecycle:
                         return self._error("request_conflict")
                     return self._load(existing["outcome_json"])
                 self._settle_due(conn)
-                active = conn.execute("SELECT call_id FROM lifecycle_calls WHERE call_state IN ('ringing', 'accepted') LIMIT 1").fetchone()
+                active = conn.execute("SELECT call_id FROM lifecycle_calls WHERE call_state IN ('ringing', 'accepted', 'in_progress') LIMIT 1").fetchone()
                 if active is not None:
                     outcome = {"success": True, "status": "busy", "call_state": None, "call_id": None, "needs_continuation": False}
                 else:
@@ -132,7 +134,7 @@ class WaitingLifecycle:
                 event = conn.execute("SELECT body_json FROM lifecycle_events WHERE call_id=? AND event_seq>? ORDER BY event_seq LIMIT 1", (call_id, after)).fetchone()
                 if event is not None:
                     outcome = self._load(event["body_json"])
-                elif call["call_state"] in {"ringing", "accepted"}:
+                elif call["call_state"] in {"ringing", "accepted", "in_progress"}:
                     outcome = self._heartbeat(interaction_id, call_id, call["call_state"])
                 else:
                     # A terminal state always has an event, but retain a safe fallback.
@@ -148,9 +150,11 @@ class WaitingLifecycle:
     def response_delivered(self, caller_id: str, response: Mapping[str, object]) -> None:
         """Persist grace only after a newly executed resumable response is sent."""
         status, state = response.get("status"), response.get("call_state")
-        if state not in {"ringing", "accepted"}:
+        if state not in {"ringing", "accepted", "in_progress"}:
             return
-        if status != "heartbeat" and not (status == "opened" and state == "accepted"):
+        if status != "heartbeat" and not (status == "opened" and state == "accepted") and not (
+            status == "in_progress" and state == "in_progress"
+        ):
             return
         interaction_id, call_id = response.get("interaction_id"), response.get("call_id")
         if not isinstance(interaction_id, str) or not isinstance(call_id, str):
@@ -164,9 +168,73 @@ class WaitingLifecycle:
                     (call_id, caller_id),
                 ).fetchone()
                 if call is not None and call["interaction_id"] == interaction_id and call["call_state"] == state:
+                    grace = 300 if state == "in_progress" else self._agent_reconnect_seconds
                     conn.execute(
                         "UPDATE lifecycle_calls SET agent_reconnect_deadline=? WHERE call_id=?",
-                        (self._clock() + self._agent_reconnect_seconds, call_id),
+                        (self._clock() + grace, call_id),
+                    )
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+
+    def settle_deadlines(self) -> None:
+        """Run one durable, server-owned expiry pass.
+
+        Request paths also call ``_settle_due`` before acting, but the ASGI
+        application owns this public tick so an idle ringing call is settled
+        without requiring another caller, terminal action, or restart.
+        """
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._settle_due(conn)
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+
+    def apply_delivery_decisions(self, decisions: Mapping[str, object]) -> None:
+        """Persist definitive notification-routing outcomes.
+
+        A router may report that every enabled delivery route definitely
+        failed, or that delivery remains uncertain.  Only the former is a
+        business outcome: uncertainty deliberately leaves the ringing call
+        and its original absolute deadline alone.  This method is idempotent
+        so delayed router work cannot append events or resurrect a terminal
+        call after a restart.
+        """
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # Deadline settlement is first so a late router report cannot
+                # replace the earlier ring-timeout business result.
+                self._settle_due(conn)
+                for call_id, decision in decisions.items():
+                    if not isinstance(call_id, str) or decision != "unreachable":
+                        continue
+                    call = conn.execute(
+                        "SELECT * FROM lifecycle_calls WHERE call_id=? AND call_state='ringing'",
+                        (call_id,),
+                    ).fetchone()
+                    if call is None:
+                        continue
+                    conn.execute(
+                        "UPDATE lifecycle_calls SET call_state='unreachable', reason='no_available_channel' "
+                        "WHERE call_id=?",
+                        (call_id,),
+                    )
+                    seq = int(conn.execute(
+                        "SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?",
+                        (call_id,),
+                    ).fetchone()["n"])
+                    body = self._terminal(
+                        call["interaction_id"], call_id, "unreachable", "no_available_channel", seq,
+                    )
+                    body["human_action"] = False
+                    conn.execute(
+                        "INSERT INTO lifecycle_events VALUES (?, ?, ?)",
+                        (call_id, seq, self._dump(body)),
                     )
                 conn.commit()
             except BaseException:
@@ -188,7 +256,7 @@ class WaitingLifecycle:
                 call = conn.execute("SELECT * FROM lifecycle_calls WHERE call_id=?", (call_id,)).fetchone()
                 if call is None:
                     return self._error("session_not_found")
-                if call["call_state"] not in {"ringing", "accepted"}:
+                if call["call_state"] not in {"ringing", "accepted", "in_progress"}:
                     event = conn.execute("SELECT body_json FROM lifecycle_events WHERE call_id=? ORDER BY event_seq DESC LIMIT 1", (call_id,)).fetchone()
                     return self._load(event["body_json"]) if event else self._error("expired")
                 if status == "opened" and call["call_state"] != "ringing":
@@ -196,12 +264,12 @@ class WaitingLifecycle:
                 # A final answer cannot establish ownership by itself.  The
                 # accepted event is the durable ownership transition and must
                 # precede every terminal result.
-                if status != "opened" and call["call_state"] != "accepted":
+                if status != "opened" and call["call_state"] not in {"accepted", "in_progress"}:
                     return self._error("not_accepted")
                 conn.execute("UPDATE lifecycle_calls SET call_state=?, reason=? WHERE call_id=?", (state, reason, call_id))
                 seq = int(conn.execute("SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call_id,)).fetchone()["n"])
                 body: dict[str, object] = {"success": True, "status": status, "call_state": state, "event_seq": seq,
-                                            "needs_continuation": status == "opened", "interaction_id": call["interaction_id"], "call_id": call_id}
+                                            "needs_continuation": status in {"opened", "in_progress"}, "interaction_id": call["interaction_id"], "call_id": call_id}
                 body.update(extra)
                 conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call_id, seq, self._dump(body)))
                 conn.commit()
@@ -219,7 +287,7 @@ class WaitingLifecycle:
             body = self._terminal(call["interaction_id"], call["call_id"], "not_accepted", "ring_timeout", seq)
             conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call["call_id"], seq, self._dump(body)))
         rows = conn.execute(
-            "SELECT * FROM lifecycle_calls WHERE call_state IN ('ringing', 'accepted') "
+            "SELECT * FROM lifecycle_calls WHERE call_state IN ('ringing', 'accepted', 'in_progress') "
             "AND agent_reconnect_deadline IS NOT NULL AND agent_reconnect_deadline<=?",
             (now,),
         ).fetchall()
@@ -255,10 +323,18 @@ class WaitingLifecycle:
 
 
 class Application:
-    def __init__(self, lifecycle: WaitingLifecycle, credentials: Mapping[str, str], wait: Waiter) -> None:
+    def __init__(self, lifecycle: WaitingLifecycle, credentials: Mapping[str, str], wait: Waiter,
+                 deadline_tick_seconds: float, scheduler_sleep: Waiter,
+                 route_admission: RouteAdmission) -> None:
         self.lifecycle, self._credentials, self._wait = lifecycle, dict(credentials), wait
+        self._deadline_tick_seconds, self._scheduler_sleep = deadline_tick_seconds, scheduler_sleep
+        self._route_admission = route_admission
+        self._deadline_task: asyncio.Task[None] | None = None
 
     async def __call__(self, scope: Mapping[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") == "lifespan":
+            await self._lifespan(receive, send)
+            return
         if scope.get("type") != "http" or scope.get("method") != "POST" or scope.get("path") != "/mcp":
             await self._send(send, 404, self._error("not_found")); return
         caller = self._caller(scope.get("headers", []))
@@ -280,6 +356,26 @@ class Application:
         if should_wait:
             self.lifecycle.response_delivered(caller, response)
 
+    async def _lifespan(self, receive: Any, send: Any) -> None:
+        while True:
+            event = await receive()
+            if event.get("type") == "lifespan.startup":
+                self._deadline_task = asyncio.create_task(self._run_deadline_scheduler())
+                await send({"type": "lifespan.startup.complete"})
+            elif event.get("type") == "lifespan.shutdown":
+                if self._deadline_task is not None:
+                    self._deadline_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await self._deadline_task
+                    self._deadline_task = None
+                await send({"type": "lifespan.shutdown.complete"})
+                return
+
+    async def _run_deadline_scheduler(self) -> None:
+        while True:
+            await self._scheduler_sleep(self._deadline_tick_seconds)
+            self.lifecycle.settle_deadlines()
+
     def _dispatch(self, caller: str, body: Mapping[str, object]) -> tuple[dict[str, object], bool]:
         request_id = body.get("request_id")
         if not isinstance(request_id, str) or not request_id:
@@ -295,7 +391,21 @@ class Application:
         if not isinstance(payload, Mapping):
             return self._error("invalid_request"), False
         replay = self.lifecycle.has_request(caller, request_id)
+        if not replay and not self._route_is_enabled():
+            # Route configuration is a server-side admission check.  In
+            # particular, it must not consume a request id, reserve the busy
+            # slot, or disclose an active call when no human channel is
+            # enabled for this new call.
+            return self._error("no_enabled_channel"), False
         return self.lifecycle.create(caller, request_id, payload), not replay
+
+    def _route_is_enabled(self) -> bool:
+        """Accept only the central configuration's affirmative route result."""
+        try:
+            result = self._route_admission()
+        except Exception:
+            return False
+        return result.get("success") is True and result.get("status") == "ready"
 
     def _caller(self, headers: object) -> str | None:
         if not isinstance(headers, list): return None
@@ -326,9 +436,16 @@ class Application:
 
 
 def create_app(*, database_path: str | Path, credentials: Mapping[str, str], clock: Clock, notify: Notifier,
-               wait: Waiter, ring_timeout_seconds: float = 60, agent_reconnect_seconds: float = 30) -> Application:
+               wait: Waiter, ring_timeout_seconds: float = 60, agent_reconnect_seconds: float = 30,
+               deadline_tick_seconds: float = 1, scheduler_sleep: Waiter = asyncio.sleep,
+               route_admission: RouteAdmission | None = None) -> Application:
+    if deadline_tick_seconds <= 0:
+        raise ValueError("deadline_tick_seconds must be positive")
     return Application(
         WaitingLifecycle(database_path, clock, notify, ring_timeout_seconds, agent_reconnect_seconds),
         credentials,
         wait,
+        deadline_tick_seconds,
+        scheduler_sleep,
+        route_admission if route_admission is not None else (lambda: {"success": True, "status": "ready"}),
     )
