@@ -38,11 +38,22 @@ class CookieBrowserSessions:
         return self.sessions.get(cookie or "")
 
 
+@dataclass
+class RuntimeState:
+    """Durable paths plus separately owned, already-authenticated seams."""
+
+    root: Path
+    clock: Clock
+    registry: TerminalRegistry
+    registration: DesktopRegistrationStateService
+    sessions: CookieBrowserSessions
+
+
 async def _no_wait(_: float) -> None:
     return None
 
 
-def _components(tmp_path: Path, *, route_mode: str = "both") -> tuple[Any, Clock, CookieBrowserSessions]:
+def _components(tmp_path: Path, *, route_mode: str = "both") -> tuple[Any, RuntimeState]:
     clock = Clock()
     registry = TerminalRegistry(database_path=tmp_path / "registry.sqlite3", clock=clock)
     registry.register_desktop(
@@ -55,7 +66,15 @@ def _components(tmp_path: Path, *, route_mode: str = "both") -> tuple[Any, Clock
         registered_credentials={"desktop-secret": {"device_id": "desktop-61", "terminal_platform": "windows"}},
         device_state=lambda _device: [],
     )
-    lifecycle_path = tmp_path / "lifecycle.sqlite3"
+    state = RuntimeState(tmp_path, clock, registry, registration, CookieBrowserSessions({
+        "operator-cookie": {"operator_id": "only-operator", "browser_session_id": "browser-61", "csrf_token": "csrf-61"},
+        "foreign-cookie": {"operator_id": "foreign", "browser_session_id": "browser-62", "csrf_token": "csrf-62"},
+    }))
+    return _make_app(state, route_mode=route_mode), state
+
+
+def _make_app(state: RuntimeState, *, route_mode: str) -> Any:
+    lifecycle_path = state.root / "lifecycle.sqlite3"
 
     def call_state(call_id: str) -> str | None:
         if not lifecycle_path.exists():
@@ -68,27 +87,23 @@ def _components(tmp_path: Path, *, route_mode: str = "both") -> tuple[Any, Clock
         return {"accepted": True, "http_status": 200, "business_success": True}
 
     router = NotificationRouter(
-        database_path=tmp_path / "router.sqlite3", clock=clock, registry=registry,
+        database_path=state.root / "router.sqlite3", clock=state.clock, registry=state.registry,
         desktop_dispatch=accepted, bark_dispatch=accepted, route_mode=route_mode,
         call_state=call_state, web_base_url="https://central.example.test",
     )
-    sessions = CookieBrowserSessions({
-        "operator-cookie": {"operator_id": "only-operator", "browser_session_id": "browser-61", "csrf_token": "csrf-61"},
-        "foreign-cookie": {"operator_id": "foreign", "browser_session_id": "browser-62", "csrf_token": "csrf-62"},
-    })
     # These deliberately absent lifecycle seams make the contract Red.  The
     # implementation must render real HTML and authenticate a cookie itself,
     # rather than reuse the private x-operator-session testing header.
     app = create_app(
         database_path=lifecycle_path, credentials={"agent-a": "agent-secret"},
-        clock=clock, notify=router.enqueue, wait=_no_wait,
+        clock=state.clock, notify=router.enqueue, wait=_no_wait,
         route_admission=router.validate_route, notification_router=router,
-        desktop_registration_service=registration,
-        browser_cookie_authenticator=sessions,
+        desktop_registration_service=state.registration,
+        browser_cookie_authenticator=state.sessions,
         mobile_html_renderer=lambda view, csrf_token: {"view": view, "csrf_token": csrf_token},
         trusted_browser_origin="https://central.example.test",
     )
-    return app, clock, sessions
+    return app
 
 
 def _request(app: Any, method: str, path: str, *, cookie: str | None = None,
@@ -119,7 +134,7 @@ def _create(app: Any, request_id: str = "create") -> dict[str, object]:
 
 
 def test_cookie_authenticated_initial_page_is_html_and_inert_while_link_or_foreign_session_is_opaque(tmp_path: Path) -> None:
-    app, _clock, _sessions = _components(tmp_path, route_mode="iphone")
+    app, _state = _components(tmp_path, route_mode="iphone")
     call = _create(app)
 
     page = _request(app, "GET", f"/calls/{call['call_id']}", cookie="operator-cookie")
@@ -142,7 +157,7 @@ def test_cookie_authenticated_initial_page_is_html_and_inert_while_link_or_forei
 
 
 def test_protected_form_actions_enforce_cookie_csrf_origin_and_host_then_preserve_submission_replay(tmp_path: Path) -> None:
-    app, _clock, _sessions = _components(tmp_path, route_mode="iphone")
+    app, _state = _components(tmp_path, route_mode="iphone")
     call = _create(app)
     accept_path = f"/calls/{call['call_id']}/accept"
     bad = _request(app, "POST", accept_path, cookie="operator-cookie", form={"operation_id": "accept", "csrf_token": "wrong"}, headers={"origin": "https://evil.example", "host": "evil.example"})
@@ -158,7 +173,7 @@ def test_protected_form_actions_enforce_cookie_csrf_origin_and_host_then_preserv
 
 
 def test_refresh_after_desktop_ownership_is_truthful_and_reconstruction_keeps_foreign_forms_inert(tmp_path: Path) -> None:
-    app, clock, sessions = _components(tmp_path, route_mode="both")
+    app, state = _components(tmp_path, route_mode="both")
     call = _create(app)
     async def desktop_accept() -> httpx.Response:
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://central.example.test") as client:
@@ -172,6 +187,19 @@ def test_refresh_after_desktop_ownership_is_truthful_and_reconstruction_keeps_fo
     foreign = _request(app, "POST", f"/calls/{call['call_id']}/decline", cookie="foreign-cookie", form={"operation_id": "foreign", "csrf_token": "csrf-62"}, headers={"origin": "https://central.example.test", "host": "central.example.test"})
     assert foreign.status_code in {401, 403, 404}
     assert call["call_id"] not in foreign.text
-    # The configured cookie seam, lifecycle SQLite state, and truthful page
-    # must survive an app reconstruction without creating a second owner.
-    assert clock() == 1_700_000_000.0 and sessions.authenticate_cookie("operator-cookie")
+    # Recreate only the lifecycle application/router over the same durable
+    # paths.  The browser-authentication and terminal-registration seams are
+    # retained: this is not a claim that those separate session stores are
+    # durable.  The restarted app must neither re-ring nor grant the browser
+    # a second owner or a writable form for this desktop-owned call.
+    restarted = _make_app(state, route_mode="both")
+    restarted_view = _request(restarted, "GET", f"/calls/{call['call_id']}", cookie="operator-cookie")
+    assert restarted_view.status_code == 200
+    assert "电脑端处理中" in restarted_view.text
+    assert "accept" not in restarted_view.text.lower()
+    restarted_foreign = _request(restarted, "POST", f"/calls/{call['call_id']}/decline", cookie="foreign-cookie", form={"operation_id": "foreign-after-restart", "csrf_token": "csrf-62"}, headers={"origin": "https://central.example.test", "host": "central.example.test"})
+    assert restarted_foreign.status_code in {401, 403, 404}
+    assert call["call_id"] not in restarted_foreign.text
+    with sqlite3.connect(state.root / "router.sqlite3") as conn:
+        deliveries = conn.execute("SELECT count(*) FROM notification_outbox WHERE call_id=?", (call["call_id"],)).fetchone()[0]
+    assert deliveries == 2
