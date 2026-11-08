@@ -97,7 +97,11 @@ def expected_disconnected(call: dict[str, object]) -> dict[str, object]:
 
 def test_ringing_heartbeat_continuation_refreshes_durable_reconnect_deadline_without_notification(tmp_path: Path) -> None:
     clock, notifications = FakeClock(), []
-    app = make_app(tmp_path, clock, notifications)
+    # The refreshed reconnect deadline is reached at t=79 below.  Keep the
+    # absolute ringing deadline later than that so this test isolates the
+    # reconnect-expiry branch; the next test below covers an earlier ring
+    # deadline winning instead.
+    app = make_app(tmp_path, clock, notifications, ring_timeout=120)
     call = create(app)
     clock.advance(20)
 
