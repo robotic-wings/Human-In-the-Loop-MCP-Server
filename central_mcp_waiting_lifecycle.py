@@ -194,6 +194,49 @@ class WaitingLifecycle:
                 conn.rollback()
                 raise
 
+    def apply_delivery_decisions(self, decisions: Mapping[str, object]) -> None:
+        """Apply definitive router decisions without letting routing own state.
+
+        ``unreachable`` is emitted only after the router has established that
+        every enabled channel definitely failed.  Uncertain and stale
+        decisions leave the call alone; settling deadlines first preserves
+        the absolute ringing deadline as the earlier terminal outcome.
+        """
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._settle_due(conn)
+                for call_id, decision in decisions.items():
+                    if not isinstance(call_id, str) or decision != "unreachable":
+                        continue
+                    call = conn.execute(
+                        "SELECT * FROM lifecycle_calls WHERE call_id=? AND call_state='ringing'",
+                        (call_id,),
+                    ).fetchone()
+                    if call is None:
+                        continue
+                    conn.execute(
+                        "UPDATE lifecycle_calls SET call_state='unreachable', reason='no_available_channel' "
+                        "WHERE call_id=?",
+                        (call_id,),
+                    )
+                    seq = int(conn.execute(
+                        "SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?",
+                        (call_id,),
+                    ).fetchone()["n"])
+                    body = self._terminal(
+                        call["interaction_id"], call_id, "unreachable", "no_available_channel", seq,
+                    )
+                    body["human_action"] = False
+                    conn.execute(
+                        "INSERT INTO lifecycle_events VALUES (?, ?, ?)",
+                        (call_id, seq, self._dump(body)),
+                    )
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+
     def accept(self, *, call_id: str, device_id: str, handled_on: str, terminal_platform: str) -> dict[str, object]:
         del device_id
         return self._human_action(call_id, "opened", "accepted", None, {"handled_on": handled_on, "terminal_platform": terminal_platform})
@@ -278,11 +321,29 @@ class WaitingLifecycle:
 class Application:
     def __init__(self, lifecycle: WaitingLifecycle, credentials: Mapping[str, str], wait: Waiter,
                  deadline_tick_seconds: float, scheduler_sleep: Waiter,
-                 route_admission: RouteAdmission) -> None:
+                 route_admission: RouteAdmission, notification_router: Any | None) -> None:
         self.lifecycle, self._credentials, self._wait = lifecycle, dict(credentials), wait
         self._deadline_tick_seconds, self._scheduler_sleep = deadline_tick_seconds, scheduler_sleep
         self._route_admission = route_admission
+        self._notification_router = notification_router
         self._deadline_task: asyncio.Task[None] | None = None
+
+    async def dispatch_notification_delivery(self) -> dict[str, object]:
+        """Dispatch pending notifications and apply their durable decisions.
+
+        The router is responsible for classifying individual delivery
+        attempts; the lifecycle is the authority that turns a definitive
+        all-channel failure into the Agent-visible terminal outcome.  Keeping
+        the bridge here prevents the router from owning call state while
+        ensuring its real dispatch result is not discarded.
+        """
+        if self._notification_router is None:
+            return {"call_decisions": {}}
+        result = await self._notification_router.dispatch_pending()
+        decisions = result.get("call_decisions") if isinstance(result, Mapping) else None
+        if isinstance(decisions, Mapping):
+            self.lifecycle.apply_delivery_decisions(decisions)
+        return result if isinstance(result, dict) else {"call_decisions": {}}
 
     async def __call__(self, scope: Mapping[str, Any], receive: Any, send: Any) -> None:
         if scope.get("type") == "lifespan":
@@ -391,7 +452,7 @@ class Application:
 def create_app(*, database_path: str | Path, credentials: Mapping[str, str], clock: Clock, notify: Notifier,
                wait: Waiter, ring_timeout_seconds: float = 60, agent_reconnect_seconds: float = 30,
                deadline_tick_seconds: float = 1, scheduler_sleep: Waiter = asyncio.sleep,
-               route_admission: RouteAdmission | None = None) -> Application:
+               route_admission: RouteAdmission | None = None, notification_router: Any | None = None) -> Application:
     if deadline_tick_seconds <= 0:
         raise ValueError("deadline_tick_seconds must be positive")
     return Application(
@@ -401,4 +462,5 @@ def create_app(*, database_path: str | Path, credentials: Mapping[str, str], clo
         deadline_tick_seconds,
         scheduler_sleep,
         route_admission if route_admission is not None else (lambda: {"success": True, "status": "ready"}),
+        notification_router,
     )
