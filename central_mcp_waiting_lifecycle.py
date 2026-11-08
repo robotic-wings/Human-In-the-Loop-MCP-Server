@@ -321,12 +321,20 @@ class WaitingLifecycle:
 class Application:
     def __init__(self, lifecycle: WaitingLifecycle, credentials: Mapping[str, str], wait: Waiter,
                  deadline_tick_seconds: float, scheduler_sleep: Waiter,
-                 route_admission: RouteAdmission, notification_router: Any | None) -> None:
+                 route_admission: RouteAdmission, notification_router: Any | None,
+                 notification_dispatch_tick_seconds: float, notification_scheduler_sleep: Waiter) -> None:
         self.lifecycle, self._credentials, self._wait = lifecycle, dict(credentials), wait
         self._deadline_tick_seconds, self._scheduler_sleep = deadline_tick_seconds, scheduler_sleep
         self._route_admission = route_admission
         self._notification_router = notification_router
+        if notification_router is not None:
+            sink_setter = getattr(notification_router, "set_delivery_decision_sink", None)
+            if callable(sink_setter):
+                sink_setter(self.lifecycle.apply_delivery_decisions)
         self._deadline_task: asyncio.Task[None] | None = None
+        self._notification_dispatch_tick_seconds = notification_dispatch_tick_seconds
+        self._notification_scheduler_sleep = notification_scheduler_sleep
+        self._notification_dispatch_task: asyncio.Task[None] | None = None
 
     async def dispatch_notification_delivery(self) -> dict[str, object]:
         """Dispatch pending notifications and apply their durable decisions.
@@ -375,20 +383,31 @@ class Application:
             event = await receive()
             if event.get("type") == "lifespan.startup":
                 self._deadline_task = asyncio.create_task(self._run_deadline_scheduler())
+                self._notification_dispatch_task = asyncio.create_task(self._run_notification_dispatch_scheduler())
                 await send({"type": "lifespan.startup.complete"})
             elif event.get("type") == "lifespan.shutdown":
-                if self._deadline_task is not None:
-                    self._deadline_task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await self._deadline_task
-                    self._deadline_task = None
+                await self._stop_scheduler("_notification_dispatch_task")
+                await self._stop_scheduler("_deadline_task")
                 await send({"type": "lifespan.shutdown.complete"})
                 return
+
+    async def _stop_scheduler(self, attribute: str) -> None:
+        task = getattr(self, attribute)
+        if task is not None:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+            setattr(self, attribute, None)
 
     async def _run_deadline_scheduler(self) -> None:
         while True:
             await self._scheduler_sleep(self._deadline_tick_seconds)
             self.lifecycle.settle_deadlines()
+
+    async def _run_notification_dispatch_scheduler(self) -> None:
+        while True:
+            await self._notification_scheduler_sleep(self._notification_dispatch_tick_seconds)
+            await self.dispatch_notification_delivery()
 
     def _dispatch(self, caller: str, body: Mapping[str, object]) -> tuple[dict[str, object], bool]:
         request_id = body.get("request_id")
@@ -452,9 +471,11 @@ class Application:
 def create_app(*, database_path: str | Path, credentials: Mapping[str, str], clock: Clock, notify: Notifier,
                wait: Waiter, ring_timeout_seconds: float = 60, agent_reconnect_seconds: float = 30,
                deadline_tick_seconds: float = 1, scheduler_sleep: Waiter = asyncio.sleep,
-               route_admission: RouteAdmission | None = None, notification_router: Any | None = None) -> Application:
-    if deadline_tick_seconds <= 0:
-        raise ValueError("deadline_tick_seconds must be positive")
+               route_admission: RouteAdmission | None = None, notification_router: Any | None = None,
+               notification_dispatch_tick_seconds: float = 1,
+               notification_scheduler_sleep: Waiter = asyncio.sleep) -> Application:
+    if deadline_tick_seconds <= 0 or notification_dispatch_tick_seconds <= 0:
+        raise ValueError("scheduler tick seconds must be positive")
     return Application(
         WaitingLifecycle(database_path, clock, notify, ring_timeout_seconds, agent_reconnect_seconds),
         credentials,
@@ -463,4 +484,6 @@ def create_app(*, database_path: str | Path, credentials: Mapping[str, str], clo
         scheduler_sleep,
         route_admission if route_admission is not None else (lambda: {"success": True, "status": "ready"}),
         notification_router,
+        notification_dispatch_tick_seconds,
+        notification_scheduler_sleep,
     )
