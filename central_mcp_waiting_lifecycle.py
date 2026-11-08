@@ -390,11 +390,13 @@ class Application:
     def __init__(self, lifecycle: WaitingLifecycle, credentials: Mapping[str, str], wait: Waiter,
                  deadline_tick_seconds: float, scheduler_sleep: Waiter,
                  route_admission: RouteAdmission, notification_router: Any | None,
-                 notification_dispatch_tick_seconds: float, notification_scheduler_sleep: Waiter) -> None:
+                 notification_dispatch_tick_seconds: float, notification_scheduler_sleep: Waiter,
+                 desktop_registration_service: Any | None = None) -> None:
         self.lifecycle, self._credentials, self._wait = lifecycle, dict(credentials), wait
         self._deadline_tick_seconds, self._scheduler_sleep = deadline_tick_seconds, scheduler_sleep
         self._route_admission = route_admission
         self._notification_router = notification_router
+        self._desktop_registration_service = desktop_registration_service
         if notification_router is not None:
             sink_setter = getattr(notification_router, "set_delivery_decision_sink", None)
             if callable(sink_setter):
@@ -425,7 +427,13 @@ class Application:
         if scope.get("type") == "lifespan":
             await self._lifespan(receive, send)
             return
-        if scope.get("type") != "http" or scope.get("method") != "POST" or scope.get("path") != "/mcp":
+        if scope.get("type") != "http":
+            await self._send(send, 404, self._error("not_found")); return
+        path, method = scope.get("path"), scope.get("method")
+        if path.startswith("/api/terminals/"):
+            await self._terminal_api(method, path, scope.get("headers", []), receive, send)
+            return
+        if method != "POST" or path != "/mcp":
             await self._send(send, 404, self._error("not_found")); return
         caller = self._caller(scope.get("headers", []))
         if caller is None:
@@ -445,6 +453,37 @@ class Application:
         await send({"type": "http.response.body", "body": json.dumps(response, separators=(",", ":")).encode(), "more_body": False})
         if should_wait:
             self.lifecycle.response_delivered(caller, response)
+
+    async def _terminal_api(self, method: object, path: object, headers: object, receive: Any, send: Any) -> None:
+        service = self._desktop_registration_service
+        if service is None:
+            await self._send(send, 404, self._error("not_found")); return
+        if method == "POST" and path == "/api/terminals/register":
+            body = await self._body(receive)
+            credential = self._terminal_credential(headers)
+            if body is None or credential is None:
+                await self._send(send, 401, self._terminal_error("terminal_not_authenticated")); return
+            endpoint, gui_ready = body.get("endpoint"), body.get("gui_ready")
+            if not isinstance(endpoint, str) or not isinstance(gui_ready, bool):
+                await self._send(send, 400, self._error("invalid_request")); return
+            response = service.register(credential=credential, endpoint=endpoint, gui_ready=gui_ready)
+            await self._send(send, 201 if response.get("success") else 401, response); return
+        if path not in {"/api/terminals/heartbeat", "/api/terminals/state"}:
+            await self._send(send, 404, self._error("not_found")); return
+        session = self._terminal_session(headers)
+        if session is None:
+            await self._send(send, 401, self._terminal_error("session_not_found")); return
+        if method == "POST" and path == "/api/terminals/heartbeat":
+            body = await self._body(receive)
+            gui_ready = body.get("gui_ready") if body is not None else None
+            if not isinstance(gui_ready, bool):
+                await self._send(send, 400, self._error("invalid_request")); return
+            response = service.heartbeat(session_id=session, gui_ready=gui_ready)
+        elif method == "GET" and path == "/api/terminals/state":
+            response = service.states(session_id=session)
+        else:
+            await self._send(send, 404, self._error("not_found")); return
+        await self._send(send, 200 if response.get("success") else 404, response)
 
     async def _lifespan(self, receive: Any, send: Any) -> None:
         while True:
@@ -524,6 +563,22 @@ class Application:
         return None
 
     @staticmethod
+    def _header(headers: object, wanted: bytes) -> str | None:
+        if not isinstance(headers, list):
+            return None
+        for name, value in headers:
+            if bytes(name).lower() == wanted:
+                return bytes(value).decode("latin-1")
+        return None
+
+    def _terminal_credential(self, headers: object) -> str | None:
+        presented = self._header(headers, b"authorization")
+        return presented[9:] if presented is not None and presented.startswith("Terminal ") else None
+
+    def _terminal_session(self, headers: object) -> str | None:
+        return self._header(headers, b"x-terminal-session")
+
+    @staticmethod
     async def _body(receive: Any) -> dict[str, object] | None:
         event = await receive()
         if event.get("type") != "http.request": return None
@@ -535,6 +590,10 @@ class Application:
     def _error(status: str) -> dict[str, object]:
         return {"success": False, "status": status, "needs_continuation": False}
 
+    @staticmethod
+    def _terminal_error(status: str) -> dict[str, object]:
+        return {"success": False, "status": status}
+
     async def _send(self, send: Any, status: int, body: Mapping[str, object]) -> None:
         await send({"type": "http.response.start", "status": status, "headers": [(b"content-type", b"application/json")]})
         await send({"type": "http.response.body", "body": json.dumps(body).encode(), "more_body": False})
@@ -545,7 +604,8 @@ def create_app(*, database_path: str | Path, credentials: Mapping[str, str], clo
                deadline_tick_seconds: float = 1, scheduler_sleep: Waiter = asyncio.sleep,
                route_admission: RouteAdmission | None = None, notification_router: Any | None = None,
                notification_dispatch_tick_seconds: float = 1,
-               notification_scheduler_sleep: Waiter = asyncio.sleep) -> Application:
+               notification_scheduler_sleep: Waiter = asyncio.sleep,
+               desktop_registration_service: Any | None = None) -> Application:
     if deadline_tick_seconds <= 0 or notification_dispatch_tick_seconds <= 0:
         raise ValueError("scheduler tick seconds must be positive")
     return Application(
@@ -558,4 +618,5 @@ def create_app(*, database_path: str | Path, credentials: Mapping[str, str], clo
         notification_router,
         notification_dispatch_tick_seconds,
         notification_scheduler_sleep,
+        desktop_registration_service,
     )
