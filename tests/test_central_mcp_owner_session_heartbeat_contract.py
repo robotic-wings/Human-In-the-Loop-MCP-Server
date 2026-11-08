@@ -176,6 +176,15 @@ def test_global_or_foreign_activity_cannot_keep_an_accepted_owner_session_alive(
         assert denied.json()["success"] is False
     assert _call_row(database, str(call["call_id"]))["terminal_disconnect_deadline"] == before["terminal_disconnect_deadline"]
 
+    # The continuation correctly arms its separate Agent-reconnect grace.
+    # Remove that independently-tested clock before isolating the terminal
+    # deadline below; otherwise it would correctly win at +30 rather than
+    # testing the owner-session timeout.  The explicit equal-deadline test
+    # covers the specified terminal-before-Agent ordering separately.
+    with sqlite3.connect(database) as conn:
+        conn.execute("UPDATE lifecycle_calls SET agent_reconnect_deadline=NULL WHERE call_id=?", (call["call_id"],))
+        conn.commit()
+
     clock.advance(180)
     # A request path must settle the durable owner-session expiry before a
     # late heartbeat can mutate it.
