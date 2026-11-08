@@ -211,6 +211,51 @@ def test_decline_is_explicit_whole_call_action_and_replays(tmp_path: Path) -> No
     assert updates == [{"call_id": call_id, "call_state": "declined"}]
 
 
+def test_browser_action_replay_is_scoped_to_the_call_id(tmp_path: Path) -> None:
+    """A browser operation ID cannot replay an outcome onto a later call."""
+
+    clock, updates, renderer = FakeClock(), [], Renderer()
+    coordinator, service = _service(tmp_path, clock, updates)
+    first_call = _call(coordinator, service, {"bark"})
+    iphone_session = _terminal_session(service, "iphone-terminal")
+    sessions = BrowserSessions({"owner": {"operator_id": "only-operator", "terminal_session_id": iphone_session}})
+    app = _app(service, sessions, renderer)
+
+    first = _request(
+        app,
+        "POST",
+        f"/calls/{first_call}/decline",
+        token="owner",
+        body={"operation_id": "reused-op"},
+    )
+    assert first.status_code == 200
+    assert first.json()["call_state"] == "declined"
+    assert coordinator.get_call(first_call)["call_state"] == "declined"
+
+    # D4 permits a second invitation only after the first call has ended.
+    # Its distinct request ID must therefore reach the central service even
+    # when the browser reuses its operation ID.
+    second_call = _call(coordinator, service, {"bark"})
+    assert second_call != first_call
+    second = _request(
+        app,
+        "POST",
+        f"/calls/{second_call}/accept",
+        token="owner",
+        body={"operation_id": "reused-op"},
+    )
+
+    assert second.status_code == 200
+    assert second.json()["call_id"] == second_call
+    assert second.json()["call_state"] == "accepted"
+    assert coordinator.get_call(first_call)["call_state"] == "declined"
+    assert coordinator.get_call(second_call)["call_state"] == "accepted"
+    assert updates == [
+        {"call_id": first_call, "call_state": "declined"},
+        {"call_id": second_call, "call_state": "accepted"},
+    ]
+
+
 def test_route_foreign_unknown_and_late_states_are_uniformly_hidden(tmp_path: Path) -> None:
     clock, updates, renderer = FakeClock(), [], Renderer()
     coordinator, service = _service(tmp_path, clock, updates)
