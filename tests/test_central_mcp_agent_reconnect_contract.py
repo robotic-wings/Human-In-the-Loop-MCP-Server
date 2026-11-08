@@ -133,7 +133,10 @@ def test_reconnect_expiry_is_immutable_across_restart_releases_busy_and_rejects_
 
     next_call = create(restarted, "new-after-release")
     assert next_call["status"] == "heartbeat"
-    assert len(notifications) == 2
+    # The original app's injected notifier records only its own initial
+    # invitation.  The restarted app owns the notifier used for the newly
+    # admitted call.
+    assert notifications == [{"call_id": call["call_id"], "ring_deadline": 1_700_000_060.0}]
     assert restarted_notifications == [{"call_id": next_call["call_id"], "ring_deadline": clock() + 60}]
 
 
