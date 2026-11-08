@@ -37,6 +37,10 @@ class DesktopTerminalClient:
         self._operations: dict[tuple[str, str], dict[str, object]] = {}
 
     def start(self) -> dict[str, object]:
+        if self._callback_credential() is None:
+            self._online = False
+            self._gui_ready = False
+            return {"success": False, "status": "invalid_config"}
         self._gui_ready = bool(self._gui_capability())
         if not self._gui_ready:
             self._online = False
@@ -60,7 +64,8 @@ class DesktopTerminalClient:
     def receive_notification(
         self, event: Mapping[str, object], *, callback_credential: str | None
     ) -> dict[str, object]:
-        if callback_credential != self._callback_credential():
+        expected_credential = self._callback_credential()
+        if expected_credential is None or callback_credential != expected_credential:
             return {"success": False, "status": "notification_not_authenticated"}
         call_id, version = event.get("call_id"), event.get("version")
         if not isinstance(call_id, str) or not isinstance(version, int) or not self._online or self._session_id is None:
@@ -140,8 +145,8 @@ class DesktopTerminalClient:
             self._close(call_id)
         return {"success": False, "status": "central_unavailable"}
 
-    def _callback_credential(self) -> str:
-        # Kept separate from the terminal credential; deployments provide this
-        # protected value in local configuration.  The fallback is only a test
-        # placeholder for the injected contract adapter.
-        return str(self._config.get("callback_credential", "central-callback-secret"))
+    def _callback_credential(self) -> str | None:
+        """Return the separately configured callback secret, never a fallback."""
+
+        credential = self._config.get("callback_credential")
+        return credential if isinstance(credential, str) and credential else None
