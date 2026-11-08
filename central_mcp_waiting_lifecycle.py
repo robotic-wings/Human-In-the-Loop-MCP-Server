@@ -26,9 +26,10 @@ RouteAdmission = Callable[[], Mapping[str, object]]
 
 class WaitingLifecycle:
     def __init__(self, path: str | Path, clock: Clock, notify: Notifier, ring_timeout: float,
-                 agent_reconnect_seconds: float) -> None:
+                 agent_reconnect_seconds: float, terminal_disconnect_seconds: float = 180) -> None:
         self._path, self._clock, self._notify = str(path), clock, notify
         self._ring_timeout, self._agent_reconnect_seconds = ring_timeout, agent_reconnect_seconds
+        self._terminal_disconnect_seconds = terminal_disconnect_seconds
         Path(self._path).parent.mkdir(parents=True, exist_ok=True)
         with self._connection() as conn:
             conn.executescript("""
@@ -37,6 +38,7 @@ class WaitingLifecycle:
                 call_state TEXT NOT NULL, ring_deadline REAL NOT NULL, reason TEXT,
                 owner_device_id TEXT, owner_session_id TEXT, handled_on TEXT,
                 terminal_platform TEXT, invited_desktop_id TEXT,
+                terminal_last_seen_at REAL, terminal_disconnect_deadline REAL,
                 version INTEGER NOT NULL DEFAULT 1
               );
               CREATE TABLE IF NOT EXISTS lifecycle_requests (
@@ -70,6 +72,7 @@ class WaitingLifecycle:
             ("owner_device_id", "TEXT"), ("owner_session_id", "TEXT"),
             ("handled_on", "TEXT"), ("terminal_platform", "TEXT"),
             ("invited_desktop_id", "TEXT"),
+            ("terminal_last_seen_at", "REAL"), ("terminal_disconnect_deadline", "REAL"),
             ("version", "INTEGER NOT NULL DEFAULT 1"),
         ):
             if column not in columns:
@@ -348,8 +351,10 @@ class WaitingLifecycle:
                 else:
                     state, status, reason = ("accepted", "opened", None) if action == "accept" else ("declined", "declined", "human_declined")
                     conn.execute(
-                        "UPDATE lifecycle_calls SET call_state=?, reason=?, owner_device_id=?, owner_session_id=?, handled_on='desktop', terminal_platform=?, version=version+1 WHERE call_id=?",
-                        (state, reason, device_id, session_id, terminal_platform, call_id),
+                        "UPDATE lifecycle_calls SET call_state=?, reason=?, owner_device_id=?, owner_session_id=?, handled_on='desktop', terminal_platform=?, terminal_last_seen_at=?, terminal_disconnect_deadline=?, agent_reconnect_deadline=?, version=version+1 WHERE call_id=?",
+                        (state, reason, device_id, session_id, terminal_platform, self._clock(),
+                         self._clock() + self._terminal_disconnect_seconds if action == "accept" else None,
+                         None, call_id),
                     )
                     seq = int(conn.execute("SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call_id,)).fetchone()["n"])
                     outcome: dict[str, object] = {
@@ -366,6 +371,35 @@ class WaitingLifecycle:
                 conn.execute("INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?, ?)", (actor, operation_id, encoded, self._dump(outcome), kind))
                 conn.commit()
                 return outcome
+            except BaseException:
+                conn.rollback()
+                raise
+
+    def terminal_heartbeat(self, *, call_id: str, session_id: str) -> dict[str, object]:
+        """Refresh liveness only for the exact session which accepted the call."""
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._settle_due(conn)
+                call = conn.execute("SELECT * FROM lifecycle_calls WHERE call_id=?", (call_id,)).fetchone()
+                if call is None or call["owner_session_id"] != session_id:
+                    return self._error("session_not_found")
+                if call["call_state"] not in {"accepted", "in_progress"}:
+                    event = conn.execute(
+                        "SELECT body_json FROM lifecycle_events WHERE call_id=? ORDER BY event_seq DESC LIMIT 1",
+                        (call_id,),
+                    ).fetchone()
+                    outcome = self._load(event["body_json"]) if event else self._error("expired")
+                    conn.commit()
+                    return outcome
+                now = self._clock()
+                conn.execute(
+                    "UPDATE lifecycle_calls SET terminal_last_seen_at=?, terminal_disconnect_deadline=? WHERE call_id=?",
+                    (now, now + self._terminal_disconnect_seconds, call_id),
+                )
+                conn.commit()
+                return {"success": True, "status": "heartbeat", "call_state": call["call_state"],
+                        "needs_continuation": True}
             except BaseException:
                 conn.rollback()
                 raise
@@ -431,6 +465,20 @@ class WaitingLifecycle:
             conn.execute("UPDATE lifecycle_calls SET call_state='not_accepted', reason='ring_timeout' WHERE call_id=?", (call["call_id"],))
             seq = int(conn.execute("SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call["call_id"],)).fetchone()["n"])
             body = self._terminal(call["interaction_id"], call["call_id"], "not_accepted", "ring_timeout", seq)
+            conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call["call_id"], seq, self._dump(body)))
+        rows = conn.execute(
+            "SELECT * FROM lifecycle_calls WHERE call_state IN ('accepted', 'in_progress') "
+            "AND terminal_disconnect_deadline IS NOT NULL AND terminal_disconnect_deadline<=?",
+            (now,),
+        ).fetchall()
+        for call in rows:
+            conn.execute(
+                "UPDATE lifecycle_calls SET call_state='disconnected', reason='terminal_disconnected', version=version+1 WHERE call_id=?",
+                (call["call_id"],),
+            )
+            seq = int(conn.execute("SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call["call_id"],)).fetchone()["n"])
+            body = self._terminal(call["interaction_id"], call["call_id"], "disconnected", "terminal_disconnected", seq)
+            body["human_action"] = False
             conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call["call_id"], seq, self._dump(body)))
         rows = conn.execute(
             "SELECT * FROM lifecycle_calls WHERE call_state IN ('ringing', 'accepted', 'in_progress') "
@@ -587,21 +635,25 @@ class Application:
         if method != "POST" or not isinstance(path, str):
             await self._send(send, 404, self._error("not_found")); return
         parts = path.split("/")
-        if len(parts) != 5 or parts[:3] != ["", "api", "calls"] or parts[4] not in {"accept", "decline"}:
+        if len(parts) != 5 or parts[:3] != ["", "api", "calls"] or parts[4] not in {"accept", "decline", "heartbeat"}:
             await self._send(send, 404, self._error("not_found")); return
         session = self._terminal_session(headers)
         context = self._terminal_context(session) if session is not None else None
         if context is None:
             await self._send(send, 401, self._terminal_error("session_not_found")); return
-        body = await self._body(receive)
-        operation_id = body.get("operation_id") if body is not None else None
-        if not isinstance(operation_id, str) or not operation_id:
-            await self._send(send, 400, self._error("invalid_request")); return
         device_id, platform = context
-        response = self.lifecycle.terminal_action(
-            call_id=parts[3], device_id=device_id, session_id=session, terminal_platform=platform,
-            operation_id=operation_id, action=parts[4],
-        )
+        if parts[4] == "heartbeat":
+            await self._body(receive)
+            response = self.lifecycle.terminal_heartbeat(call_id=parts[3], session_id=session)
+        else:
+            body = await self._body(receive)
+            operation_id = body.get("operation_id") if body is not None else None
+            if not isinstance(operation_id, str) or not operation_id:
+                await self._send(send, 400, self._error("invalid_request")); return
+            response = self.lifecycle.terminal_action(
+                call_id=parts[3], device_id=device_id, session_id=session, terminal_platform=platform,
+                operation_id=operation_id, action=parts[4],
+            )
         await self._send(send, 200 if response.get("success") else 404, response)
 
     def _terminal_context(self, session_id: str | None) -> tuple[str, str] | None:
@@ -750,15 +802,17 @@ class Application:
 
 def create_app(*, database_path: str | Path, credentials: Mapping[str, str], clock: Clock, notify: Notifier,
                wait: Waiter, ring_timeout_seconds: float = 60, agent_reconnect_seconds: float = 30,
+               terminal_disconnect_seconds: float = 180,
                deadline_tick_seconds: float = 1, scheduler_sleep: Waiter = asyncio.sleep,
                route_admission: RouteAdmission | None = None, notification_router: Any | None = None,
                notification_dispatch_tick_seconds: float = 1,
                notification_scheduler_sleep: Waiter = asyncio.sleep,
                desktop_registration_service: Any | None = None) -> Application:
-    if deadline_tick_seconds <= 0 or notification_dispatch_tick_seconds <= 0:
+    if deadline_tick_seconds <= 0 or notification_dispatch_tick_seconds <= 0 or terminal_disconnect_seconds <= 0:
         raise ValueError("scheduler tick seconds must be positive")
     return Application(
-        WaitingLifecycle(database_path, clock, notify, ring_timeout_seconds, agent_reconnect_seconds),
+        WaitingLifecycle(database_path, clock, notify, ring_timeout_seconds, agent_reconnect_seconds,
+                         terminal_disconnect_seconds),
         credentials,
         wait,
         deadline_tick_seconds,
