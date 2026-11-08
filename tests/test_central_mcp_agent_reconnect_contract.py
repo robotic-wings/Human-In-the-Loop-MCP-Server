@@ -36,11 +36,31 @@ class RecordingWait:
         self.legs.append(seconds)
 
 
+class FirstLegAdvancingWait(RecordingWait):
+    """Advances only the initial wait leg to model heartbeat delivery time."""
+
+    def __init__(self, clock: FakeClock) -> None:
+        super().__init__()
+        self._clock = clock
+
+    async def __call__(self, seconds: float) -> None:
+        await super().__call__(seconds)
+        if len(self.legs) == 1:
+            self._clock.advance(seconds)
+
+
 def _module() -> Any:
     return importlib.import_module("central_mcp_waiting_lifecycle")
 
 
-def make_app(tmp_path: Path, clock: FakeClock, notifications: list[dict[str, object]], *, ring_timeout: float = 60) -> Any:
+def make_app(
+    tmp_path: Path,
+    clock: FakeClock,
+    notifications: list[dict[str, object]],
+    *,
+    ring_timeout: float = 60,
+    wait: Any | None = None,
+) -> Any:
     # ``agent_reconnect_seconds`` is an intentional new seam.  The current
     # adapter has no durable reconnect deadline at all, so this Red contract
     # must initially fail rather than accidentally testing a wall-clock wait.
@@ -49,7 +69,7 @@ def make_app(tmp_path: Path, clock: FakeClock, notifications: list[dict[str, obj
         credentials={"agent-a": "token-a", "agent-b": "token-b"},
         clock=clock,
         notify=notifications.append,
-        wait=RecordingWait(),
+        wait=wait or RecordingWait(),
         ring_timeout_seconds=ring_timeout,
         agent_reconnect_seconds=30,
     )
@@ -65,8 +85,11 @@ def post(app: Any, body: dict[str, object], token: str = "token-a") -> dict[str,
     return response.json()
 
 
-def create(app: Any, request_id: str = "create") -> dict[str, object]:
-    created = post(app, {"request_id": request_id, "payload": {"tool": "text"}, "client_timeout_seconds": 8})
+def create(app: Any, request_id: str = "create", *, client_timeout: float = 8) -> dict[str, object]:
+    created = post(
+        app,
+        {"request_id": request_id, "payload": {"tool": "text"}, "client_timeout_seconds": client_timeout},
+    )
     assert created["status"] == "heartbeat"
     return created
 
@@ -114,6 +137,31 @@ def test_ringing_heartbeat_continuation_refreshes_durable_reconnect_deadline_wit
     assert post(app, continuation(call, "still-live"))["status"] == "heartbeat"
     clock.advance(30)
     assert post(app, continuation(call, "expired")) == expected_disconnected(call)
+
+
+def test_reconnect_grace_starts_when_the_heartbeat_is_delivered_not_when_wait_begins(tmp_path: Path) -> None:
+    clock, notifications = FakeClock(), []
+    wait = FirstLegAdvancingWait(clock)
+    app = make_app(tmp_path, clock, notifications, ring_timeout=120, wait=wait)
+
+    # A 120-second client limit has a 90-second safe wait leg.  The initial
+    # heartbeat therefore arrives at t=90, and only then may its 30-second
+    # reconnect allowance begin; a deadline set when the request began would
+    # already be expired at t=90.
+    call = create(app, client_timeout=120)
+    assert wait.legs == [90]
+    assert clock() == 1_700_000_090.0
+    immediate = post(app, continuation(call, "immediate-after-delivery"))
+    assert immediate["status"] == "heartbeat"
+    assert immediate["call_state"] == "ringing"
+
+    # The original absolute ring deadline still wins at t=120.  The point of
+    # this case is that the immediate continuation at t=90 is not falsely
+    # settled as an already-expired agent reconnect deadline.
+    clock.advance(30)
+    terminal = post(app, continuation(call, "absolute-ring-wins"))
+    assert terminal["status"] == "not_accepted"
+    assert terminal["reason"] == "ring_timeout"
 
 
 def test_reconnect_expiry_is_immutable_across_restart_releases_busy_and_rejects_late_action(tmp_path: Path) -> None:
