@@ -150,6 +150,12 @@ class CentralServiceConfig:
             if (not isinstance(credential, str) or not credential
                     or not isinstance(session_cookie, str) or session_cookie not in operator_sessions):
                 raise ValueError("operator_login_credentials must map credentials to configured sessions")
+            # The lifecycle is deliberately single-operator.  A credential
+            # which names any other configured browser session cannot ever
+            # own a call, so accepting it here would defer a configuration
+            # error until after a successful-looking browser login.
+            if operator_sessions[session_cookie]["operator_id"] != "only-operator":
+                raise ValueError("operator_login_credentials must target the configured operator session")
             operator_login_credentials[credential] = session_cookie
 
         return cls(
