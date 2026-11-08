@@ -77,7 +77,7 @@ class WaitingLifecycle:
                         return self._error("request_conflict")
                     return self._load(existing["outcome_json"])
                 self._settle_due(conn)
-                active = conn.execute("SELECT call_id FROM lifecycle_calls WHERE call_state IN ('ringing', 'accepted') LIMIT 1").fetchone()
+                active = conn.execute("SELECT call_id FROM lifecycle_calls WHERE call_state IN ('ringing', 'accepted', 'in_progress') LIMIT 1").fetchone()
                 if active is not None:
                     outcome = {"success": True, "status": "busy", "call_state": None, "call_id": None, "needs_continuation": False}
                 else:
@@ -132,7 +132,7 @@ class WaitingLifecycle:
                 event = conn.execute("SELECT body_json FROM lifecycle_events WHERE call_id=? AND event_seq>? ORDER BY event_seq LIMIT 1", (call_id, after)).fetchone()
                 if event is not None:
                     outcome = self._load(event["body_json"])
-                elif call["call_state"] in {"ringing", "accepted"}:
+                elif call["call_state"] in {"ringing", "accepted", "in_progress"}:
                     outcome = self._heartbeat(interaction_id, call_id, call["call_state"])
                 else:
                     # A terminal state always has an event, but retain a safe fallback.
@@ -148,9 +148,11 @@ class WaitingLifecycle:
     def response_delivered(self, caller_id: str, response: Mapping[str, object]) -> None:
         """Persist grace only after a newly executed resumable response is sent."""
         status, state = response.get("status"), response.get("call_state")
-        if state not in {"ringing", "accepted"}:
+        if state not in {"ringing", "accepted", "in_progress"}:
             return
-        if status != "heartbeat" and not (status == "opened" and state == "accepted"):
+        if status != "heartbeat" and not (status == "opened" and state == "accepted") and not (
+            status == "in_progress" and state == "in_progress"
+        ):
             return
         interaction_id, call_id = response.get("interaction_id"), response.get("call_id")
         if not isinstance(interaction_id, str) or not isinstance(call_id, str):
@@ -164,9 +166,10 @@ class WaitingLifecycle:
                     (call_id, caller_id),
                 ).fetchone()
                 if call is not None and call["interaction_id"] == interaction_id and call["call_state"] == state:
+                    grace = 300 if state == "in_progress" else self._agent_reconnect_seconds
                     conn.execute(
                         "UPDATE lifecycle_calls SET agent_reconnect_deadline=? WHERE call_id=?",
-                        (self._clock() + self._agent_reconnect_seconds, call_id),
+                        (self._clock() + grace, call_id),
                     )
                 conn.commit()
             except BaseException:
@@ -188,7 +191,7 @@ class WaitingLifecycle:
                 call = conn.execute("SELECT * FROM lifecycle_calls WHERE call_id=?", (call_id,)).fetchone()
                 if call is None:
                     return self._error("session_not_found")
-                if call["call_state"] not in {"ringing", "accepted"}:
+                if call["call_state"] not in {"ringing", "accepted", "in_progress"}:
                     event = conn.execute("SELECT body_json FROM lifecycle_events WHERE call_id=? ORDER BY event_seq DESC LIMIT 1", (call_id,)).fetchone()
                     return self._load(event["body_json"]) if event else self._error("expired")
                 if status == "opened" and call["call_state"] != "ringing":
@@ -196,12 +199,12 @@ class WaitingLifecycle:
                 # A final answer cannot establish ownership by itself.  The
                 # accepted event is the durable ownership transition and must
                 # precede every terminal result.
-                if status != "opened" and call["call_state"] != "accepted":
+                if status != "opened" and call["call_state"] not in {"accepted", "in_progress"}:
                     return self._error("not_accepted")
                 conn.execute("UPDATE lifecycle_calls SET call_state=?, reason=? WHERE call_id=?", (state, reason, call_id))
                 seq = int(conn.execute("SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call_id,)).fetchone()["n"])
                 body: dict[str, object] = {"success": True, "status": status, "call_state": state, "event_seq": seq,
-                                            "needs_continuation": status == "opened", "interaction_id": call["interaction_id"], "call_id": call_id}
+                                            "needs_continuation": status in {"opened", "in_progress"}, "interaction_id": call["interaction_id"], "call_id": call_id}
                 body.update(extra)
                 conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call_id, seq, self._dump(body)))
                 conn.commit()
@@ -219,7 +222,7 @@ class WaitingLifecycle:
             body = self._terminal(call["interaction_id"], call["call_id"], "not_accepted", "ring_timeout", seq)
             conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call["call_id"], seq, self._dump(body)))
         rows = conn.execute(
-            "SELECT * FROM lifecycle_calls WHERE call_state IN ('ringing', 'accepted') "
+            "SELECT * FROM lifecycle_calls WHERE call_state IN ('ringing', 'accepted', 'in_progress') "
             "AND agent_reconnect_deadline IS NOT NULL AND agent_reconnect_deadline<=?",
             (now,),
         ).fetchall()
