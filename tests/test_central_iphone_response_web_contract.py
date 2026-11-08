@@ -15,6 +15,7 @@ import ast
 import importlib
 import inspect
 import sqlite3
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -86,7 +87,7 @@ def _service(tmp_path: Path, clock: FakeClock, updates: list[dict[str, object]])
 
 def _call(coordinator: CallCoordinator, service: TerminalCallService, channels: set[str]) -> str:
     created = coordinator.create_call(
-        caller_id="agent-a", request_id=f"create-{len(channels)}-{id(channels)}", payload={"prompt": "Proceed?"}
+        caller_id="agent-a", request_id=f"create-{len(channels)}-{uuid.uuid4()}", payload={"prompt": "Proceed?"}
     )
     call_id = str(created["call_id"])
     service.track_call(call_id=call_id, enabled_channels=channels)
@@ -214,7 +215,14 @@ def test_route_foreign_unknown_and_late_states_are_uniformly_hidden(tmp_path: Pa
     clock, updates, renderer = FakeClock(), [], Renderer()
     coordinator, service = _service(tmp_path, clock, updates)
     bark_call = _call(coordinator, service, {"bark"})
+    # The coordinator intentionally permits only one active call.  Seed the
+    # first call's terminal state before constructing a desktop-only call so
+    # this test exercises route exclusion on a genuinely distinct call rather
+    # than accidentally reusing the active Bark call.
+    with sqlite3.connect(tmp_path / "calls.sqlite3") as conn:
+        conn.execute("UPDATE calls SET call_state='answered' WHERE call_id=?", (bark_call,))
     desktop_call = _call(coordinator, service, {"desktop"})
+    assert desktop_call != bark_call
     iphone_session = _terminal_session(service, "iphone-terminal")
     other_iphone = _terminal_session(service, "iphone-terminal")
     sessions = BrowserSessions({
@@ -222,8 +230,6 @@ def test_route_foreign_unknown_and_late_states_are_uniformly_hidden(tmp_path: Pa
         "other": {"operator_id": "only-operator", "terminal_session_id": other_iphone},
     })
     app = _app(service, sessions, renderer)
-    assert _request(app, "POST", f"/calls/{bark_call}/accept", token="owner", body={"operation_id": "take"}).status_code == 200
-
     for response in (
         _request(app, "GET", f"/calls/{desktop_call}", token="owner"),
         _request(app, "GET", "/calls/no-such-call", token="owner"),
@@ -231,11 +237,11 @@ def test_route_foreign_unknown_and_late_states_are_uniformly_hidden(tmp_path: Pa
         _request(app, "POST", f"/calls/{bark_call}/decline", token="other", body={"operation_id": "late"}),
     ):
         _hidden(response)
-    # The first call was deliberately settled above to make room for the
+    # The first call was deliberately settled before construction of the
     # distinct desktop-only call.  A late or foreign browser operation cannot
     # revive it or disclose a writable state.
     assert coordinator.get_call(bark_call)["call_state"] == "answered"
-    assert len(updates) == 1
+    assert updates == []
 
 
 def test_desktop_processing_and_processed_views_are_truthful_not_editable(tmp_path: Path) -> None:
