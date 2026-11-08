@@ -221,6 +221,40 @@ def test_browser_owner_submission_and_unauthorized_or_preaccept_attempts_are_ine
 
     accepted = request(app, "POST", f"/calls/{call['call_id']}/accept", browser="operator", body={"operation_id": "web-accept"})
     assert accepted.status_code == 200
+
+    # The call was already created and routed before this distinct device is
+    # configured, so it cannot displace desktop-owner as the invited device.
+    # Its valid session must be denied while the browser owner still holds an
+    # active accepted call, not only after all actors are terminal-state inert.
+    configure_foreign_desktop_after_routing(app)
+    other = terminal_session(app, "other-desktop-secret")
+    with sqlite3.connect(tmp_path / "lifecycle.sqlite3") as conn:
+        before_call = conn.execute(
+            "SELECT call_state, version, owner_device_id, owner_session_id, handled_on "
+            "FROM lifecycle_calls WHERE call_id=?", (call["call_id"],)
+        ).fetchone()
+        before_events = conn.execute(
+            "SELECT event_seq, body_json FROM lifecycle_events WHERE call_id=? ORDER BY event_seq",
+            (call["call_id"],),
+        ).fetchall()
+    before_delivery = app._notification_router.delivery_states(str(call["call_id"]))
+    hidden(request(app, "POST", f"/api/calls/{call['call_id']}/submissions", terminal=other, body={
+        "submission_id": "other", "result": {"user_input": "steal"},
+    }))
+    with sqlite3.connect(tmp_path / "lifecycle.sqlite3") as conn:
+        after_call = conn.execute(
+            "SELECT call_state, version, owner_device_id, owner_session_id, handled_on "
+            "FROM lifecycle_calls WHERE call_id=?", (call["call_id"],)
+        ).fetchone()
+        after_events = conn.execute(
+            "SELECT event_seq, body_json FROM lifecycle_events WHERE call_id=? ORDER BY event_seq",
+            (call["call_id"],),
+        ).fetchall()
+    assert after_call == before_call
+    assert after_events == before_events
+    assert app._notification_router.delivery_states(str(call["call_id"])) == before_delivery
+    assert create(app, "foreign-still-busy")["status"] == "busy"
+
     submitted = request(app, "POST", f"/calls/{call['call_id']}/submissions", browser="operator", body={
         "submission_id": "web-final", "result": {"user_input": "from iphone"},
     })
@@ -228,13 +262,6 @@ def test_browser_owner_submission_and_unauthorized_or_preaccept_attempts_are_ine
     assert submitted.json()["handled_on"] == "iphone_web"
     assert continuation(app, call, after=1)["result"] == {"user_input": "from iphone"}
 
-    # The call was already created and routed before this distinct device is
-    # configured, so it cannot displace desktop-owner as the invited device.
-    configure_foreign_desktop_after_routing(app)
-    other = terminal_session(app, "other-desktop-secret")
-    hidden(request(app, "POST", f"/api/calls/{call['call_id']}/submissions", terminal=other, body={
-        "submission_id": "other", "result": {"user_input": "steal"},
-    }))
 
 
 def test_deadline_and_terminal_submission_are_authoritative_before_late_owner_submission(tmp_path: Path) -> None:
