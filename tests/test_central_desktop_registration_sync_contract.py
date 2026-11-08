@@ -83,6 +83,7 @@ def _client(service: Any, presenter: FakePresenter, ring: FakeRing):
         config={
             "terminal_credential": "desktop-secret",
             "listener_endpoint": "https://10.0.0.61:9100/terminal/events",
+            "callback_credential": "central-callback-secret",
         },
         central=service,
         presenter=presenter,
@@ -223,7 +224,10 @@ def test_stale_or_duplicate_versions_never_reopen_or_rering_after_authoritative_
     client.start()
 
     # The identical current callback is a duplicate delivery, not a new alert.
-    assert client.receive_callback({"call_id": "call-1", "call_state": "ringing", "version": 2}) == {
+    assert client.receive_callback(
+        {"call_id": "call-1", "call_state": "ringing", "version": 2},
+        callback_credential="central-callback-secret",
+    ) == {
         "success": True,
         "status": "duplicate",
         "call_id": "call-1",
@@ -234,7 +238,10 @@ def test_stale_or_duplicate_versions_never_reopen_or_rering_after_authoritative_
     states["desktop-61"] = [{"call_id": "call-1", "call_state": "declined", "version": 3}]
     client.wake()
     # A delayed ringing callback/version cannot recreate a finished call.
-    assert client.receive_callback({"call_id": "call-1", "call_state": "ringing", "version": 2}) == {
+    assert client.receive_callback(
+        {"call_id": "call-1", "call_state": "ringing", "version": 2},
+        callback_credential="central-callback-secret",
+    ) == {
         "success": True,
         "status": "stale",
         "call_id": "call-1",
