@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import html
 import hmac
 import httpx
 import json
@@ -29,6 +30,93 @@ from central_notification_router import NotificationRouter, TerminalRegistry
 Clock = Callable[[], float]
 Notification = Callable[[dict[str, object]], None]
 Waiter = Callable[[float], Awaitable[None]]
+
+
+def mobile_html_renderer(view: Mapping[str, object], csrf_token: str) -> str:
+    """Render the iPhone response surface with explicit labels and controls.
+
+    The lifecycle supplies authority flags and the original, durable request
+    payload.  This adapter only turns that view into accessible HTML; the
+    submission still uses the lifecycle's existing JSON result path.
+    """
+    def esc(value: object) -> str:
+        return html.escape(str(value), quote=True)
+
+    call_id = esc(view.get("call_id", ""))
+    csrf = esc(csrf_token)
+    payload = view.get("payload")
+    payload = dict(payload) if isinstance(payload, Mapping) else {}
+    tool = str(payload.get("tool") or payload.get("interaction_type") or "text").lower()
+    prompt = esc(payload.get("prompt") or payload.get("message") or payload.get("task_description") or "请完成此请求")
+    title = esc(payload.get("title") or _mobile_tool_title(tool))
+    head = ("<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+            f"<title>{title}</title><style>body{{font:17px -apple-system,BlinkMacSystemFont,sans-serif;margin:20px;line-height:1.45}}"
+            "label,fieldset{display:block;margin:16px 0}input,textarea,select,button{font:inherit;padding:9px;max-width:100%;box-sizing:border-box}"
+            "textarea{width:100%;min-height:8em}button{margin:8px 8px 0 0}.hint{color:#555}</style></head><body>")
+    if view.get("display_state") == "handled_on_desktop_processing":
+        return head + "<h1>已在电脑端接听，处理中</h1><p>此呼叫正在电脑端处理，手机端不能再次提交。</p></body></html>"
+    if view.get("display_state") == "handled_on_desktop_complete":
+        return head + "<h1>已在电脑端处理</h1><p>该呼叫已经完成。</p></body></html>"
+    if view.get("can_accept"):
+        return (head + f"<h1>{title}</h1><p>{prompt}</p><p class=\"hint\">请明确选择接听或拒绝。</p>"
+                f"<form method=\"post\" action=\"/calls/{call_id}/accept\"><input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\"><input type=\"hidden\" name=\"operation_id\" value=\"accept\"><button type=\"submit\">接听</button></form>"
+                f"<form method=\"post\" action=\"/calls/{call_id}/decline\"><input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\"><input type=\"hidden\" name=\"operation_id\" value=\"decline\"><button type=\"submit\">拒绝本次呼叫</button></form></body></html>")
+    if view.get("can_submit"):
+        fields = _mobile_response_fields(tool, payload, esc)
+        submission_id = esc(uuid.uuid4())
+        return (head + f"<h1>{title}</h1><p>{prompt}</p>"
+                f"<form id=\"response-form\" method=\"post\" action=\"/calls/{call_id}/submissions\">"
+                f"<input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\"><input type=\"hidden\" name=\"submission_id\" value=\"{submission_id}\">"
+                "<input type=\"hidden\" name=\"result\" id=\"result\">" + fields +
+                "<button type=\"submit\">提交回答</button></form>"
+                "<script>document.getElementById('response-form').addEventListener('submit',function(e){var f=e.currentTarget,r={};"
+                "f.querySelectorAll('[data-result-key]').forEach(function(x){var k=x.dataset.resultKey;if(x.type==='checkbox'||x.type==='radio'){(r[k]||(r[k]=[]));if(x.checked)r[k].push(x.value)}else r[k]=x.value});"
+                "['confirmed','acknowledged'].forEach(function(k){if(typeof r[k]==='string')r[k]=r[k]==='true'});document.getElementById('result').value=JSON.stringify(r)});</script></body></html>")
+    return head + "<h1>当前呼叫不可处理</h1><p>请刷新页面查看最新状态。</p></body></html>"
+
+
+def _mobile_tool_title(tool: str) -> str:
+    if "confirm" in tool: return "确认请求"
+    if "info" in tool or "acknowledge" in tool: return "信息确认"
+    if "feedback" in tool: return "反馈"
+    if "task" in tool or "assign" in tool: return "任务报告"
+    if "choice" in tool or "select" in tool: return "选择回答"
+    if "multiline" in tool or "long" in tool: return "多行输入"
+    if "number" in tool: return "数字输入"
+    return "文本输入"
+
+
+def _mobile_response_fields(tool: str, payload: Mapping[str, object], esc: Callable[[object], str]) -> str:
+    """Return labelled controls for the seven shared interaction families."""
+    required = " required" if payload.get("required", True) else ""
+    if "confirm" in tool:
+        return ("<fieldset><legend>请选择确认结果</legend><label><input data-result-key=\"confirmed\" type=\"radio\" name=\"confirmed\" value=\"true\" required> 是，确认</label>"
+                "<label><input data-result-key=\"confirmed\" type=\"radio\" name=\"confirmed\" value=\"false\"> 否，不确认</label></fieldset>")
+    if "info" in tool or "acknowledge" in tool:
+        return "<label><input data-result-key=\"acknowledged\" type=\"checkbox\" value=\"true\" required> 我已阅读并确认此信息</label>"
+    if "feedback" in tool:
+        return f"<label for=\"feedback\">反馈内容<textarea id=\"feedback\" data-result-key=\"feedback\"{required}></textarea></label>"
+    if "task" in tool or "assign" in tool:
+        return ("<label for=\"task-status\">任务状态<select id=\"task-status\" data-result-key=\"status\"><option value=\"completed\">已完成</option><option value=\"failed\">执行失败</option></select></label>"
+                f"<label for=\"task-report\">任务报告<textarea id=\"task-report\" data-result-key=\"report\"{required}></textarea></label>")
+    choices = payload.get("choices") or payload.get("options")
+    if ("choice" in tool or "select" in tool or isinstance(choices, list)) and isinstance(choices, list):
+        multiple = bool(payload.get("multiple") or payload.get("allow_multiple"))
+        input_type, key = ("checkbox", "selected_choices") if multiple else ("radio", "selected_choices")
+        rendered = "<fieldset><legend>请选择" + ("一个或多个选项" if multiple else "一个选项") + "</legend>"
+        for index, choice in enumerate(choices):
+            value = choice.get("value", choice.get("label", "")) if isinstance(choice, Mapping) else choice
+            label = choice.get("label", value) if isinstance(choice, Mapping) else choice
+            rendered += f"<label><input data-result-key=\"{key}\" type=\"{input_type}\" name=\"choice\" value=\"{esc(value)}\"{' required' if index == 0 and not multiple else ''}> {esc(label)}</label>"
+        return rendered + "</fieldset>"
+    numeric = "number" in tool or str(payload.get("input_type", "")).lower() == "number"
+    multiline = "multiline" in tool or "long" in tool or bool(payload.get("multiline"))
+    if multiline:
+        return f"<label for=\"user-input\">请输入完整回答<textarea id=\"user-input\" data-result-key=\"user_input\"{required}></textarea></label>"
+    input_type = "number" if numeric else "text"
+    label = "请输入数字" if numeric else "请输入回答"
+    return f"<label for=\"user-input\">{label}<input id=\"user-input\" data-result-key=\"user_input\" type=\"{input_type}\"{required}></label>"
 
 
 @dataclass(frozen=True)
@@ -409,7 +497,7 @@ def create_lifecycle_app(
     desktop_dispatch: Callable[[dict[str, object]], object],
     operator_session_verifier: Any,
     browser_cookie_authenticator: Any | None = None,
-    mobile_html_renderer: Any | None = None,
+    mobile_html_renderer: Any | None = mobile_html_renderer,
     scheduler_sleep: Waiter = asyncio.sleep,
     notification_scheduler_sleep: Waiter = asyncio.sleep,
 ) -> Application:
@@ -611,7 +699,7 @@ def main(argv: list[str] | None = None) -> None:
         desktop_dispatch=desktop_dispatch,
         operator_session_verifier=operator_session_verifier,
         browser_cookie_authenticator=operator_session_verifier,
-        mobile_html_renderer=lambda _view, _csrf_token: None,
+        mobile_html_renderer=mobile_html_renderer,
     )
     uvicorn.run(app, host=config.listen_host, port=config.listen_port, ssl_certfile=config.tls_cert_file, ssl_keyfile=config.tls_key_file)
 

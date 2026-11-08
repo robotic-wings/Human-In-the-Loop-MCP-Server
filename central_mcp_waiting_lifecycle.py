@@ -40,6 +40,7 @@ class WaitingLifecycle:
               CREATE TABLE IF NOT EXISTS lifecycle_calls (
                 call_id TEXT PRIMARY KEY, interaction_id TEXT NOT NULL, caller_id TEXT NOT NULL,
                 call_state TEXT NOT NULL, ring_deadline REAL NOT NULL, reason TEXT,
+                payload_json TEXT NOT NULL DEFAULT '{}',
                 owner_device_id TEXT, owner_session_id TEXT, handled_on TEXT,
                 terminal_platform TEXT, invited_desktop_id TEXT,
                 mobile_eligible INTEGER NOT NULL DEFAULT 0,
@@ -79,6 +80,7 @@ class WaitingLifecycle:
         if "agent_reconnect_deadline" not in columns:
             conn.execute("ALTER TABLE lifecycle_calls ADD COLUMN agent_reconnect_deadline REAL")
         for column, definition in (
+            ("payload_json", "TEXT NOT NULL DEFAULT '{}'"),
             ("owner_device_id", "TEXT"), ("owner_session_id", "TEXT"),
             ("handled_on", "TEXT"), ("terminal_platform", "TEXT"),
             ("invited_desktop_id", "TEXT"),
@@ -113,9 +115,9 @@ class WaitingLifecycle:
                     deadline = self._clock() + self._ring_timeout
                     conn.execute(
                         "INSERT INTO lifecycle_calls "
-                        "(call_id, interaction_id, caller_id, call_state, ring_deadline, reason, agent_reconnect_deadline, invited_desktop_id, mobile_eligible) "
-                        "VALUES (?, ?, ?, 'ringing', ?, NULL, NULL, ?, ?)",
-                        (call_id, interaction_id, caller_id, deadline, invited_desktop_id, int(mobile_eligible)),
+                        "(call_id, interaction_id, caller_id, call_state, ring_deadline, reason, payload_json, agent_reconnect_deadline, invited_desktop_id, mobile_eligible) "
+                        "VALUES (?, ?, ?, 'ringing', ?, NULL, ?, NULL, ?, ?)",
+                        (call_id, interaction_id, caller_id, deadline, encoded, invited_desktop_id, int(mobile_eligible)),
                     )
                     outcome = self._heartbeat(interaction_id, call_id, "ringing")
                     notification = {"call_id": call_id, "ring_deadline": deadline}
@@ -917,8 +919,9 @@ class Application:
     @staticmethod
     def _render_login_entry() -> str:
         return ("<html><body><form method=\"post\" action=\"/operator/login\">"
-                "<input type=\"password\" name=\"credential\">"
-                "<button>login</button></form></body></html>")
+                "<label for=\"operator-credential\">操作者登录凭证"
+                "<input id=\"operator-credential\" type=\"password\" name=\"credential\" required>"
+                "</label><button type=\"submit\">登录</button></form></body></html>")
 
     def _browser_call_view(self, call_id: str, operator_id: str,
                            browser_session_id: str | None = None) -> dict[str, object]:
@@ -946,6 +949,14 @@ class Application:
                 and call["owner_session_id"] == browser_session_id
             ),
         }
+        try:
+            payload = self.lifecycle._load(call["payload_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        # The stored creation payload is presentation data only.  Submission
+        # remains centrally authorized and validated; a browser never gets to
+        # choose a different call or alter the persisted request.
+        view["payload"] = payload if isinstance(payload, Mapping) else {}
         if state in {"accepted", "in_progress"} and call["handled_on"] == "desktop":
             view["display_state"] = "handled_on_desktop_processing"
         elif state in {"answered", "completed", "failed"} and call["handled_on"] == "desktop":
