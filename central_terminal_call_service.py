@@ -28,10 +28,12 @@ class TerminalCallService:
                 call_id TEXT PRIMARY KEY, channels TEXT NOT NULL
               );
               CREATE TABLE IF NOT EXISTS terminal_operations (
-                session_id TEXT NOT NULL, operation_id TEXT NOT NULL, outcome TEXT NOT NULL,
-                PRIMARY KEY (session_id, operation_id)
+                session_id TEXT NOT NULL, call_id TEXT NOT NULL, operation_id TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                PRIMARY KEY (session_id, call_id, operation_id)
               );
             """)
+            self._migrate_terminal_operations(conn)
 
     @contextmanager
     def _connection(self):
@@ -72,11 +74,20 @@ class TerminalCallService:
         if call is None:
             return self._hidden()
         state = str(call["call_state"])
-        if state == "accepted" and not self._is_owner(call_id, session_id):
+        # Another iPhone browser session must not learn that an accepted call
+        # exists or take it over.  A routed iPhone is allowed to observe a
+        # desktop-owned call, however: the response web must truthfully say
+        # that the desktop is processing/has processed it without exposing an
+        # editable session capability.
+        if (
+            state == "accepted"
+            and not self._is_owner(call_id, session_id)
+            and call.get("handled_on") == "iphone_web"
+        ):
             return self._hidden()
         result: dict[str, object] = {"success": True, "call_id": call_id, "call_state": state,
                                      "can_accept": state == "ringing", "can_decline": state == "ringing"}
-        if state == "accepted":
+        if state == "accepted" and self._is_owner(call_id, session_id):
             result["can_write"] = True
         if "handled_on" in call:
             result["handled_on"] = call["handled_on"]
@@ -90,9 +101,11 @@ class TerminalCallService:
             return self._hidden()
         if self._owner_is_other_mobile_session(call_id, session_id, session):
             return self._hidden()
-        replay = self._replay(session_id, operation_id)
+        replay = self._replay(session_id, call_id, operation_id)
         if replay is not None:
             return replay
+        if not self._call_is_ringing_or_accepted(call_id):
+            return self._hidden()
         # This private seam runs before the coordinator transaction so a
         # binding failure cannot create a coordinator-only accepted call.  The
         # actual non-secret binding is written by CallCoordinator.accept in
@@ -105,7 +118,7 @@ class TerminalCallService:
             str(session["terminal_platform"]),
             owner_session_id=session_id,
         )
-        self._save(session_id, operation_id, outcome)
+        self._save(session_id, call_id, operation_id, outcome)
         if outcome.get("success") is True:
             self._on_update({"call_id": call_id, "call_state": "accepted"})
         return outcome
@@ -116,11 +129,13 @@ class TerminalCallService:
             return self._hidden()
         if self._owner_is_other_mobile_session(call_id, session_id, session):
             return self._hidden()
-        replay = self._replay(session_id, operation_id)
+        replay = self._replay(session_id, call_id, operation_id)
         if replay is not None:
             return replay
+        if not self._call_is_ringing_or_accepted(call_id):
+            return self._hidden()
         outcome = self._coordinator.decline(call_id, str(session["device_id"]))
-        self._save(session_id, operation_id, outcome)
+        self._save(session_id, call_id, operation_id, outcome)
         if outcome.get("success") is True:
             self._on_update({"call_id": call_id, "call_state": "declined"})
         return outcome
@@ -164,17 +179,50 @@ class TerminalCallService:
         call = self._coordinator.get_call(call_id)
         return call is not None and call.get("call_state") == "accepted"
 
-    def _replay(self, session_id: str, operation_id: str) -> dict[str, object] | None:
+    def _call_is_ringing_or_accepted(self, call_id: str) -> bool:
+        call = self._coordinator.get_call(call_id)
+        return call is not None and call.get("call_state") in {"ringing", "accepted"}
+
+    @staticmethod
+    def _migrate_terminal_operations(conn: sqlite3.Connection) -> None:
+        """Upgrade pre-call-scoped replay rows without making them reusable.
+
+        Older rows do not record the call they belonged to.  Assigning one to
+        a later call would recreate the cross-call replay bug, so they remain
+        retained under an unreachable legacy identifier instead.
+        """
+        columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(terminal_operations)")}
+        if "call_id" in columns:
+            return
+        conn.executescript("""
+          BEGIN;
+          CREATE TABLE terminal_operations_rekeyed (
+            session_id TEXT NOT NULL, call_id TEXT NOT NULL, operation_id TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            PRIMARY KEY (session_id, call_id, operation_id)
+          );
+          INSERT INTO terminal_operations_rekeyed (session_id, call_id, operation_id, outcome)
+            SELECT session_id, '__legacy_unbound__', operation_id, outcome
+            FROM terminal_operations;
+          DROP TABLE terminal_operations;
+          ALTER TABLE terminal_operations_rekeyed RENAME TO terminal_operations;
+          COMMIT;
+        """)
+
+    def _replay(self, session_id: str, call_id: str, operation_id: str) -> dict[str, object] | None:
         import json
         with self._connection() as conn:
-            row = conn.execute("SELECT outcome FROM terminal_operations WHERE session_id=? AND operation_id=?", (session_id, operation_id)).fetchone()
+            row = conn.execute(
+                "SELECT outcome FROM terminal_operations WHERE session_id=? AND call_id=? AND operation_id=?",
+                (session_id, call_id, operation_id),
+            ).fetchone()
         return json.loads(row["outcome"]) if row else None
 
-    def _save(self, session_id: str, operation_id: str, outcome: dict[str, object]) -> None:
+    def _save(self, session_id: str, call_id: str, operation_id: str, outcome: dict[str, object]) -> None:
         import json
         with self._connection() as conn:
-            conn.execute("INSERT OR IGNORE INTO terminal_operations VALUES (?, ?, ?)",
-                         (session_id, operation_id, json.dumps(outcome, sort_keys=True)))
+            conn.execute("INSERT OR IGNORE INTO terminal_operations VALUES (?, ?, ?, ?)",
+                         (session_id, call_id, operation_id, json.dumps(outcome, sort_keys=True)))
 
     @staticmethod
     def _hidden() -> dict[str, object]:
