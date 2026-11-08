@@ -183,6 +183,30 @@ def test_replayed_initial_heartbeat_does_not_extend_reconnect_deadline(tmp_path:
     assert post(app, continuation(call, "after-replay-expiry")) == expected_disconnected(call)
 
 
+def test_replayed_continuation_heartbeat_does_not_extend_reconnect_deadline(tmp_path: Path) -> None:
+    clock, notifications = FakeClock(), []
+    app = make_app(tmp_path, clock, notifications, ring_timeout=120)
+    call = create(app, "continuation-replay-create")
+
+    # A new continuation legitimately refreshes the grace from t=30 to t=50.
+    # Retrying that exact operation at t=49 is only a response replay: it must
+    # not deliver another heartbeat or move the durable deadline to t=79.
+    clock.advance(20)
+    request = continuation(call, "continuation-replay")
+    first = post(app, request)
+    assert first["status"] == "heartbeat"
+    clock.advance(29)
+    replayed = post(app, request)
+    assert replayed == first
+    assert len(notifications) == 1
+
+    # The continuation grace originally refreshed at t=20 expires at t=50.
+    # A different valid continuation after that point observes the immutable
+    # disconnect result rather than treating the replay as fresh liveness.
+    clock.advance(2)
+    assert post(app, continuation(call, "after-continuation-replay-expiry")) == expected_disconnected(call)
+
+
 def test_reconnect_expiry_is_immutable_across_restart_releases_busy_and_rejects_late_action(tmp_path: Path) -> None:
     clock, notifications = FakeClock(), []
     first = make_app(tmp_path, clock, notifications)
