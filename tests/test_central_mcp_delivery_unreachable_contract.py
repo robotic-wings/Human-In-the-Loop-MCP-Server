@@ -33,15 +33,42 @@ def _module() -> Any:
     return importlib.import_module("central_mcp_waiting_lifecycle")
 
 
-def make_app(tmp_path: Path, clock: FakeClock, notifications: list[dict[str, object]]) -> Any:
-    return _module().create_app(
+async def _definitive_failure(_: dict[str, object]) -> dict[str, object]:
+    return {"http_status": 503, "business_success": False}
+
+
+async def _uncertain(_: dict[str, object]) -> dict[str, object]:
+    raise TimeoutError("outbound result unknown")
+
+
+def make_app(tmp_path: Path, clock: FakeClock, *, bark_dispatch: Any = _definitive_failure) -> tuple[Any, Any, list[dict[str, object]]]:
+    router_module = importlib.import_module("central_notification_router")
+    notifications: list[dict[str, object]] = []
+    registry = router_module.TerminalRegistry(database_path=tmp_path / "routing.sqlite3", clock=clock)
+    router = router_module.NotificationRouter(
+        database_path=tmp_path / "routing.sqlite3",
+        clock=clock,
+        registry=registry,
+        desktop_dispatch=_definitive_failure,
+        bark_dispatch=bark_dispatch,
+        route_mode="both",
+        web_base_url="https://central.example.test",
+        # The delivery bridge supplies lifecycle authority; this callback only
+        # lets the router avoid attempts after a decision has already won.
+        call_state=lambda _call_id: "ringing",
+    )
+    app = _module().create_app(
         database_path=tmp_path / "delivery-unreachable.sqlite3",
         credentials={"agent-a": "token-a", "agent-b": "token-b"},
         clock=clock,
-        notify=notifications.append,
+        notify=lambda event: (notifications.append(event), router.enqueue(event)),
         wait=RecordingWait(),
         ring_timeout_seconds=60,
+        # The missing production seam must consume the actual output of
+        # NotificationRouter.dispatch_pending(), not a test-built decision.
+        notification_router=router,
     )
+    return app, router, notifications
 
 
 def post(app: Any, body: dict[str, object], token: str = "token-a") -> dict[str, object]:
@@ -64,13 +91,16 @@ def continuation(app: Any, ringing: dict[str, object], request_id: str) -> dict[
 
 def test_definitive_all_channel_failure_is_one_durable_unreachable_event_and_releases_busy(tmp_path: Path) -> None:
     clock = FakeClock()
-    notifications: list[dict[str, object]] = []
-    app = make_app(tmp_path, clock, notifications)
+    app, router, notifications = make_app(tmp_path, clock)
     ringing = create(app, "ringing")
 
     # This is the central delivery boundary: the router supplies this value
     # only after every enabled channel has definitively failed.
-    app.lifecycle.apply_delivery_decisions({ringing["call_id"]: "unreachable"})
+    asyncio.run(app.dispatch_notification_delivery())
+    assert router.delivery_states(ringing["call_id"]) == [
+        {"channel": "bark", "state": "failed"},
+        {"channel": "desktop", "state": "failed"},
+    ]
 
     result = continuation(app, ringing, "read-unreachable")
     assert result == {"success": True, "status": "unreachable", "call_state": "unreachable", "reason": "no_available_channel", "human_action": False, "event_seq": 1, "needs_continuation": False, "interaction_id": ringing["interaction_id"], "call_id": ringing["call_id"]}
@@ -84,19 +114,19 @@ def test_definitive_all_channel_failure_is_one_durable_unreachable_event_and_rel
 
 def test_uncertain_delivery_waits_but_due_ring_deadline_wins_over_late_unreachable(tmp_path: Path) -> None:
     clock = FakeClock()
-    notifications: list[dict[str, object]] = []
-    app = make_app(tmp_path, clock, notifications)
+    app, router, _notifications = make_app(tmp_path, clock, bark_dispatch=_uncertain)
     ringing = create(app, "ringing")
 
     # Router uncertainty is explicitly not evidence that all channels are
     # unavailable.  It must leave the original absolute deadline untouched.
-    app.lifecycle.apply_delivery_decisions({ringing["call_id"]: "ringing"})
+    asyncio.run(app.dispatch_notification_delivery())
+    assert {item["state"] for item in router.delivery_states(ringing["call_id"])} == {"failed", "uncertain"}
     assert continuation(app, ringing, "still-ringing")["status"] == "heartbeat"
 
     clock.now += 60
-    # Request-path settlement is authoritative: a late dispatcher decision
-    # cannot replace the earlier ring timeout with unreachable.
-    app.lifecycle.apply_delivery_decisions({ringing["call_id"]: "unreachable"})
+    # The router checks the deadline before delivery; the lifecycle bridge
+    # must settle that deadline first rather than classify a stale result.
+    asyncio.run(app.dispatch_notification_delivery())
     terminal = continuation(app, ringing, "read-timeout")
     assert terminal["status"] == "not_accepted"
     assert terminal["reason"] == "ring_timeout"
@@ -105,16 +135,15 @@ def test_uncertain_delivery_waits_but_due_ring_deadline_wins_over_late_unreachab
 
 def test_repeated_or_stale_delivery_decisions_survive_restart_without_resurrection_or_rering(tmp_path: Path) -> None:
     clock = FakeClock()
-    notifications: list[dict[str, object]] = []
-    app = make_app(tmp_path, clock, notifications)
+    app, _router, notifications = make_app(tmp_path, clock)
     ringing = create(app, "ringing")
-    app.lifecycle.apply_delivery_decisions({ringing["call_id"]: "unreachable"})
+    asyncio.run(app.dispatch_notification_delivery())
 
     # A repeat cannot append a second event.  A restarted service also must
     # not revive or notify the old call when it sees the stale decision.
-    app.lifecycle.apply_delivery_decisions({ringing["call_id"]: "unreachable"})
-    restarted = make_app(tmp_path, clock, notifications)
-    restarted.lifecycle.apply_delivery_decisions({ringing["call_id"]: "unreachable"})
+    asyncio.run(app.dispatch_notification_delivery())
+    restarted, _restarted_router, _ = make_app(tmp_path, clock)
+    asyncio.run(restarted.dispatch_notification_delivery())
     terminal = continuation(restarted, ringing, "after-restart")
     assert terminal["status"] == "unreachable"
     assert terminal["reason"] == "no_available_channel"
