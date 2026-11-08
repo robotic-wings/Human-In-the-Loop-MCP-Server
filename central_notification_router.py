@@ -9,6 +9,7 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlsplit
 
 Clock = Callable[[], float]
 Dispatch = Callable[[dict[str, object]], object]
@@ -107,17 +108,26 @@ class NotificationRouter:
         self._store, self._clock, self._registry = _Store(database_path), clock, registry
         self._desktop_dispatch, self._bark_dispatch, self._route_mode = desktop_dispatch, bark_dispatch, route_mode
         self._desktop_timeout, self._bark_timeout, self._call_state = desktop_timeout_seconds, bark_timeout_seconds, call_state
-        self._web_base_url = self._normalize_web_base_url(web_base_url)
+        self._web_base_url, self._invalid_web_base_url = self._normalize_web_base_url(web_base_url)
 
     @staticmethod
-    def _normalize_web_base_url(value: str | None) -> str | None:
+    def _normalize_web_base_url(value: str | None) -> tuple[str | None, bool]:
         if not isinstance(value, str) or not value.strip():
-            return None
-        return value.rstrip("/")
+            return None, False
+        candidate = value.strip()
+        try:
+            parsed = urlsplit(candidate)
+        except ValueError:
+            return None, True
+        if parsed.scheme != "https" or not parsed.netloc or parsed.query or parsed.fragment:
+            return None, True
+        return candidate.rstrip("/"), False
 
     def validate_route(self) -> dict[str, object]:
         if self._route_mode not in self._CHANNELS:
             return {"success": False, "status": "no_enabled_channel", "needs_continuation": False}
+        if "bark" in self._CHANNELS[self._route_mode] and self._invalid_web_base_url:
+            return {"success": False, "status": "invalid_web_base_url", "needs_continuation": False}
         if "bark" in self._CHANNELS[self._route_mode] and not self._web_base_url:
             return {"success": False, "status": "missing_web_base_url", "needs_continuation": False}
         return {"success": True, "status": "ready", "needs_continuation": False}
