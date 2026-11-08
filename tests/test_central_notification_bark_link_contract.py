@@ -180,3 +180,31 @@ def test_invalid_route_reports_no_enabled_channel_before_any_outbox_write(tmp_pa
     }
     router.enqueue({"call_id": "never", "ring_deadline": clock() + 60})
     assert router.delivery_states("never") == []
+
+
+def test_iphone_route_without_configured_web_base_url_fails_before_outbox_or_dispatch(tmp_path: Path) -> None:
+    """A Bark route cannot create a notification that lacks its central call link."""
+    clock = FakeClock()
+    attempts: list[dict[str, object]] = []
+
+    async def bark(payload: dict[str, object]) -> dict[str, object]:
+        attempts.append(payload)
+        return {"http_status": 200, "business_success": True}
+
+    router = _router(
+        tmp_path,
+        clock,
+        desktop=_desktop_ok,
+        bark=bark,
+        route_mode="iphone",
+        configured_link=False,
+    )
+    assert router.validate_route() == {
+        "success": False,
+        "status": "missing_web_base_url",
+        "needs_continuation": False,
+    }
+    router.enqueue({"call_id": "missing-link", "ring_deadline": clock() + 60})
+    asyncio.run(router.dispatch_pending())
+    assert router.outbox_records("missing-link") == []
+    assert attempts == []
