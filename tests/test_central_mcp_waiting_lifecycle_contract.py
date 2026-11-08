@@ -195,6 +195,37 @@ def test_opened_then_final_events_are_persisted_ordered_and_replayable(tmp_path:
     assert len(notifications) == 1
 
 
+def test_finish_while_ringing_is_inert_until_an_owner_accepts(tmp_path: Path) -> None:
+    """A final answer cannot manufacture ownership of an unanswered call."""
+
+    clock, notifications = FakeClock(), []
+    app = make_app(tmp_path, clock, notifications, RecordingWait(clock))
+    ringing = create(app)
+
+    rejected = app.lifecycle.finish(
+        call_id=ringing["call_id"], status="answered", result={"user_input": "premature"}
+    )
+    unchanged = continue_call(app, ringing, "read-ringing", 0).json()
+
+    assert rejected["success"] is False
+    assert rejected["needs_continuation"] is False
+    assert unchanged["status"] == "heartbeat"
+    assert unchanged["call_state"] == "ringing"
+    assert "event_seq" not in unchanged
+    assert len(notifications) == 1
+
+    opened = app.lifecycle.accept(
+        call_id=ringing["call_id"], device_id="iphone", handled_on="iphone_web", terminal_platform="ios"
+    )
+    final = app.lifecycle.finish(
+        call_id=ringing["call_id"], status="answered", result={"user_input": "after-accept"}
+    )
+
+    assert opened["status"] == "opened"
+    assert final["status"] == "answered"
+    assert final["event_seq"] == 2
+
+
 def test_ring_timeout_is_absolute_persisted_and_recovered_without_reringing(tmp_path: Path) -> None:
     clock, notifications = FakeClock(), []
     first = make_app(tmp_path, clock, notifications, RecordingWait(clock))
