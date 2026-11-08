@@ -207,6 +207,33 @@ def test_replayed_continuation_heartbeat_does_not_extend_reconnect_deadline(tmp_
     assert post(app, continuation(call, "after-continuation-replay-expiry")) == expected_disconnected(call)
 
 
+def test_request_id_cannot_be_reused_across_create_and_continuation_without_wait_or_deadline_mutation(
+    tmp_path: Path,
+) -> None:
+    clock, notifications = FakeClock(), []
+    wait = RecordingWait()
+    app = make_app(tmp_path, clock, notifications, ring_timeout=120, wait=wait)
+    call = create(app, "same-id")
+    assert wait.legs == [6]
+
+    # ``request_id`` is unique for the caller across operations, rather than
+    # merely inside the create or continuation operation table.  Reusing the
+    # create ID for a distinct continuation payload is a conflict: it must not
+    # perform another wait or treat that request as fresh reconnect liveness.
+    clock.advance(29)
+    conflicting = post(app, continuation(call, "same-id"))
+    assert conflicting["success"] is False
+    assert conflicting["status"] == "request_conflict"
+    assert conflicting["needs_continuation"] is False
+    assert wait.legs == [6]
+    assert len(notifications) == 1
+
+    # The rejected cross-operation reuse did not move the original t=30
+    # reconnect deadline.  A fresh ID at t=31 observes its immutable result.
+    clock.advance(2)
+    assert post(app, continuation(call, "after-cross-operation-conflict")) == expected_disconnected(call)
+
+
 def test_reconnect_expiry_is_immutable_across_restart_releases_busy_and_rejects_late_action(tmp_path: Path) -> None:
     clock, notifications = FakeClock(), []
     first = make_app(tmp_path, clock, notifications)
