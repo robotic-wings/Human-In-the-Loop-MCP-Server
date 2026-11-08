@@ -478,9 +478,11 @@ class _ConfiguredOperatorSessionVerifier:
     """Minimal configuration-backed browser-session boundary for the runtime."""
 
     def __init__(self, sessions: Mapping[str, Mapping[str, str]],
-                 login_credentials: Mapping[str, str] | None = None) -> None:
+                 login_credentials: Mapping[str, str] | None = None,
+                 *, lifecycle_operator_id: str = "only-operator") -> None:
         self._sessions = {token: dict(session) for token, session in sessions.items()}
         self._login_credentials = dict(login_credentials or {})
+        self._lifecycle_operator_id = lifecycle_operator_id
 
     def verify(self, token: str | None) -> dict[str, str] | None:
         if not isinstance(token, str):
@@ -500,6 +502,14 @@ class _ConfiguredOperatorSessionVerifier:
             return None
         for expected, session_cookie in self._login_credentials.items():
             if hmac.compare_digest(credential, expected):
+                # Authentication must not mint a browser cookie which the
+                # lifecycle will subsequently reject as another operator.
+                # That used to turn a successful login redirect into an
+                # opaque ``session_not_found`` page for the same call.
+                session = self._sessions.get(session_cookie)
+                if (session is None
+                        or session.get("operator_id") != self._lifecycle_operator_id):
+                    return None
                 return session_cookie
         return None
 
