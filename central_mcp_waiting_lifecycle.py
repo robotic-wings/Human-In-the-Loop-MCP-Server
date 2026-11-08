@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import html
 import json
 import sqlite3
 import uuid
+from urllib.parse import parse_qs
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import contextmanager, suppress
 from pathlib import Path
@@ -657,13 +659,19 @@ class Application:
                  route_admission: RouteAdmission, notification_router: Any | None,
                  notification_dispatch_tick_seconds: float, notification_scheduler_sleep: Waiter,
                  desktop_registration_service: Any | None = None,
-                 operator_session_verifier: Any | None = None) -> None:
+                 operator_session_verifier: Any | None = None,
+                 browser_cookie_authenticator: Any | None = None,
+                 mobile_html_renderer: Any | None = None,
+                 trusted_browser_origin: str | None = None) -> None:
         self.lifecycle, self._credentials, self._wait = lifecycle, dict(credentials), wait
         self._deadline_tick_seconds, self._scheduler_sleep = deadline_tick_seconds, scheduler_sleep
         self._route_admission = route_admission
         self._notification_router = notification_router
         self._desktop_registration_service = desktop_registration_service
         self._operator_session_verifier = operator_session_verifier
+        self._browser_cookie_authenticator = browser_cookie_authenticator
+        self._mobile_html_renderer = mobile_html_renderer
+        self._trusted_browser_origin = trusted_browser_origin
         if notification_router is not None:
             sink_setter = getattr(notification_router, "set_delivery_decision_sink", None)
             if callable(sink_setter):
@@ -812,26 +820,43 @@ class Application:
         parts = path.split("/")
         if len(parts) not in {3, 4} or parts[:2] != ["", "calls"] or not isinstance(parts[2], str) or not parts[2]:
             await self._send(send, 404, self._error("not_found")); return
-        session = self._operator_session(headers)
+        session = self._browser_session(headers)
         if session is None:
             await self._send(send, 401, self._terminal_error("session_not_found")); return
-        operator_id, browser_session_id = session
+        operator_id, browser_session_id, csrf_token = session
+        cookie_mode = self._browser_cookie_authenticator is not None
         call_id = parts[2]
         if len(parts) == 3 and method == "GET":
-            response = self._browser_call_view(call_id, operator_id)
+            response = self._browser_call_view(call_id, operator_id, browser_session_id)
+            if response.get("success") and cookie_mode:
+                await self._send_html(send, 200, self._render_browser_page(response, csrf_token)); return
             await self._send(send, self._action_status(response), response); return
         if len(parts) != 4 or method != "POST" or parts[3] not in {"accept", "decline", "submissions"}:
             await self._send(send, 404, self._error("not_found")); return
-        body = await self._body(receive)
+        if cookie_mode:
+            if not self._browser_write_is_trusted(headers):
+                await self._send(send, 403, self._terminal_error("session_not_found")); return
+            body = await self._form_body(receive)
+            if body is None or not hmac.compare_digest(str(body.get("csrf_token", "")), csrf_token):
+                await self._send(send, 403, self._terminal_error("session_not_found")); return
+        else:
+            body = await self._body(receive)
         if parts[3] == "submissions":
             submission_id = body.get("submission_id") if body is not None else None
             result = body.get("result") if body is not None else None
+            if isinstance(result, str):
+                try:
+                    result = json.loads(result)
+                except json.JSONDecodeError:
+                    result = None
             if not isinstance(submission_id, str) or not isinstance(result, Mapping):
                 await self._send(send, 400, self._error("invalid_request")); return
             response = self.lifecycle.submit(
                 call_id=call_id, device_id="iphone_web", session_id=browser_session_id,
                 submission_id=submission_id, result=result,
             ) if operator_id == self.lifecycle._operator_id else self._terminal_error("session_not_found")
+            if cookie_mode:
+                await self._send_html(send, self._action_status(response), self._render_browser_page(response, csrf_token, response)); return
             await self._send(send, self._action_status(response), response); return
         operation_id = body.get("operation_id") if body is not None else None
         if not isinstance(operation_id, str) or not operation_id:
@@ -840,9 +865,14 @@ class Application:
             call_id=call_id, operator_id=operator_id, session_id=browser_session_id,
             operation_id=operation_id, action=parts[3],
         )
-        await self._send(send, self._action_status(response), response)
+        if cookie_mode:
+            view = self._browser_call_view(call_id, operator_id, browser_session_id)
+            await self._send_html(send, self._action_status(response), self._render_browser_page(view, csrf_token, response))
+        else:
+            await self._send(send, self._action_status(response), response)
 
-    def _browser_call_view(self, call_id: str, operator_id: str) -> dict[str, object]:
+    def _browser_call_view(self, call_id: str, operator_id: str,
+                           browser_session_id: str | None = None) -> dict[str, object]:
         if operator_id != self.lifecycle._operator_id:
             return self._terminal_error("session_not_found")
         with self.lifecycle._connection() as conn:
@@ -861,6 +891,11 @@ class Application:
             "success": True, "call_id": call_id, "call_state": state,
             "handled_on": call["handled_on"], "terminal_platform": call["terminal_platform"],
             "can_accept": state == "ringing", "can_decline": state == "ringing",
+            "can_submit": (
+                state in {"accepted", "in_progress"}
+                and call["handled_on"] == "iphone_web"
+                and call["owner_session_id"] == browser_session_id
+            ),
         }
         if state in {"accepted", "in_progress"} and call["handled_on"] == "desktop":
             view["display_state"] = "handled_on_desktop_processing"
@@ -995,6 +1030,26 @@ class Application:
     def _terminal_session(self, headers: object) -> str | None:
         return self._header(headers, b"x-terminal-session")
 
+    def _browser_session(self, headers: object) -> tuple[str, str, str] | None:
+        """Authenticate the browser cookie; never treat a call link as a credential."""
+        authenticator = self._browser_cookie_authenticator
+        cookie = self._cookie(headers, "operator_session")
+        authenticate = getattr(authenticator, "authenticate_cookie", None)
+        result = authenticate(cookie) if callable(authenticate) else None
+        if isinstance(result, Mapping):
+            operator_id, session_id, csrf_token = (
+                result.get("operator_id"), result.get("browser_session_id"), result.get("csrf_token"),
+            )
+            if all(isinstance(value, str) and value for value in (operator_id, session_id, csrf_token)):
+                return str(operator_id), str(session_id), str(csrf_token)
+            return None
+        # Retain the injected header verifier only for older JSON adapter tests;
+        # a configured cookie authenticator deliberately disables this fallback.
+        if authenticator is not None:
+            return None
+        legacy = self._operator_session(headers)
+        return (*legacy, "") if legacy is not None else None
+
     def _operator_session(self, headers: object) -> tuple[str, str] | None:
         token = self._header(headers, b"x-operator-session")
         verifier = self._operator_session_verifier
@@ -1007,6 +1062,58 @@ class Application:
             return None
         return operator_id, session_id
 
+    def _browser_write_is_trusted(self, headers: object) -> bool:
+        origin = self._header(headers, b"origin")
+        host = self._header(headers, b"host")
+        expected = self._trusted_browser_origin
+        if not isinstance(expected, str) or not expected:
+            return False
+        try:
+            expected_host = expected.split("://", 1)[1]
+        except IndexError:
+            return False
+        return hmac.compare_digest(origin or "", expected) and hmac.compare_digest(host or "", expected_host)
+
+    def _render_browser_page(self, view: Mapping[str, object], csrf_token: str,
+                             action_response: Mapping[str, object] | None = None) -> str:
+        renderer = self._mobile_html_renderer
+        rendered = renderer(view, csrf_token) if callable(renderer) else None
+        if isinstance(rendered, str):
+            return rendered
+        call_id = html.escape(str(view.get("call_id", "")), quote=True)
+        csrf = html.escape(csrf_token, quote=True)
+        display = str(view.get("display_state", ""))
+        if display == "handled_on_desktop_processing":
+            return "<html><body>已在电脑端处理中</body></html>"
+        if display == "handled_on_desktop_complete":
+            return "<html><body>已在电脑端处理</body></html>"
+        if view.get("success") and view.get("can_accept"):
+            return (f"<html><body><form method=\"post\" action=\"/calls/{call_id}/accept\">"
+                    f"<input name=\"csrf_token\" value=\"{csrf}\"><input name=\"operation_id\" value=\"accept\">"
+                    "<button>accept</button></form><form method=\"post\" action=\"/calls/"
+                    f"{call_id}/decline\"><input name=\"csrf_token\" value=\"{csrf}\">"
+                    "<input name=\"operation_id\" value=\"decline\"><button>decline</button></form></body></html>")
+        if view.get("success") and view.get("can_submit"):
+            submission_id = html.escape(str(uuid.uuid4()), quote=True)
+            return (f"<html><body data-handled-on=\"iphone_web\"><form method=\"post\" action=\"/calls/{call_id}/submissions\">"
+                    f"<input name=\"csrf_token\" value=\"{csrf}\">"
+                    f"<input name=\"submission_id\" value=\"{submission_id}\">"
+                    "<textarea name=\"result\"></textarea><button>submit</button></form></body></html>")
+        if action_response is not None:
+            return "<html><body><pre>" + html.escape(json.dumps(action_response, sort_keys=True)) + "</pre></body></html>"
+        return "<html><body>当前呼叫不可处理</body></html>"
+
+    @staticmethod
+    def _cookie(headers: object, name: str) -> str | None:
+        value = Application._header(headers, b"cookie")
+        if not isinstance(value, str):
+            return None
+        for item in value.split(";"):
+            key, separator, content = item.strip().partition("=")
+            if separator and key == name:
+                return content
+        return None
+
     @staticmethod
     async def _body(receive: Any) -> dict[str, object] | None:
         event = await receive()
@@ -1014,6 +1121,17 @@ class Application:
         try: value = json.loads(event.get("body", b""))
         except (TypeError, UnicodeDecodeError, json.JSONDecodeError): return None
         return value if isinstance(value, dict) else None
+
+    @staticmethod
+    async def _form_body(receive: Any) -> dict[str, object] | None:
+        event = await receive()
+        if event.get("type") != "http.request":
+            return None
+        try:
+            parsed = parse_qs(bytes(event.get("body", b"")).decode("utf-8"), keep_blank_values=True)
+        except (TypeError, UnicodeDecodeError):
+            return None
+        return {key: values[-1] for key, values in parsed.items() if values}
 
     @staticmethod
     def _error(status: str) -> dict[str, object]:
@@ -1033,6 +1151,11 @@ class Application:
         await send({"type": "http.response.start", "status": status, "headers": [(b"content-type", b"application/json")]})
         await send({"type": "http.response.body", "body": json.dumps(body).encode(), "more_body": False})
 
+    @staticmethod
+    async def _send_html(send: Any, status: int, body: str) -> None:
+        await send({"type": "http.response.start", "status": status, "headers": [(b"content-type", b"text/html; charset=utf-8")]})
+        await send({"type": "http.response.body", "body": body.encode("utf-8"), "more_body": False})
+
 
 def create_app(*, database_path: str | Path, credentials: Mapping[str, str], clock: Clock, notify: Notifier,
                wait: Waiter, ring_timeout_seconds: float = 60, agent_reconnect_seconds: float = 30,
@@ -1043,6 +1166,9 @@ def create_app(*, database_path: str | Path, credentials: Mapping[str, str], clo
                notification_scheduler_sleep: Waiter = asyncio.sleep,
                desktop_registration_service: Any | None = None,
                operator_session_verifier: Any | None = None,
+               browser_cookie_authenticator: Any | None = None,
+               mobile_html_renderer: Any | None = None,
+               trusted_browser_origin: str | None = None,
                operator_id: str = "only-operator") -> Application:
     if deadline_tick_seconds <= 0 or notification_dispatch_tick_seconds <= 0 or terminal_disconnect_seconds <= 0:
         raise ValueError("scheduler tick seconds must be positive")
@@ -1059,4 +1185,7 @@ def create_app(*, database_path: str | Path, credentials: Mapping[str, str], clo
         notification_scheduler_sleep,
         desktop_registration_service,
         operator_session_verifier,
+        browser_cookie_authenticator,
+        mobile_html_renderer,
+        trusted_browser_origin,
     )
