@@ -44,17 +44,28 @@ def _components(tmp_path: Path, *, route_mode: str = "desktop") -> tuple[Any, Te
         callback_credential="central-callback-secret",
         gui_ready=False,
     )
+    registry.register_desktop(
+        actor_role="management",
+        device_id="desktop-62",
+        endpoint="https://10.10.0.62:9100/terminal/events",
+        callback_credential="central-callback-secret-62",
+        gui_ready=False,
+    )
     service = DesktopRegistrationStateService(
         registry=registry,
         clock=clock,
         registered_credentials={
-            "desktop-secret": {"device_id": "desktop-61", "terminal_platform": "windows"}
+            "desktop-secret": {"device_id": "desktop-61", "terminal_platform": "windows"},
+            "desktop-62-secret": {"device_id": "desktop-62", "terminal_platform": "windows"},
         },
         device_state=lambda _device_id: [],
     )
     lifecycle_path = tmp_path / "lifecycle.sqlite3"
 
-    async def desktop_dispatch(_: dict[str, object]) -> dict[str, object]:
+    notifications: list[dict[str, object]] = []
+
+    async def desktop_dispatch(payload: dict[str, object]) -> dict[str, object]:
+        notifications.append(dict(payload))
         return {"accepted": True}
 
     async def bark_dispatch(_: dict[str, object]) -> dict[str, object]:
@@ -89,6 +100,8 @@ def _components(tmp_path: Path, *, route_mode: str = "desktop") -> tuple[Any, Te
         notification_router=router,
         desktop_registration_service=service,
     )
+    # Test-only observation of the real router dispatch boundary.
+    app._contract_notifications = notifications
     return app, registry, clock
 
 
@@ -115,13 +128,14 @@ def _request(
     return asyncio.run(run())
 
 
-def _register(app: Any) -> str:
+def _register(app: Any, *, credential: str = "desktop-secret") -> str:
+    device_suffix = "61" if credential == "desktop-secret" else "62"
     response = _request(
         app,
         "POST",
         "/api/terminals/register",
-        authorization="Terminal desktop-secret",
-        body={"endpoint": "https://10.10.0.61:9100/terminal/events", "gui_ready": True},
+        authorization=f"Terminal {credential}",
+        body={"endpoint": f"https://10.10.0.{device_suffix}:9100/terminal/events", "gui_ready": True},
     )
     assert response.status_code == 201
     return str(response.json()["session_id"])
@@ -230,15 +244,61 @@ def test_terminal_action_auth_deadline_route_and_race_are_opaque_or_single_winne
     assert excluded.status_code in {400, 404}
     assert excluded.json()["success"] is False
 
-    clock.advance(60)
-    expired = _request(app, "POST", path, session=owner, body={"operation_id": "late"})
+    # Both desktops are valid registered sessions, but the desktop route was
+    # concretely delivered to its deterministic target desktop-61.  The
+    # other desktop cannot accept or decline that invitation.
+    second = _register(app, credential="desktop-62-secret")
+    asyncio.run(app.dispatch_notification_delivery())
+    assert app._contract_notifications == [{
+        "call_id": call["call_id"],
+        "call_state": "ringing",
+        "version": 1,
+        "ring_deadline": clock() + 60,
+        "device_id": "desktop-61",
+        "endpoint": "https://10.10.0.61:9100/terminal/events",
+        "callback_credential": "central-callback-secret",
+        "gui_ready": True,
+        "fresh": True,
+    }]
+    for action in ("accept", "decline"):
+        denied = _request(
+            app, "POST", f"/api/calls/{call['call_id']}/{action}", session=second,
+            body={"operation_id": f"desktop-62-{action}"},
+        )
+        assert denied.status_code == 404
+        assert denied.json() == {"success": False, "status": "session_not_found", "needs_continuation": False}
+        # The original Agent still sees the same ringing call; a wrong
+        # desktop cannot alter ownership, busy state, or its delivered event.
+        assert _request(app, "GET", "/api/terminals/state", session=owner).json() == before
+        assert app._contract_notifications == [app._contract_notifications[0]]
+
+    accepted_owner = _request(
+        app, "POST", path, session=owner, body={"operation_id": "desktop-61-after-62"}
+    )
+    assert accepted_owner.status_code == 200
+    assert accepted_owner.json()["owner_device_id"] == "desktop-61"
+    assert accepted_owner.json()["owner_session_id"] == owner
+
+    deadline_app, _deadline_registry, deadline_clock = _components(tmp_path / "deadline")
+    deadline_owner = _register(deadline_app)
+    deadline_call = _ringing_call(deadline_app, "deadline-call")
+    deadline_clock.advance(60)
+    expired = _request(
+        deadline_app,
+        "POST",
+        f"/api/calls/{deadline_call['call_id']}/accept",
+        session=deadline_owner,
+        body={"operation_id": "late"},
+    )
     assert expired.json()["status"] == "not_accepted"
     assert expired.json()["reason"] == "ring_timeout"
 
-    race = _ringing_call(app, "race-call")
-    accepted = _request(app, "POST", f"/api/calls/{race['call_id']}/accept", session=owner,
+    race_app, _race_registry, _race_clock = _components(tmp_path / "race")
+    race_owner = _register(race_app)
+    race = _ringing_call(race_app, "race-call")
+    accepted = _request(race_app, "POST", f"/api/calls/{race['call_id']}/accept", session=race_owner,
                         body={"operation_id": "race-accept"})
-    declined = _request(app, "POST", f"/api/calls/{race['call_id']}/decline", session=owner,
+    declined = _request(race_app, "POST", f"/api/calls/{race['call_id']}/decline", session=race_owner,
                         body={"operation_id": "race-decline"})
     assert {accepted.json()["call_state"], declined.json()["call_state"]} <= {"accepted", "declined"}
     assert accepted.json()["call_state"] == declined.json()["call_state"]
