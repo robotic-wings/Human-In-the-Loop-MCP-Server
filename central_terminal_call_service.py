@@ -72,11 +72,20 @@ class TerminalCallService:
         if call is None:
             return self._hidden()
         state = str(call["call_state"])
-        if state == "accepted" and not self._is_owner(call_id, session_id):
+        # Another iPhone browser session must not learn that an accepted call
+        # exists or take it over.  A routed iPhone is allowed to observe a
+        # desktop-owned call, however: the response web must truthfully say
+        # that the desktop is processing/has processed it without exposing an
+        # editable session capability.
+        if (
+            state == "accepted"
+            and not self._is_owner(call_id, session_id)
+            and call.get("handled_on") == "iphone_web"
+        ):
             return self._hidden()
         result: dict[str, object] = {"success": True, "call_id": call_id, "call_state": state,
                                      "can_accept": state == "ringing", "can_decline": state == "ringing"}
-        if state == "accepted":
+        if state == "accepted" and self._is_owner(call_id, session_id):
             result["can_write"] = True
         if "handled_on" in call:
             result["handled_on"] = call["handled_on"]
@@ -93,6 +102,8 @@ class TerminalCallService:
         replay = self._replay(session_id, operation_id)
         if replay is not None:
             return replay
+        if not self._call_is_ringing_or_accepted(call_id):
+            return self._hidden()
         # This private seam runs before the coordinator transaction so a
         # binding failure cannot create a coordinator-only accepted call.  The
         # actual non-secret binding is written by CallCoordinator.accept in
@@ -119,6 +130,8 @@ class TerminalCallService:
         replay = self._replay(session_id, operation_id)
         if replay is not None:
             return replay
+        if not self._call_is_ringing_or_accepted(call_id):
+            return self._hidden()
         outcome = self._coordinator.decline(call_id, str(session["device_id"]))
         self._save(session_id, operation_id, outcome)
         if outcome.get("success") is True:
@@ -163,6 +176,10 @@ class TerminalCallService:
     def _call_is_accepted(self, call_id: str) -> bool:
         call = self._coordinator.get_call(call_id)
         return call is not None and call.get("call_state") == "accepted"
+
+    def _call_is_ringing_or_accepted(self, call_id: str) -> bool:
+        call = self._coordinator.get_call(call_id)
+        return call is not None and call.get("call_state") in {"ringing", "accepted"}
 
     def _replay(self, session_id: str, operation_id: str) -> dict[str, object] | None:
         import json
