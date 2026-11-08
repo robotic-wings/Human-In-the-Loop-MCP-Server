@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hmac
+import httpx
 import json
 import sys
 import uuid
@@ -44,6 +45,9 @@ class CentralServiceConfig:
     route_mode: str = "iphone"
     desktop_credentials: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
     desktop_endpoints: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    bark_endpoint: str | None = None
+    bark_credential: str | None = None
+    operator_sessions: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, object]) -> "CentralServiceConfig":
@@ -114,6 +118,24 @@ class CentralServiceConfig:
             if {metadata["device_id"] for metadata in desktop_credentials.values()} != set(desktop_endpoints):
                 raise ValueError("desktop credential and endpoint devices must match")
 
+        bark_endpoint = mapping.get("bark_endpoint")
+        bark_credential = mapping.get("bark_credential")
+        if bark_endpoint is not None and (not isinstance(bark_endpoint, str) or not bark_endpoint.strip()):
+            raise ValueError("bark_endpoint must be a non-empty URL")
+        if bark_credential is not None and (not isinstance(bark_credential, str) or not bark_credential):
+            raise ValueError("bark_credential must be non-empty")
+        raw_sessions = mapping.get("operator_sessions", {})
+        if not isinstance(raw_sessions, Mapping):
+            raise ValueError("operator_sessions must be a mapping")
+        operator_sessions: dict[str, dict[str, str]] = {}
+        for token, session in raw_sessions.items():
+            if not isinstance(token, str) or not token or not isinstance(session, Mapping):
+                raise ValueError("operator_sessions must contain session metadata")
+            operator_id, session_id = session.get("operator_id"), session.get("browser_session_id")
+            if not isinstance(operator_id, str) or not operator_id or not isinstance(session_id, str) or not session_id:
+                raise ValueError("operator session metadata is invalid")
+            operator_sessions[token] = {"operator_id": operator_id, "browser_session_id": session_id}
+
         return cls(
             listen_host=listen_host,
             listen_port=port,
@@ -125,6 +147,9 @@ class CentralServiceConfig:
             route_mode=route_mode,
             desktop_credentials=desktop_credentials,
             desktop_endpoints=desktop_endpoints,
+            bark_endpoint=bark_endpoint.strip() if isinstance(bark_endpoint, str) else None,
+            bark_credential=bark_credential,
+            operator_sessions=operator_sessions,
         )
 
 
@@ -419,6 +444,56 @@ def create_lifecycle_app(
     return app
 
 
+class _ConfiguredOperatorSessionVerifier:
+    """Minimal configuration-backed browser-session boundary for the runtime."""
+
+    def __init__(self, sessions: Mapping[str, Mapping[str, str]]) -> None:
+        self._sessions = {token: dict(session) for token, session in sessions.items()}
+
+    def verify(self, token: str | None) -> dict[str, str] | None:
+        if not isinstance(token, str):
+            return None
+        for expected, session in self._sessions.items():
+            if hmac.compare_digest(token, expected):
+                return dict(session)
+        return None
+
+
+def _runtime_dependencies(
+    config: CentralServiceConfig,
+) -> tuple[Callable[[dict[str, object]], object], Callable[[dict[str, object]], object], _ConfiguredOperatorSessionVerifier]:
+    """Build bounded, configuration-backed transport and browser seams."""
+    if config.route_mode in {"iphone", "both"} and (not config.bark_endpoint or not config.bark_credential):
+        raise ValueError("bark_endpoint and bark_credential are required for an iPhone route")
+    if config.route_mode in {"iphone", "both"} and not config.operator_sessions:
+        raise ValueError("operator_sessions are required for an iPhone route")
+
+    async def bark_dispatch(payload: dict[str, object]) -> dict[str, object]:
+        if not config.bark_endpoint or not config.bark_credential:
+            return {"http_status": 503, "business_success": False}
+        body = {**payload, "device_key": config.bark_credential}
+        async with httpx.AsyncClient(timeout=2.5) as client:
+            response = await client.post(config.bark_endpoint, json=body)
+        try:
+            content = response.json()
+        except (ValueError, json.JSONDecodeError):
+            content = None
+        business_success = bool(isinstance(content, Mapping) and content.get("code") in {200, "200"})
+        return {"http_status": response.status_code, "business_success": business_success}
+
+    async def desktop_dispatch(payload: dict[str, object]) -> dict[str, object]:
+        endpoint = payload.get("endpoint")
+        credential = payload.get("callback_credential")
+        if not isinstance(endpoint, str) or not endpoint or not isinstance(credential, str) or not credential:
+            return {"accepted": False}
+        body = {key: value for key, value in payload.items() if key not in {"endpoint", "callback_credential"}}
+        async with httpx.AsyncClient(timeout=2.5) as client:
+            response = await client.post(endpoint, json=body, headers={"x-central-callback": credential})
+        return {"accepted": 200 <= response.status_code < 300}
+
+    return bark_dispatch, desktop_dispatch, _ConfiguredOperatorSessionVerifier(config.operator_sessions)
+
+
 def main(argv: list[str] | None = None) -> None:
     """Start the central HTTP entry, rejecting removed legacy modes explicitly."""
 
@@ -446,7 +521,19 @@ def main(argv: list[str] | None = None) -> None:
     async def real_wait(seconds: float) -> None:
         await asyncio.sleep(seconds)
 
-    app = create_app(config, clock=lambda: __import__("time").time(), notify=lambda _: None, wait=real_wait)
+    try:
+        bark_dispatch, desktop_dispatch, operator_session_verifier = _runtime_dependencies(config)
+    except ValueError as error:
+        parser.error(f"invalid central configuration: {error}")
+
+    app = create_lifecycle_app(
+        config,
+        clock=lambda: __import__("time").time(),
+        wait=real_wait,
+        bark_dispatch=bark_dispatch,
+        desktop_dispatch=desktop_dispatch,
+        operator_session_verifier=operator_session_verifier,
+    )
     uvicorn.run(app, host=config.listen_host, port=config.listen_port, ssl_certfile=config.tls_cert_file, ssl_keyfile=config.tls_key_file)
 
 
