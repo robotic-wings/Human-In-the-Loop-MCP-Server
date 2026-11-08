@@ -32,7 +32,8 @@ class _Store:
                 CREATE TABLE IF NOT EXISTS notification_outbox (
                     call_id TEXT NOT NULL, channel TEXT NOT NULL,
                     ring_deadline REAL NOT NULL, state TEXT NOT NULL,
-                    created_at REAL NOT NULL, payload TEXT, PRIMARY KEY (call_id, channel)
+                    created_at REAL NOT NULL, payload TEXT, delivery_outcome TEXT,
+                    PRIMARY KEY (call_id, channel)
                 );
             """)
             # Existing outboxes predate the explicitly persisted Bark payload.
@@ -41,6 +42,8 @@ class _Store:
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(notification_outbox)")}
             if "payload" not in columns:
                 conn.execute("ALTER TABLE notification_outbox ADD COLUMN payload TEXT")
+            if "delivery_outcome" not in columns:
+                conn.execute("ALTER TABLE notification_outbox ADD COLUMN delivery_outcome TEXT")
 
     @contextmanager
     def connection(self):
@@ -180,7 +183,7 @@ class NotificationRouter:
     def outbox_records(self, call_id: str) -> list[dict[str, object]]:
         with self._store.connection() as conn:
             rows = conn.execute(
-                "SELECT channel, state, ring_deadline, payload FROM notification_outbox "
+                "SELECT channel, state, ring_deadline, payload, delivery_outcome FROM notification_outbox "
                 "WHERE call_id=? ORDER BY channel", (call_id,)
             ).fetchall()
         records: list[dict[str, object]] = []
@@ -189,6 +192,8 @@ class NotificationRouter:
                 "channel": row["channel"], "state": row["state"], "ring_deadline": row["ring_deadline"],
                 "payload": json.loads(row["payload"]) if row["payload"] else {"call_id": call_id},
             }
+            if row["delivery_outcome"] is not None:
+                record["delivery_outcome"] = row["delivery_outcome"]
             # Delivery bookkeeping is intentionally separate from the human
             # state machine.  It is exposed once a transport result exists.
             if row["state"] != "pending":
@@ -236,13 +241,21 @@ class NotificationRouter:
             response = dispatch(payload)
             if inspect.isawaitable(response):
                 response = await asyncio.wait_for(response, timeout)
-            delivered = bool(response.get("accepted")) if channel == "desktop" else (
-                response.get("http_status") == 200 and bool(response.get("business_success")))
-            self._set_state(call_id, channel, "delivered" if delivered else "failed")
+            if channel == "desktop":
+                delivered = bool(response.get("accepted"))
+                outcome = "delivered" if delivered else "transport_failure"
+            else:
+                http_ok = response.get("http_status") == 200
+                business_ok = bool(response.get("business_success"))
+                delivered = http_ok and business_ok
+                outcome = "delivered" if delivered else (
+                    "http_failure" if not http_ok else "business_failure"
+                )
+            self._set_state(call_id, channel, "delivered" if delivered else "failed", outcome)
         except (asyncio.TimeoutError, TimeoutError):
-            self._set_state(call_id, channel, "uncertain")
+            self._set_state(call_id, channel, "uncertain", "timeout")
         except Exception:
-            self._set_state(call_id, channel, "failed")
+            self._set_state(call_id, channel, "failed", "transport_failure")
 
         decision = self._delivery_decision(call_id)
         if decision is not None and self._decision_sink is not None:
@@ -264,6 +277,9 @@ class NotificationRouter:
             return "unreachable" if state == "ringing" else None
         return "ringing" if "skipped" not in states else None
 
-    def _set_state(self, call_id: str, channel: str, state: str) -> None:
+    def _set_state(self, call_id: str, channel: str, state: str, outcome: str | None = None) -> None:
         with self._store.connection() as conn:
-            conn.execute("UPDATE notification_outbox SET state=? WHERE call_id=? AND channel=?", (state, call_id, channel))
+            conn.execute(
+                "UPDATE notification_outbox SET state=?, delivery_outcome=? WHERE call_id=? AND channel=?",
+                (state, outcome, call_id, channel),
+            )
