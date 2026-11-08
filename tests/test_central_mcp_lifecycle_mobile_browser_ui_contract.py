@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import httpx
+import pytest
 
 from central_http_service import CentralServiceConfig, _ConfiguredOperatorSessionVerifier, create_lifecycle_app
 from central_desktop_registration_sync import DesktopRegistrationStateService
@@ -138,7 +139,7 @@ def _create(app: Any, request_id: str = "create") -> dict[str, object]:
     return response.json()
 
 
-def _configured_lifecycle_app(tmp_path: Path) -> Any:
+def _configured_lifecycle_app(tmp_path: Path, *, operator_id: str = "only-operator") -> Any:
     """Exercise the central runtime factory, not a direct lifecycle seam."""
     config = CentralServiceConfig.from_mapping({
         "listen_host": "127.0.0.1",
@@ -153,7 +154,7 @@ def _configured_lifecycle_app(tmp_path: Path) -> Any:
         "bark_credential": "bark-secret",
         "operator_sessions": {
             "operator-cookie": {
-                "operator_id": "only-operator",
+                "operator_id": operator_id,
                 "browser_session_id": "browser-61",
                 "csrf_token": "csrf-61",
             },
@@ -369,3 +370,53 @@ def test_configured_bark_call_link_establishes_authenticated_cookie_without_expo
     foreign = _request(app, "GET", call_path, cookie="foreign-cookie")
     assert foreign.status_code in {401, 404}
     assert call["call_id"] not in foreign.text
+
+
+def test_configured_operator_identity_is_derived_from_login_sessions_not_hardcoded(tmp_path: Path) -> None:
+    """A real operator identity must own its call, not a hardcoded literal.
+
+    The production deployment names one operator.  Deriving that identity from
+    the configured login sessions makes a non-``only-operator`` operator id
+    read its own call instead of turning a successful login into an opaque
+    ``session_not_found`` after the redirect.
+    """
+    app = _configured_lifecycle_app(tmp_path, operator_id="kefan")
+    call = _create(app, request_id="named-operator-call")
+    entry = _request(app, "GET", f"/calls/{call['call_id']}")
+    entry_token = entry.headers["set-cookie"].split("browser_entry=", 1)[1].split(";", 1)[0]
+    login = _request(
+        app, "POST", "/operator/login", raw_cookie=f"browser_entry={entry_token}",
+        form={"credential": "operator-login-secret"},
+        headers={"origin": "https://central.example.test", "host": "central.example.test"},
+    )
+    assert login.status_code in {302, 303}
+    cookie = login.headers["set-cookie"].split("operator_session=", 1)[1].split(";", 1)[0]
+    page = _request(app, "GET", f"/calls/{call['call_id']}", cookie=cookie)
+    assert page.status_code == 200
+    assert page.headers["content-type"].startswith("text/html")
+    assert "accept" in page.text.lower()
+
+
+def test_configured_login_credentials_must_target_a_single_operator(tmp_path: Path) -> None:
+    """Two login credentials naming different operators is a config error."""
+    with pytest.raises(ValueError):
+        CentralServiceConfig.from_mapping({
+            "listen_host": "127.0.0.1",
+            "listen_port": 8443,
+            "web_base_url": "https://central.example.test",
+            "data_dir": str(tmp_path / "multi-operator"),
+            "agent_credentials": {"agent-a": "agent-secret"},
+            "tls_cert_file": "test-cert.pem",
+            "tls_key_file": "test-key.pem",
+            "route_mode": "iphone",
+            "bark_endpoint": "https://bark.example.test/push",
+            "bark_credential": "bark-secret",
+            "operator_sessions": {
+                "operator-cookie": {"operator_id": "operator-a", "browser_session_id": "browser-61", "csrf_token": "csrf-61"},
+                "other-cookie": {"operator_id": "operator-b", "browser_session_id": "browser-62", "csrf_token": "csrf-62"},
+            },
+            "operator_login_credentials": {
+                "login-a": "operator-cookie",
+                "login-b": "other-cookie",
+            },
+        })

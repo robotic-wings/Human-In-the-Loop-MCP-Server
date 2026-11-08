@@ -49,6 +49,7 @@ class CentralServiceConfig:
     bark_credential: str | None = None
     operator_sessions: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
     operator_login_credentials: Mapping[str, str] = field(default_factory=dict)
+    operator_id: str = "only-operator"
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, object]) -> "CentralServiceConfig":
@@ -150,13 +151,21 @@ class CentralServiceConfig:
             if (not isinstance(credential, str) or not credential
                     or not isinstance(session_cookie, str) or session_cookie not in operator_sessions):
                 raise ValueError("operator_login_credentials must map credentials to configured sessions")
-            # The lifecycle is deliberately single-operator.  A credential
-            # which names any other configured browser session cannot ever
-            # own a call, so accepting it here would defer a configuration
-            # error until after a successful-looking browser login.
-            if operator_sessions[session_cookie]["operator_id"] != "only-operator":
-                raise ValueError("operator_login_credentials must target the configured operator session")
             operator_login_credentials[credential] = session_cookie
+
+        # The lifecycle runs one operator.  Its identity is the single operator
+        # declared by the sessions reachable through the login credentials, not
+        # a hardcoded literal.  Deriving it here keeps the configured operator
+        # id in agreement with both the login verifier and the call view, so a
+        # physical deployment whose operator uses a real identity no longer
+        # degrades into an opaque ``session_not_found`` after a working login.
+        login_operator_ids = {
+            operator_sessions[cookie]["operator_id"]
+            for cookie in operator_login_credentials.values()
+        }
+        if len(login_operator_ids) > 1:
+            raise ValueError("operator_login_credentials must target a single operator")
+        operator_id = next(iter(login_operator_ids), "only-operator")
 
         return cls(
             listen_host=listen_host,
@@ -173,6 +182,7 @@ class CentralServiceConfig:
             bark_credential=bark_credential,
             operator_sessions=operator_sessions,
             operator_login_credentials=operator_login_credentials,
+            operator_id=operator_id,
         )
 
 
@@ -417,7 +427,8 @@ def create_lifecycle_app(
         # still inject a cookie-only seam, but cannot accidentally bypass the
         # production entry flow when credentials are configured.
         configured_browser_authenticator = _ConfiguredOperatorSessionVerifier(
-            config.operator_sessions, config.operator_login_credentials
+            config.operator_sessions, config.operator_login_credentials,
+            lifecycle_operator_id=config.operator_id,
         )
     config.data_dir.mkdir(parents=True, exist_ok=True)
     database_path = config.data_dir / "lifecycle.sqlite3"
@@ -475,6 +486,7 @@ def create_lifecycle_app(
         browser_cookie_authenticator=configured_browser_authenticator,
         mobile_html_renderer=mobile_html_renderer,
         trusted_browser_origin=config.web_base_url,
+        operator_id=config.operator_id,
     )
     lifecycle_holder["app"] = app
     return app
@@ -553,7 +565,8 @@ def _runtime_dependencies(
         return {"accepted": 200 <= response.status_code < 300}
 
     verifier = _ConfiguredOperatorSessionVerifier(
-        config.operator_sessions, config.operator_login_credentials
+        config.operator_sessions, config.operator_login_credentials,
+        lifecycle_operator_id=config.operator_id,
     )
     return bark_dispatch, desktop_dispatch, verifier
 
