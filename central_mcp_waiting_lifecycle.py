@@ -34,7 +34,10 @@ class WaitingLifecycle:
             conn.executescript("""
               CREATE TABLE IF NOT EXISTS lifecycle_calls (
                 call_id TEXT PRIMARY KEY, interaction_id TEXT NOT NULL, caller_id TEXT NOT NULL,
-                call_state TEXT NOT NULL, ring_deadline REAL NOT NULL, reason TEXT
+                call_state TEXT NOT NULL, ring_deadline REAL NOT NULL, reason TEXT,
+                owner_device_id TEXT, owner_session_id TEXT, handled_on TEXT,
+                terminal_platform TEXT, invited_desktop_id TEXT,
+                version INTEGER NOT NULL DEFAULT 1
               );
               CREATE TABLE IF NOT EXISTS lifecycle_requests (
                 caller_id TEXT NOT NULL, request_id TEXT NOT NULL, payload_json TEXT NOT NULL,
@@ -63,11 +66,20 @@ class WaitingLifecycle:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(lifecycle_calls)")}
         if "agent_reconnect_deadline" not in columns:
             conn.execute("ALTER TABLE lifecycle_calls ADD COLUMN agent_reconnect_deadline REAL")
+        for column, definition in (
+            ("owner_device_id", "TEXT"), ("owner_session_id", "TEXT"),
+            ("handled_on", "TEXT"), ("terminal_platform", "TEXT"),
+            ("invited_desktop_id", "TEXT"),
+            ("version", "INTEGER NOT NULL DEFAULT 1"),
+        ):
+            if column not in columns:
+                conn.execute(f"ALTER TABLE lifecycle_calls ADD COLUMN {column} {definition}")
         request_columns = {row["name"] for row in conn.execute("PRAGMA table_info(lifecycle_requests)")}
         if "operation_kind" not in request_columns:
             conn.execute("ALTER TABLE lifecycle_requests ADD COLUMN operation_kind TEXT NOT NULL DEFAULT 'create'")
 
-    def create(self, caller_id: str, request_id: str, payload: Mapping[str, object]) -> dict[str, object]:
+    def create(self, caller_id: str, request_id: str, payload: Mapping[str, object],
+               invited_desktop_id: str | None = None) -> dict[str, object]:
         encoded = self._dump(payload)
         notification: dict[str, object] | None = None
         with self._connection() as conn:
@@ -87,9 +99,9 @@ class WaitingLifecycle:
                     deadline = self._clock() + self._ring_timeout
                     conn.execute(
                         "INSERT INTO lifecycle_calls "
-                        "(call_id, interaction_id, caller_id, call_state, ring_deadline, reason, agent_reconnect_deadline) "
-                        "VALUES (?, ?, ?, 'ringing', ?, NULL, NULL)",
-                        (call_id, interaction_id, caller_id, deadline),
+                        "(call_id, interaction_id, caller_id, call_state, ring_deadline, reason, agent_reconnect_deadline, invited_desktop_id) "
+                        "VALUES (?, ?, ?, 'ringing', ?, NULL, NULL, ?)",
+                        (call_id, interaction_id, caller_id, deadline, invited_desktop_id),
                     )
                     outcome = self._heartbeat(interaction_id, call_id, "ringing")
                     notification = {"call_id": call_id, "ring_deadline": deadline}
@@ -305,9 +317,79 @@ class WaitingLifecycle:
                 conn.rollback()
                 raise
 
-    def accept(self, *, call_id: str, device_id: str, handled_on: str, terminal_platform: str) -> dict[str, object]:
+    def terminal_action(self, *, call_id: str, device_id: str, session_id: str, terminal_platform: str,
+                        operation_id: str, action: str) -> dict[str, object]:
+        """Apply a desktop session action to the central call authority."""
+        if action not in {"accept", "decline"}:
+            return self._error("session_not_found")
+        encoded = self._dump({"call_id": call_id, "action": action})
+        actor = f"terminal:{session_id}"
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = conn.execute("SELECT payload_json, outcome_json, operation_kind FROM lifecycle_requests WHERE caller_id=? AND request_id=?", (actor, operation_id)).fetchone()
+                kind = f"terminal_{action}"
+                if existing is not None:
+                    if existing["operation_kind"] != kind or existing["payload_json"] != encoded:
+                        return self._error("request_conflict")
+                    return self._load(existing["outcome_json"])
+                self._settle_due(conn)
+                call = conn.execute("SELECT * FROM lifecycle_calls WHERE call_id=?", (call_id,)).fetchone()
+                if call is None:
+                    return self._error("session_not_found")
+                # A desktop channel is not a transferable invitation: the
+                # selected device is persisted with the call and is the only
+                # desktop allowed to act on that call.
+                if call["invited_desktop_id"] != device_id:
+                    return self._error("session_not_found")
+                if call["call_state"] != "ringing":
+                    event = conn.execute("SELECT body_json FROM lifecycle_events WHERE call_id=? ORDER BY event_seq DESC LIMIT 1", (call_id,)).fetchone()
+                    outcome = self._load(event["body_json"]) if event else self._error("expired")
+                else:
+                    state, status, reason = ("accepted", "opened", None) if action == "accept" else ("declined", "declined", "human_declined")
+                    conn.execute(
+                        "UPDATE lifecycle_calls SET call_state=?, reason=?, owner_device_id=?, owner_session_id=?, handled_on='desktop', terminal_platform=?, version=version+1 WHERE call_id=?",
+                        (state, reason, device_id, session_id, terminal_platform, call_id),
+                    )
+                    seq = int(conn.execute("SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call_id,)).fetchone()["n"])
+                    outcome: dict[str, object] = {
+                        "success": True, "status": status, "call_state": state, "human_action": True,
+                        "needs_continuation": action == "accept", "interaction_id": call["interaction_id"],
+                        "call_id": call_id, "event_seq": seq,
+                    }
+                    if action == "accept":
+                        outcome.update(owner_device_id=device_id, owner_session_id=session_id,
+                                       handled_on="desktop", terminal_platform=terminal_platform)
+                    else:
+                        outcome["reason"] = reason
+                    conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call_id, seq, self._dump(outcome)))
+                conn.execute("INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?, ?)", (actor, operation_id, encoded, self._dump(outcome), kind))
+                conn.commit()
+                return outcome
+            except BaseException:
+                conn.rollback()
+                raise
+
+    def terminal_states(self, device_id: str) -> list[dict[str, object]]:
+        with self._connection() as conn:
+            rows = conn.execute(
+                "SELECT call_id, call_state, version FROM lifecycle_calls WHERE owner_device_id=? ORDER BY call_id",
+                (device_id,),
+            ).fetchall()
+        return [{"call_id": row["call_id"], "call_state": row["call_state"], "version": row["version"]} for row in rows]
+
+    def accept(self, *, call_id: str, device_id: str, handled_on: str,
+               terminal_platform: str) -> dict[str, object]:
+        """Compatibility helper for existing lifecycle consumers.
+
+        The central desktop HTTP boundary above is the only new action route;
+        existing lifecycle callers retain their established ownership event.
+        """
         del device_id
-        return self._human_action(call_id, "opened", "accepted", None, {"handled_on": handled_on, "terminal_platform": terminal_platform})
+        return self._human_action(
+            call_id, "opened", "accepted", None,
+            {"handled_on": handled_on, "terminal_platform": terminal_platform, "human_action": True},
+        )
 
     def finish(self, *, call_id: str, status: str, result: Mapping[str, object]) -> dict[str, object]:
         return self._human_action(call_id, status, status, None, dict(result))
@@ -433,6 +515,9 @@ class Application:
         if path.startswith("/api/terminals/"):
             await self._terminal_api(method, path, scope.get("headers", []), receive, send)
             return
+        if isinstance(path, str) and path.startswith("/api/calls/"):
+            await self._terminal_action_api(method, path, scope.get("headers", []), receive, send)
+            return
         if method != "POST" or path != "/mcp":
             await self._send(send, 404, self._error("not_found")); return
         caller = self._caller(scope.get("headers", []))
@@ -481,9 +566,72 @@ class Application:
             response = service.heartbeat(session_id=session, gui_ready=gui_ready)
         elif method == "GET" and path == "/api/terminals/state":
             response = service.states(session_id=session)
+            context = self._terminal_context(session)
+            if response.get("success") and context is not None:
+                device_id, _platform = context
+                central_states = self.lifecycle.terminal_states(device_id)
+                if central_states:
+                    reported = response.get("states")
+                    merged = {
+                        str(item["call_id"]): dict(item)
+                        for item in reported if isinstance(reported, list) and isinstance(item, Mapping)
+                        and isinstance(item.get("call_id"), str)
+                    }
+                    merged.update({str(item["call_id"]): item for item in central_states})
+                    response = {**response, "states": [merged[key] for key in sorted(merged)]}
         else:
             await self._send(send, 404, self._error("not_found")); return
         await self._send(send, 200 if response.get("success") else 404, response)
+
+    async def _terminal_action_api(self, method: object, path: object, headers: object, receive: Any, send: Any) -> None:
+        if method != "POST" or not isinstance(path, str):
+            await self._send(send, 404, self._error("not_found")); return
+        parts = path.split("/")
+        if len(parts) != 5 or parts[:3] != ["", "api", "calls"] or parts[4] not in {"accept", "decline"}:
+            await self._send(send, 404, self._error("not_found")); return
+        session = self._terminal_session(headers)
+        context = self._terminal_context(session) if session is not None else None
+        if context is None:
+            await self._send(send, 401, self._terminal_error("session_not_found")); return
+        body = await self._body(receive)
+        operation_id = body.get("operation_id") if body is not None else None
+        if not isinstance(operation_id, str) or not operation_id:
+            await self._send(send, 400, self._error("invalid_request")); return
+        device_id, platform = context
+        response = self.lifecycle.terminal_action(
+            call_id=parts[3], device_id=device_id, session_id=session, terminal_platform=platform,
+            operation_id=operation_id, action=parts[4],
+        )
+        await self._send(send, 200 if response.get("success") else 404, response)
+
+    def _terminal_context(self, session_id: str | None) -> tuple[str, str] | None:
+        service = self._desktop_registration_service
+        if service is None or not isinstance(session_id, str):
+            return None
+        sessions = getattr(service, "_sessions", None)
+        credentials = getattr(service, "_credentials", None)
+        if not isinstance(sessions, Mapping) or not isinstance(credentials, Mapping):
+            return None
+        device_id = sessions.get(session_id)
+        if not isinstance(device_id, str):
+            return None
+        for metadata in credentials.values():
+            if isinstance(metadata, Mapping) and metadata.get("device_id") == device_id:
+                platform = metadata.get("terminal_platform")
+                return device_id, str(platform) if isinstance(platform, str) else "unknown"
+        return None
+
+    def _invited_desktop_id(self) -> str | None:
+        router = self._notification_router
+        if getattr(router, "_route_mode", None) not in {"desktop", "both"}:
+            return None
+        registry = getattr(router, "_registry", None) if router is not None else None
+        ready_desktop = getattr(registry, "ready_desktop", None)
+        if not callable(ready_desktop):
+            return None
+        terminal = ready_desktop()
+        device_id = terminal.get("device_id") if isinstance(terminal, Mapping) else None
+        return device_id if isinstance(device_id, str) else None
 
     async def _lifespan(self, receive: Any, send: Any) -> None:
         while True:
@@ -541,7 +689,8 @@ class Application:
             # slot, or disclose an active call when no human channel is
             # enabled for this new call.
             return self._error("no_enabled_channel"), False
-        return self.lifecycle.create(caller, request_id, payload), not replay
+        invited_desktop_id = self._invited_desktop_id() if not replay else None
+        return self.lifecycle.create(caller, request_id, payload, invited_desktop_id), not replay
 
     def _route_is_enabled(self) -> bool:
         """Accept only the central configuration's affirmative route result."""
