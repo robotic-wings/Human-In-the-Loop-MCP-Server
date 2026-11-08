@@ -214,7 +214,12 @@ def test_iphone_route_without_configured_web_base_url_fails_before_outbox_or_dis
 
 def test_iphone_route_rejects_malformed_or_non_https_web_base_before_outbox_or_dispatch(tmp_path: Path) -> None:
     """Bark links must be central HTTPS URLs, not arbitrary request-derived strings."""
-    for invalid_base in ("http://10.0.0.1:8443/central", "not a URL"):
+    for invalid_base in (
+        "http://10.0.0.1:8443/central",
+        "not a URL",
+        "https://user@",
+        "https://central.example.test:bad",
+    ):
         clock = FakeClock()
         attempts: list[dict[str, object]] = []
 
