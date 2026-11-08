@@ -100,6 +100,45 @@ def _components(tmp_path: Path, *, route_mode: str = "both") -> tuple[Any, Brows
     return app, browsers, clock, deliveries
 
 
+def _restart_components(tmp_path: Path, *, clock: FakeClock, route_mode: str) -> tuple[Any, BrowserSessions, list[dict[str, object]]]:
+    """Construct fresh application/router objects over the durable databases."""
+    registry = TerminalRegistry(database_path=tmp_path / "registry.sqlite3", clock=clock)
+    registration = DesktopRegistrationStateService(
+        registry=registry, clock=clock,
+        registered_credentials={"desktop-secret": {"device_id": "desktop-61", "terminal_platform": "windows"}},
+        device_state=lambda _device_id: [],
+    )
+    lifecycle_path = tmp_path / "lifecycle.sqlite3"
+    deliveries: list[dict[str, object]] = []
+
+    async def desktop_dispatch(payload: dict[str, object]) -> dict[str, object]:
+        deliveries.append({"channel": "desktop", **payload})
+        return {"accepted": True}
+
+    async def bark_dispatch(payload: dict[str, object]) -> dict[str, object]:
+        deliveries.append({"channel": "bark", **payload})
+        return {"http_status": 200, "business_success": True}
+
+    def call_state(call_id: str) -> str | None:
+        with sqlite3.connect(lifecycle_path) as conn:
+            row = conn.execute("SELECT call_state FROM lifecycle_calls WHERE call_id=?", (call_id,)).fetchone()
+        return None if row is None else str(row[0])
+
+    router = NotificationRouter(
+        database_path=tmp_path / "router.sqlite3", clock=clock, registry=registry,
+        desktop_dispatch=desktop_dispatch, bark_dispatch=bark_dispatch,
+        route_mode=route_mode, call_state=call_state, web_base_url="https://central.example.test",
+    )
+    browsers = BrowserSessions({"operator-browser": {"operator_id": "only-operator", "browser_session_id": "browser-61"}})
+    app = create_app(
+        database_path=lifecycle_path, credentials={"agent-a": "agent-secret"},
+        clock=clock, notify=router.enqueue, wait=_no_wait,
+        route_admission=router.validate_route, notification_router=router,
+        desktop_registration_service=registration, operator_session_verifier=browsers,
+    )
+    return app, browsers, deliveries
+
+
 def _request(app: Any, method: str, path: str, *, body: dict[str, object] | None = None,
              bearer: str | None = None, browser: str | None = None, terminal_session: str | None = None) -> httpx.Response:
     async def run() -> httpx.Response:
@@ -219,12 +258,43 @@ def test_desktop_truth_view_and_deadline_race_restart_never_create_a_second_mobi
     assert expired.json()["call_state"] == "not_accepted"
     assert expired.json()["reason"] == "ring_timeout"
 
-    # Dispatch exactly once before and after constructing a new central app
-    # over the same durable state.  Restart cannot re-ring or recreate a web
-    # owner, and a mobile-vs-desktop action race retains one winner.
+    # Create a new lifecycle application and router over the same durable
+    # SQLite databases.  Restart cannot re-ring or recreate a web owner.
     asyncio.run(app.dispatch_notification_delivery())
     count = len(deliveries)
-    asyncio.run(app.dispatch_notification_delivery())
+    restarted, _restart_browsers, restarted_deliveries = _restart_components(
+        tmp_path, clock=clock, route_mode="both"
+    )
+    asyncio.run(restarted.dispatch_notification_delivery())
     assert len(deliveries) == count
+    assert restarted_deliveries == []
+    _hidden(_request(restarted, "POST", f"/calls/{call['call_id']}/accept", browser="operator-browser", body={"operation_id": "after-restart"}))
     assert len(late_deliveries) == 0
     assert clock() == 1_700_000_000.0
+
+    # The competing browser and invited desktop requests share one central
+    # lifecycle transaction.  At most one durable accepted owner/event exists.
+    race_app, _race_browsers, _race_clock, _race_deliveries = _components(tmp_path / "race", route_mode="both")
+    race_desktop = _desktop_session(race_app)
+    race_call = _create(race_app, "desktop-mobile-race")
+
+    async def compete() -> tuple[httpx.Response, httpx.Response]:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=race_app), base_url="https://central.example.test") as client:
+            desktop, mobile = await asyncio.gather(
+                client.post(f"/api/calls/{race_call['call_id']}/accept", headers={"x-terminal-session": race_desktop}, json={"operation_id": "desktop-race"}),
+                client.post(f"/calls/{race_call['call_id']}/accept", headers={"x-operator-session": "operator-browser"}, json={"operation_id": "mobile-race"}),
+            )
+        return desktop, mobile
+
+    desktop_race, mobile_race = asyncio.run(compete())
+    assert {desktop_race.status_code, mobile_race.status_code} <= {200, 401, 404}
+    with sqlite3.connect(tmp_path / "race" / "lifecycle.sqlite3") as conn:
+        row = conn.execute(
+            "SELECT call_state, owner_device_id, owner_session_id FROM lifecycle_calls WHERE call_id=?",
+            (race_call["call_id"],),
+        ).fetchone()
+        events = conn.execute("SELECT COUNT(*) FROM lifecycle_events WHERE call_id=?", (race_call["call_id"],)).fetchone()
+    assert row is not None and row[0] == "accepted"
+    assert row[1] in {"desktop-61", "iphone_web"}
+    assert isinstance(row[2], str) and row[2]
+    assert events == (1,)
