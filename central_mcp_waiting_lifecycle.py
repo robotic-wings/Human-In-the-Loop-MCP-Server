@@ -26,10 +26,12 @@ RouteAdmission = Callable[[], Mapping[str, object]]
 
 class WaitingLifecycle:
     def __init__(self, path: str | Path, clock: Clock, notify: Notifier, ring_timeout: float,
-                 agent_reconnect_seconds: float, terminal_disconnect_seconds: float = 180) -> None:
+                 agent_reconnect_seconds: float, terminal_disconnect_seconds: float = 180,
+                 operator_id: str = "only-operator") -> None:
         self._path, self._clock, self._notify = str(path), clock, notify
         self._ring_timeout, self._agent_reconnect_seconds = ring_timeout, agent_reconnect_seconds
         self._terminal_disconnect_seconds = terminal_disconnect_seconds
+        self._operator_id = operator_id
         Path(self._path).parent.mkdir(parents=True, exist_ok=True)
         with self._connection() as conn:
             conn.executescript("""
@@ -38,6 +40,7 @@ class WaitingLifecycle:
                 call_state TEXT NOT NULL, ring_deadline REAL NOT NULL, reason TEXT,
                 owner_device_id TEXT, owner_session_id TEXT, handled_on TEXT,
                 terminal_platform TEXT, invited_desktop_id TEXT,
+                mobile_eligible INTEGER NOT NULL DEFAULT 0,
                 terminal_last_seen_at REAL, terminal_disconnect_deadline REAL,
                 version INTEGER NOT NULL DEFAULT 1
               );
@@ -72,6 +75,7 @@ class WaitingLifecycle:
             ("owner_device_id", "TEXT"), ("owner_session_id", "TEXT"),
             ("handled_on", "TEXT"), ("terminal_platform", "TEXT"),
             ("invited_desktop_id", "TEXT"),
+            ("mobile_eligible", "INTEGER NOT NULL DEFAULT 0"),
             ("terminal_last_seen_at", "REAL"), ("terminal_disconnect_deadline", "REAL"),
             ("version", "INTEGER NOT NULL DEFAULT 1"),
         ):
@@ -82,7 +86,7 @@ class WaitingLifecycle:
             conn.execute("ALTER TABLE lifecycle_requests ADD COLUMN operation_kind TEXT NOT NULL DEFAULT 'create'")
 
     def create(self, caller_id: str, request_id: str, payload: Mapping[str, object],
-               invited_desktop_id: str | None = None) -> dict[str, object]:
+               invited_desktop_id: str | None = None, mobile_eligible: bool = False) -> dict[str, object]:
         encoded = self._dump(payload)
         notification: dict[str, object] | None = None
         with self._connection() as conn:
@@ -102,9 +106,9 @@ class WaitingLifecycle:
                     deadline = self._clock() + self._ring_timeout
                     conn.execute(
                         "INSERT INTO lifecycle_calls "
-                        "(call_id, interaction_id, caller_id, call_state, ring_deadline, reason, agent_reconnect_deadline, invited_desktop_id) "
-                        "VALUES (?, ?, ?, 'ringing', ?, NULL, NULL, ?)",
-                        (call_id, interaction_id, caller_id, deadline, invited_desktop_id),
+                        "(call_id, interaction_id, caller_id, call_state, ring_deadline, reason, agent_reconnect_deadline, invited_desktop_id, mobile_eligible) "
+                        "VALUES (?, ?, ?, 'ringing', ?, NULL, NULL, ?, ?)",
+                        (call_id, interaction_id, caller_id, deadline, invited_desktop_id, int(mobile_eligible)),
                     )
                     outcome = self._heartbeat(interaction_id, call_id, "ringing")
                     notification = {"call_id": call_id, "ring_deadline": deadline}
@@ -375,6 +379,82 @@ class WaitingLifecycle:
                 conn.rollback()
                 raise
 
+    def browser_action(self, *, call_id: str, operator_id: str, session_id: str,
+                       operation_id: str, action: str) -> dict[str, object]:
+        """Apply an explicit, authenticated iPhone-web action centrally.
+
+        A browser session is an ownership credential, not a read capability.
+        The invitation's mobile eligibility is stored at creation time, so a
+        later route configuration change cannot grant a browser authority.
+        """
+        if action not in {"accept", "decline"} or operator_id != self._operator_id:
+            return self._error("session_not_found")
+        encoded = self._dump({"call_id": call_id, "action": action})
+        actor = f"browser:{session_id}"
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = conn.execute(
+                    "SELECT payload_json, outcome_json, operation_kind FROM lifecycle_requests WHERE caller_id=? AND request_id=?",
+                    (actor, operation_id),
+                ).fetchone()
+                kind = f"browser_{action}"
+                if existing is not None:
+                    if existing["operation_kind"] != kind or existing["payload_json"] != encoded:
+                        return self._error("request_conflict")
+                    return self._load(existing["outcome_json"])
+                self._settle_due(conn)
+                call = conn.execute("SELECT * FROM lifecycle_calls WHERE call_id=?", (call_id,)).fetchone()
+                if call is None or not bool(call["mobile_eligible"]):
+                    return self._error("session_not_found")
+                # A browser opened after a desktop owns the call is a
+                # read-only truth view, not a second action surface.
+                if call["call_state"] != "ringing":
+                    # Deadline settlement is authoritative even when the
+                    # request path, rather than the scheduler, observes it.
+                    # Return that saved terminal result; a competing human
+                    # action (for example after desktop acceptance) remains
+                    # opaque and cannot disclose or alter ownership.
+                    if call["reason"] == "ring_timeout":
+                        event = conn.execute(
+                            "SELECT body_json FROM lifecycle_events WHERE call_id=? ORDER BY event_seq DESC LIMIT 1",
+                            (call_id,),
+                        ).fetchone()
+                        return self._load(event["body_json"]) if event is not None else self._error("expired")
+                    return self._error("session_not_found")
+                state, status, reason = (
+                    ("accepted", "opened", None) if action == "accept"
+                    else ("declined", "declined", "human_declined")
+                )
+                now = self._clock()
+                conn.execute(
+                    "UPDATE lifecycle_calls SET call_state=?, reason=?, owner_device_id=?, owner_session_id=?, handled_on='iphone_web', terminal_platform='ios', terminal_last_seen_at=?, terminal_disconnect_deadline=?, agent_reconnect_deadline=?, version=version+1 WHERE call_id=?",
+                    (state, reason, "iphone_web", session_id, now,
+                     now + self._terminal_disconnect_seconds if action == "accept" else None,
+                     None, call_id),
+                )
+                seq = int(conn.execute(
+                    "SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call_id,)
+                ).fetchone()["n"])
+                outcome: dict[str, object] = {
+                    "success": True, "status": status, "call_state": state, "human_action": True,
+                    "needs_continuation": action == "accept", "interaction_id": call["interaction_id"],
+                    "call_id": call_id, "event_seq": seq,
+                }
+                if action == "accept":
+                    outcome.update(owner_device_id="iphone_web", owner_session_id=session_id,
+                                   handled_on="iphone_web", terminal_platform="ios")
+                else:
+                    outcome["reason"] = reason
+                conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call_id, seq, self._dump(outcome)))
+                conn.execute("INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?, ?)",
+                             (actor, operation_id, encoded, self._dump(outcome), kind))
+                conn.commit()
+                return outcome
+            except BaseException:
+                conn.rollback()
+                raise
+
     def terminal_heartbeat(self, *, call_id: str, session_id: str) -> dict[str, object]:
         """Refresh liveness only for the exact session which accepted the call."""
         with self._connection() as conn:
@@ -521,12 +601,14 @@ class Application:
                  deadline_tick_seconds: float, scheduler_sleep: Waiter,
                  route_admission: RouteAdmission, notification_router: Any | None,
                  notification_dispatch_tick_seconds: float, notification_scheduler_sleep: Waiter,
-                 desktop_registration_service: Any | None = None) -> None:
+                 desktop_registration_service: Any | None = None,
+                 operator_session_verifier: Any | None = None) -> None:
         self.lifecycle, self._credentials, self._wait = lifecycle, dict(credentials), wait
         self._deadline_tick_seconds, self._scheduler_sleep = deadline_tick_seconds, scheduler_sleep
         self._route_admission = route_admission
         self._notification_router = notification_router
         self._desktop_registration_service = desktop_registration_service
+        self._operator_session_verifier = operator_session_verifier
         if notification_router is not None:
             sink_setter = getattr(notification_router, "set_delivery_decision_sink", None)
             if callable(sink_setter):
@@ -565,6 +647,9 @@ class Application:
             return
         if isinstance(path, str) and path.startswith("/api/calls/"):
             await self._terminal_action_api(method, path, scope.get("headers", []), receive, send)
+            return
+        if isinstance(path, str) and path.startswith("/calls/"):
+            await self._browser_call_api(method, path, scope.get("headers", []), receive, send)
             return
         if method != "POST" or path != "/mcp":
             await self._send(send, 404, self._error("not_found")); return
@@ -656,6 +741,58 @@ class Application:
             )
         await self._send(send, 200 if response.get("success") else 404, response)
 
+    async def _browser_call_api(self, method: object, path: object, headers: object, receive: Any, send: Any) -> None:
+        if not isinstance(path, str):
+            await self._send(send, 404, self._error("not_found")); return
+        parts = path.split("/")
+        if len(parts) not in {3, 4} or parts[:2] != ["", "calls"] or not isinstance(parts[2], str) or not parts[2]:
+            await self._send(send, 404, self._error("not_found")); return
+        session = self._operator_session(headers)
+        if session is None:
+            await self._send(send, 401, self._terminal_error("session_not_found")); return
+        operator_id, browser_session_id = session
+        call_id = parts[2]
+        if len(parts) == 3 and method == "GET":
+            response = self._browser_call_view(call_id, operator_id)
+            await self._send(send, 200 if response.get("success") else 404, response); return
+        if len(parts) != 4 or method != "POST" or parts[3] not in {"accept", "decline"}:
+            await self._send(send, 404, self._error("not_found")); return
+        body = await self._body(receive)
+        operation_id = body.get("operation_id") if body is not None else None
+        if not isinstance(operation_id, str) or not operation_id:
+            await self._send(send, 400, self._error("invalid_request")); return
+        response = self.lifecycle.browser_action(
+            call_id=call_id, operator_id=operator_id, session_id=browser_session_id,
+            operation_id=operation_id, action=parts[3],
+        )
+        await self._send(send, 200 if response.get("success") else 404, response)
+
+    def _browser_call_view(self, call_id: str, operator_id: str) -> dict[str, object]:
+        if operator_id != self.lifecycle._operator_id:
+            return self._terminal_error("session_not_found")
+        with self.lifecycle._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self.lifecycle._settle_due(conn)
+                call = conn.execute("SELECT * FROM lifecycle_calls WHERE call_id=?", (call_id,)).fetchone()
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        if call is None or not bool(call["mobile_eligible"]):
+            return self._terminal_error("session_not_found")
+        state = str(call["call_state"])
+        view: dict[str, object] = {
+            "success": True, "call_id": call_id, "call_state": state,
+            "handled_on": call["handled_on"], "terminal_platform": call["terminal_platform"],
+            "can_accept": state == "ringing", "can_decline": state == "ringing",
+        }
+        if state in {"accepted", "in_progress"} and call["handled_on"] == "desktop":
+            view["display_state"] = "handled_on_desktop_processing"
+        elif state in {"answered", "completed", "failed"} and call["handled_on"] == "desktop":
+            view["display_state"] = "handled_on_desktop_complete"
+        return view
+
     def _terminal_context(self, session_id: str | None) -> tuple[str, str] | None:
         service = self._desktop_registration_service
         if service is None or not isinstance(session_id, str):
@@ -684,6 +821,9 @@ class Application:
         terminal = ready_desktop()
         device_id = terminal.get("device_id") if isinstance(terminal, Mapping) else None
         return device_id if isinstance(device_id, str) else None
+
+    def _mobile_eligible(self) -> bool:
+        return getattr(self._notification_router, "_route_mode", None) in {"iphone", "both"}
 
     async def _lifespan(self, receive: Any, send: Any) -> None:
         while True:
@@ -742,7 +882,8 @@ class Application:
             # enabled for this new call.
             return self._error("no_enabled_channel"), False
         invited_desktop_id = self._invited_desktop_id() if not replay else None
-        return self.lifecycle.create(caller, request_id, payload, invited_desktop_id), not replay
+        mobile_eligible = self._mobile_eligible() if not replay else False
+        return self.lifecycle.create(caller, request_id, payload, invited_desktop_id, mobile_eligible), not replay
 
     def _route_is_enabled(self) -> bool:
         """Accept only the central configuration's affirmative route result."""
@@ -779,6 +920,18 @@ class Application:
     def _terminal_session(self, headers: object) -> str | None:
         return self._header(headers, b"x-terminal-session")
 
+    def _operator_session(self, headers: object) -> tuple[str, str] | None:
+        token = self._header(headers, b"x-operator-session")
+        verifier = self._operator_session_verifier
+        verify = getattr(verifier, "verify", None)
+        result = verify(token) if callable(verify) else verifier(token) if callable(verifier) else None
+        if not isinstance(result, Mapping):
+            return None
+        operator_id, session_id = result.get("operator_id"), result.get("browser_session_id")
+        if not isinstance(operator_id, str) or not operator_id or not isinstance(session_id, str) or not session_id:
+            return None
+        return operator_id, session_id
+
     @staticmethod
     async def _body(receive: Any) -> dict[str, object] | None:
         event = await receive()
@@ -807,12 +960,14 @@ def create_app(*, database_path: str | Path, credentials: Mapping[str, str], clo
                route_admission: RouteAdmission | None = None, notification_router: Any | None = None,
                notification_dispatch_tick_seconds: float = 1,
                notification_scheduler_sleep: Waiter = asyncio.sleep,
-               desktop_registration_service: Any | None = None) -> Application:
+               desktop_registration_service: Any | None = None,
+               operator_session_verifier: Any | None = None,
+               operator_id: str = "only-operator") -> Application:
     if deadline_tick_seconds <= 0 or notification_dispatch_tick_seconds <= 0 or terminal_disconnect_seconds <= 0:
         raise ValueError("scheduler tick seconds must be positive")
     return Application(
         WaitingLifecycle(database_path, clock, notify, ring_timeout_seconds, agent_reconnect_seconds,
-                         terminal_disconnect_seconds),
+                         terminal_disconnect_seconds, operator_id),
         credentials,
         wait,
         deadline_tick_seconds,
@@ -822,4 +977,5 @@ def create_app(*, database_path: str | Path, credentials: Mapping[str, str], clo
         notification_dispatch_tick_seconds,
         notification_scheduler_sleep,
         desktop_registration_service,
+        operator_session_verifier,
     )
