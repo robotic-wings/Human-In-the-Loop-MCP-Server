@@ -250,6 +250,45 @@ def test_accept_decline_and_dismiss_use_only_bound_terminal_session_and_whole_ca
     assert central.states["call-3"]["call_state"] == "declined"
 
 
+def test_operation_replay_is_scoped_to_call_id_not_only_terminal_session() -> None:
+    """The same operation ID on separate calls cannot replay/cross-close."""
+
+    central = FakeCentral(
+        states={"call-a": _ringing("call-a"), "call-b": _ringing("call-b")}
+    )
+    client = _client(central=central)
+    assert client.start()["success"] is True
+    client.receive_notification(
+        {"call_id": "call-a", "version": 1},
+        callback_credential="central-callback-secret",
+    )
+    client.receive_notification(
+        {"call_id": "call-b", "version": 1},
+        callback_credential="central-callback-secret",
+    )
+
+    first = client.accept(call_id="call-a", operation_id="shared-operation")
+    # The established public response carries additional desktop diagnostics in
+    # the current adapter.  Assert its stable fields so this first operation
+    # can succeed, then make the second-call assertion expose only an
+    # incorrectly session-wide operation cache.
+    assert first["success"] is True
+    assert first["status"] == "opened"
+    assert first["call_id"] == "call-a"
+    second = client.accept(call_id="call-b", operation_id="shared-operation")
+    assert second["success"] is True
+    assert second["status"] == "opened"
+    assert second["call_id"] == "call-b"
+    assert central.actions == [
+        ("accept", "call-a", "desktop-session-1", "shared-operation"),
+        ("accept", "call-b", "desktop-session-1", "shared-operation"),
+    ]
+    assert central.states["call-a"]["call_state"] == "accepted"
+    assert central.states["call-b"]["call_state"] == "accepted"
+    assert client.presenter.closed == ["call-a", "call-b"]
+    assert client.ring.stopped == ["call-a", "call-b"]
+
+
 def test_sync_wake_and_remote_acceptance_close_stale_desktop_alert_without_takeover() -> None:
     central = FakeCentral(states={"call-1": _ringing("call-1")})
     client = _client(central=central)
