@@ -231,7 +231,10 @@ def test_route_foreign_unknown_and_late_states_are_uniformly_hidden(tmp_path: Pa
         _request(app, "POST", f"/calls/{bark_call}/decline", token="other", body={"operation_id": "late"}),
     ):
         _hidden(response)
-    assert coordinator.get_call(bark_call)["call_state"] == "accepted"
+    # The first call was deliberately settled above to make room for the
+    # distinct desktop-only call.  A late or foreign browser operation cannot
+    # revive it or disclose a writable state.
+    assert coordinator.get_call(bark_call)["call_state"] == "answered"
     assert len(updates) == 1
 
 
