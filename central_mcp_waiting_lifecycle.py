@@ -23,8 +23,10 @@ Notifier = Callable[[dict[str, object]], None]
 
 
 class WaitingLifecycle:
-    def __init__(self, path: str | Path, clock: Clock, notify: Notifier, ring_timeout: float) -> None:
-        self._path, self._clock, self._notify, self._ring_timeout = str(path), clock, notify, ring_timeout
+    def __init__(self, path: str | Path, clock: Clock, notify: Notifier, ring_timeout: float,
+                 agent_reconnect_seconds: float) -> None:
+        self._path, self._clock, self._notify = str(path), clock, notify
+        self._ring_timeout, self._agent_reconnect_seconds = ring_timeout, agent_reconnect_seconds
         Path(self._path).parent.mkdir(parents=True, exist_ok=True)
         with self._connection() as conn:
             conn.executescript("""
@@ -41,6 +43,7 @@ class WaitingLifecycle:
                 PRIMARY KEY (call_id, event_seq)
               );
             """)
+            self._migrate_calls(conn)
             self._settle_due(conn)
 
     @contextmanager
@@ -51,6 +54,12 @@ class WaitingLifecycle:
             yield conn
         finally:
             conn.close()
+
+    @staticmethod
+    def _migrate_calls(conn: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(lifecycle_calls)")}
+        if "agent_reconnect_deadline" not in columns:
+            conn.execute("ALTER TABLE lifecycle_calls ADD COLUMN agent_reconnect_deadline REAL")
 
     def create(self, caller_id: str, request_id: str, payload: Mapping[str, object]) -> dict[str, object]:
         encoded = self._dump(payload)
@@ -70,7 +79,12 @@ class WaitingLifecycle:
                 else:
                     call_id, interaction_id = str(uuid.uuid4()), str(uuid.uuid4())
                     deadline = self._clock() + self._ring_timeout
-                    conn.execute("INSERT INTO lifecycle_calls VALUES (?, ?, ?, 'ringing', ?, NULL)", (call_id, interaction_id, caller_id, deadline))
+                    conn.execute(
+                        "INSERT INTO lifecycle_calls "
+                        "(call_id, interaction_id, caller_id, call_state, ring_deadline, reason, agent_reconnect_deadline) "
+                        "VALUES (?, ?, ?, 'ringing', ?, NULL, NULL)",
+                        (call_id, interaction_id, caller_id, deadline),
+                    )
                     outcome = self._heartbeat(interaction_id, call_id, "ringing")
                     notification = {"call_id": call_id, "ring_deadline": deadline}
                 conn.execute("INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?)", (caller_id, request_id, encoded, self._dump(outcome)))
@@ -110,6 +124,31 @@ class WaitingLifecycle:
             finally:
                 conn.commit()
 
+    def heartbeat_delivered(self, caller_id: str, response: Mapping[str, object]) -> None:
+        """Persist ringing reconnect grace after a newly executed wait returns."""
+        if response.get("status") != "heartbeat" or response.get("call_state") != "ringing":
+            return
+        interaction_id, call_id = response.get("interaction_id"), response.get("call_id")
+        if not isinstance(interaction_id, str) or not isinstance(call_id, str):
+            return
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._settle_due(conn)
+                call = conn.execute(
+                    "SELECT interaction_id, call_state FROM lifecycle_calls WHERE call_id=? AND caller_id=?",
+                    (call_id, caller_id),
+                ).fetchone()
+                if call is not None and call["interaction_id"] == interaction_id and call["call_state"] == "ringing":
+                    conn.execute(
+                        "UPDATE lifecycle_calls SET agent_reconnect_deadline=? WHERE call_id=?",
+                        (self._clock() + self._agent_reconnect_seconds, call_id),
+                    )
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+
     def accept(self, *, call_id: str, device_id: str, handled_on: str, terminal_platform: str) -> dict[str, object]:
         del device_id
         return self._human_action(call_id, "opened", "accepted", None, {"handled_on": handled_on, "terminal_platform": terminal_platform})
@@ -148,11 +187,26 @@ class WaitingLifecycle:
                 raise
 
     def _settle_due(self, conn: sqlite3.Connection) -> None:
-        rows = conn.execute("SELECT * FROM lifecycle_calls WHERE call_state='ringing' AND ring_deadline<=?", (self._clock(),)).fetchall()
+        now = self._clock()
+        rows = conn.execute("SELECT * FROM lifecycle_calls WHERE call_state='ringing' AND ring_deadline<=?", (now,)).fetchall()
         for call in rows:
             conn.execute("UPDATE lifecycle_calls SET call_state='not_accepted', reason='ring_timeout' WHERE call_id=?", (call["call_id"],))
             seq = int(conn.execute("SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call["call_id"],)).fetchone()["n"])
             body = self._terminal(call["interaction_id"], call["call_id"], "not_accepted", "ring_timeout", seq)
+            conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call["call_id"], seq, self._dump(body)))
+        rows = conn.execute(
+            "SELECT * FROM lifecycle_calls WHERE call_state='ringing' "
+            "AND agent_reconnect_deadline IS NOT NULL AND agent_reconnect_deadline<=?",
+            (now,),
+        ).fetchall()
+        for call in rows:
+            conn.execute(
+                "UPDATE lifecycle_calls SET call_state='disconnected', reason='agent_disconnected' WHERE call_id=?",
+                (call["call_id"],),
+            )
+            seq = int(conn.execute("SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call["call_id"],)).fetchone()["n"])
+            body = self._terminal(call["interaction_id"], call["call_id"], "disconnected", "agent_disconnected", seq)
+            body["human_action"] = False
             conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call["call_id"], seq, self._dump(body)))
 
     @staticmethod
@@ -195,9 +249,12 @@ class Application:
         response, should_wait = self._dispatch(caller, body)
         await send({"type": "http.response.start", "status": 200 if response.get("success") else 400,
                     "headers": [(b"content-type", b"application/json")]})
-        if should_wait and response.get("needs_continuation") and response.get("status") == "heartbeat":
+        waited = should_wait and response.get("needs_continuation") and response.get("status") == "heartbeat"
+        if waited:
             await self._wait(max(1, float(timeout) - min(30, max(1, float(timeout) // 4))))
         await send({"type": "http.response.body", "body": json.dumps(response, separators=(",", ":")).encode(), "more_body": False})
+        if waited:
+            self.lifecycle.heartbeat_delivered(caller, response)
 
     def _dispatch(self, caller: str, body: Mapping[str, object]) -> tuple[dict[str, object], bool]:
         request_id = body.get("request_id")
@@ -244,5 +301,9 @@ class Application:
 
 
 def create_app(*, database_path: str | Path, credentials: Mapping[str, str], clock: Clock, notify: Notifier,
-               wait: Waiter, ring_timeout_seconds: float = 60) -> Application:
-    return Application(WaitingLifecycle(database_path, clock, notify, ring_timeout_seconds), credentials, wait)
+               wait: Waiter, ring_timeout_seconds: float = 60, agent_reconnect_seconds: float = 30) -> Application:
+    return Application(
+        WaitingLifecycle(database_path, clock, notify, ring_timeout_seconds, agent_reconnect_seconds),
+        credentials,
+        wait,
+    )
