@@ -124,12 +124,12 @@ def test_configured_bark_link_is_call_specific_and_reconstruction_never_redispat
     first = runtime(tmp_path, bark=bark, desktop=[])
     call = create_call(first)
 
-    first.dispatch_notification_delivery()
+    asyncio.run(first.dispatch_notification_delivery())
     assert len(bark) == 1
     assert bark[0]["url"] == f"https://central.test:8443/calls/{call['call_id']}"
 
     reconstructed = runtime(tmp_path, bark=bark, desktop=[])
-    reconstructed.dispatch_notification_delivery()
+    asyncio.run(reconstructed.dispatch_notification_delivery())
     assert len(bark) == 1
 
 
@@ -149,8 +149,17 @@ def test_original_agent_reads_browser_owner_answer_after_configured_reconstructi
         "interaction_id": call["interaction_id"], "call_id": call["call_id"], "after_event_seq": 0,
     })
     assert continued.status_code == 200
-    assert continued.json()["status"] == "answered"
-    assert continued.json()["result"]["user_input"] == "from configured runtime"
+    assert continued.json()["status"] == "opened"
+    assert continued.json()["event_seq"] == 1
+
+    final = request(reconstructed, "POST", "/mcp", agent="agent-secret", body={
+        "request_id": "runtime-continue-final", "client_timeout_seconds": 2,
+        "interaction_id": call["interaction_id"], "call_id": call["call_id"], "after_event_seq": 1,
+    })
+    assert final.status_code == 200
+    assert final.json()["status"] == "answered"
+    assert final.json()["event_seq"] == 2
+    assert final.json()["result"]["user_input"] == "from configured runtime"
 
 
 @pytest.mark.parametrize("override", [
