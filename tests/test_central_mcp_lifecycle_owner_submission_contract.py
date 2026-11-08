@@ -55,6 +55,10 @@ def components(tmp_path: Path, *, clock: Clock | None = None, route_mode: str = 
         actor_role="management", device_id="desktop-owner",
         endpoint="https://desktop.test/events", callback_credential="callback-secret", gui_ready=False,
     )
+    registry.register_desktop(
+        actor_role="management", device_id="desktop-other",
+        endpoint="https://desktop-other.test/events", callback_credential="other-callback-secret", gui_ready=False,
+    )
     registration = DesktopRegistrationStateService(
         registry=registry, clock=clock,
         registered_credentials={
