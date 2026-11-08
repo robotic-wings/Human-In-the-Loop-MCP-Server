@@ -35,13 +35,9 @@ class DesktopRegistrationStateService:
             return {"success": False, "status": "terminal_not_authenticated"}
         device_id = str(metadata["device_id"])
         managed = self._registry.desktop_state(device_id)
-        if managed is not None and endpoint != managed["endpoint"]:
+        if managed is None or endpoint != managed["endpoint"]:
             return {"success": False, "status": "endpoint_not_preconfigured"}
-        callback_credential = (
-            str(managed["callback_credential"])
-            if managed is not None
-            else str(uuid.uuid4())
-        )
+        callback_credential = str(managed["callback_credential"])
         self._registry.register_desktop(
             actor_role="management",
             device_id=device_id,
@@ -104,11 +100,7 @@ class DesktopRegistrationSyncClient:
         self, event: Mapping[str, object], *, callback_credential: str | None = None
     ) -> dict[str, object]:
         expected_credential = self._config.get("callback_credential")
-        if (
-            isinstance(expected_credential, str)
-            and expected_credential
-            and callback_credential != expected_credential
-        ):
+        if not isinstance(expected_credential, str) or not expected_credential or callback_credential != expected_credential:
             return {"success": False, "status": "callback_not_authenticated"}
         call_id, version = event.get("call_id"), event.get("version")
         if not isinstance(call_id, str) or not isinstance(version, int):
