@@ -48,6 +48,7 @@ class CentralServiceConfig:
     bark_endpoint: str | None = None
     bark_credential: str | None = None
     operator_sessions: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    operator_login_credentials: Mapping[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, object]) -> "CentralServiceConfig":
@@ -141,6 +142,15 @@ class CentralServiceConfig:
             operator_sessions[token] = {
                 "operator_id": operator_id, "browser_session_id": session_id, "csrf_token": csrf_token,
             }
+        raw_login_credentials = mapping.get("operator_login_credentials", {})
+        if not isinstance(raw_login_credentials, Mapping):
+            raise ValueError("operator_login_credentials must be a mapping")
+        operator_login_credentials: dict[str, str] = {}
+        for credential, session_cookie in raw_login_credentials.items():
+            if (not isinstance(credential, str) or not credential
+                    or not isinstance(session_cookie, str) or session_cookie not in operator_sessions):
+                raise ValueError("operator_login_credentials must map credentials to configured sessions")
+            operator_login_credentials[credential] = session_cookie
 
         return cls(
             listen_host=listen_host,
@@ -156,6 +166,7 @@ class CentralServiceConfig:
             bark_endpoint=bark_endpoint.strip() if isinstance(bark_endpoint, str) else None,
             bark_credential=bark_credential,
             operator_sessions=operator_sessions,
+            operator_login_credentials=operator_login_credentials,
         )
 
 
@@ -394,6 +405,14 @@ def create_lifecycle_app(
     """
     if operator_session_verifier is None:
         raise ValueError("operator_session_verifier is required")
+    configured_browser_authenticator = browser_cookie_authenticator
+    if config.operator_login_credentials:
+        # The configured runtime owns the login-to-cookie bridge.  Tests may
+        # still inject a cookie-only seam, but cannot accidentally bypass the
+        # production entry flow when credentials are configured.
+        configured_browser_authenticator = _ConfiguredOperatorSessionVerifier(
+            config.operator_sessions, config.operator_login_credentials
+        )
     config.data_dir.mkdir(parents=True, exist_ok=True)
     database_path = config.data_dir / "lifecycle.sqlite3"
     registry = TerminalRegistry(database_path=database_path, clock=clock)
@@ -447,7 +466,7 @@ def create_lifecycle_app(
         notification_scheduler_sleep=notification_scheduler_sleep,
         desktop_registration_service=registration,
         operator_session_verifier=operator_session_verifier,
-        browser_cookie_authenticator=browser_cookie_authenticator,
+        browser_cookie_authenticator=configured_browser_authenticator,
         mobile_html_renderer=mobile_html_renderer,
         trusted_browser_origin=config.web_base_url,
     )
@@ -458,8 +477,10 @@ def create_lifecycle_app(
 class _ConfiguredOperatorSessionVerifier:
     """Minimal configuration-backed browser-session boundary for the runtime."""
 
-    def __init__(self, sessions: Mapping[str, Mapping[str, str]]) -> None:
+    def __init__(self, sessions: Mapping[str, Mapping[str, str]],
+                 login_credentials: Mapping[str, str] | None = None) -> None:
         self._sessions = {token: dict(session) for token, session in sessions.items()}
+        self._login_credentials = dict(login_credentials or {})
 
     def verify(self, token: str | None) -> dict[str, str] | None:
         if not isinstance(token, str):
@@ -472,6 +493,15 @@ class _ConfiguredOperatorSessionVerifier:
     def authenticate_cookie(self, token: str | None) -> dict[str, str] | None:
         """Authenticate the configured browser cookie without exposing its value."""
         return self.verify(token)
+
+    def authenticate_login(self, credential: str | None) -> str | None:
+        """Return the configured opaque browser-session cookie after login."""
+        if not isinstance(credential, str):
+            return None
+        for expected, session_cookie in self._login_credentials.items():
+            if hmac.compare_digest(credential, expected):
+                return session_cookie
+        return None
 
 
 def _runtime_dependencies(
@@ -506,7 +536,9 @@ def _runtime_dependencies(
             response = await client.post(endpoint, json=body, headers={"x-central-callback": credential})
         return {"accepted": 200 <= response.status_code < 300}
 
-    verifier = _ConfiguredOperatorSessionVerifier(config.operator_sessions)
+    verifier = _ConfiguredOperatorSessionVerifier(
+        config.operator_sessions, config.operator_login_credentials
+    )
     return bark_dispatch, desktop_dispatch, verifier
 
 
