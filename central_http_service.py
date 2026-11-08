@@ -14,12 +14,15 @@ import json
 import sys
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 from central_call_coordinator import CallCoordinator
+from central_desktop_registration_sync import DesktopRegistrationStateService
+from central_mcp_waiting_lifecycle import Application, create_app as create_lifecycle_asgi_app
+from central_notification_router import NotificationRouter, TerminalRegistry
 
 
 Clock = Callable[[], float]
@@ -38,6 +41,9 @@ class CentralServiceConfig:
     agent_credentials: Mapping[str, str]
     tls_cert_file: str
     tls_key_file: str
+    route_mode: str = "iphone"
+    desktop_credentials: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    desktop_endpoints: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, object]) -> "CentralServiceConfig":
@@ -71,14 +77,54 @@ class CentralServiceConfig:
                 raise ValueError("agent_credentials must map non-empty caller IDs to credentials")
             credentials[caller_id] = credential
 
+        tls_cert_file = required_text("tls_cert_file")
+        tls_key_file = required_text("tls_key_file")
+
+        # The legacy ingress remains constructible for its isolated contract;
+        # lifecycle composition validates routes only when that factory is
+        # explicitly selected.  A configured desktop route still requires
+        # its complete management-owned terminal records.
+        route_mode = mapping.get("route_mode", "iphone")
+        if route_mode not in {"desktop", "iphone", "both"}:
+            raise ValueError("route_mode must be desktop, iphone, or both")
+
+        raw_desktop_credentials = mapping.get("desktop_credentials")
+        raw_desktop_endpoints = mapping.get("desktop_endpoints")
+        desktop_credentials: dict[str, dict[str, str]] = {}
+        desktop_endpoints: dict[str, dict[str, str]] = {}
+        if route_mode in {"desktop", "both"}:
+            if not isinstance(raw_desktop_credentials, Mapping) or not raw_desktop_credentials:
+                raise ValueError("desktop_credentials are required for a desktop route")
+            if not isinstance(raw_desktop_endpoints, Mapping) or not raw_desktop_endpoints:
+                raise ValueError("desktop_endpoints are required for a desktop route")
+            for credential, metadata in raw_desktop_credentials.items():
+                if not isinstance(credential, str) or not credential or not isinstance(metadata, Mapping):
+                    raise ValueError("desktop_credentials must contain terminal metadata")
+                device_id, platform = metadata.get("device_id"), metadata.get("terminal_platform")
+                if not isinstance(device_id, str) or not device_id or not isinstance(platform, str) or not platform:
+                    raise ValueError("desktop credential metadata is invalid")
+                desktop_credentials[credential] = {"device_id": device_id, "terminal_platform": platform}
+            for device_id, endpoint in raw_desktop_endpoints.items():
+                if not isinstance(device_id, str) or not device_id or not isinstance(endpoint, Mapping):
+                    raise ValueError("desktop_endpoints must contain endpoint metadata")
+                address, callback = endpoint.get("endpoint"), endpoint.get("callback_credential")
+                if not isinstance(address, str) or not address or not isinstance(callback, str) or not callback:
+                    raise ValueError("desktop endpoint metadata is invalid")
+                desktop_endpoints[device_id] = {"endpoint": address, "callback_credential": callback}
+            if {metadata["device_id"] for metadata in desktop_credentials.values()} != set(desktop_endpoints):
+                raise ValueError("desktop credential and endpoint devices must match")
+
         return cls(
             listen_host=listen_host,
             listen_port=port,
             web_base_url=web_base_url,
             data_dir=data_dir,
             agent_credentials=credentials,
-            tls_cert_file=required_text("tls_cert_file"),
-            tls_key_file=required_text("tls_key_file"),
+            tls_cert_file=tls_cert_file,
+            tls_key_file=tls_key_file,
+            route_mode=route_mode,
+            desktop_credentials=desktop_credentials,
+            desktop_endpoints=desktop_endpoints,
         )
 
 
@@ -294,6 +340,83 @@ def create_app(
     """Build the testable HTTP-only central ingress application."""
 
     return CentralHttpApplication(config, clock=clock, notify=notify, wait=wait)
+
+
+def create_lifecycle_app(
+    config: CentralServiceConfig,
+    *,
+    clock: Clock,
+    wait: Waiter,
+    bark_dispatch: Callable[[dict[str, object]], object],
+    desktop_dispatch: Callable[[dict[str, object]], object],
+    operator_session_verifier: Any,
+    scheduler_sleep: Waiter = asyncio.sleep,
+    notification_scheduler_sleep: Waiter = asyncio.sleep,
+) -> Application:
+    """Compose the one durable lifecycle authority used by the HTTP service.
+
+    Transport callables and browser authentication are injected boundaries so
+    production configuration never turns a notification attempt into a second
+    call-state authority.
+    """
+    if operator_session_verifier is None:
+        raise ValueError("operator_session_verifier is required")
+    config.data_dir.mkdir(parents=True, exist_ok=True)
+    database_path = config.data_dir / "lifecycle.sqlite3"
+    registry = TerminalRegistry(database_path=database_path, clock=clock)
+    for device_id, endpoint in config.desktop_endpoints.items():
+        registry.register_desktop(
+            actor_role="management",
+            device_id=device_id,
+            endpoint=endpoint["endpoint"],
+            callback_credential=endpoint["callback_credential"],
+            gui_ready=False,
+        )
+
+    lifecycle_holder: dict[str, Application] = {}
+
+    def lifecycle_call_state(call_id: str) -> str | None:
+        """Read state from the lifecycle's durable authority for routing."""
+        application = lifecycle_holder.get("app")
+        if application is None:
+            return None
+        with application.lifecycle._connection() as conn:
+            row = conn.execute(
+                "SELECT call_state FROM lifecycle_calls WHERE call_id=?", (call_id,)
+            ).fetchone()
+        return str(row["call_state"]) if row is not None else None
+
+    router = NotificationRouter(
+        database_path=database_path,
+        clock=clock,
+        registry=registry,
+        desktop_dispatch=desktop_dispatch,
+        bark_dispatch=bark_dispatch,
+        route_mode=config.route_mode,
+        call_state=lifecycle_call_state,
+        web_base_url=config.web_base_url,
+    )
+    registration = DesktopRegistrationStateService(
+        registry=registry,
+        clock=clock,
+        registered_credentials=config.desktop_credentials,
+        device_state=lambda device_id: lifecycle_holder["app"].lifecycle.terminal_states(device_id),
+    )
+    app = create_lifecycle_asgi_app(
+        database_path=database_path,
+        credentials=config.agent_credentials,
+        clock=clock,
+        notify=router.enqueue,
+        wait=wait,
+        route_admission=router.validate_route,
+        notification_router=router,
+        scheduler_sleep=scheduler_sleep,
+        notification_scheduler_sleep=notification_scheduler_sleep,
+        desktop_registration_service=registration,
+        operator_session_verifier=operator_session_verifier,
+    )
+    lifecycle_holder["app"] = app
+    return app
 
 
 def main(argv: list[str] | None = None) -> None:
