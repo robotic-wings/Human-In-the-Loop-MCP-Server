@@ -131,10 +131,16 @@ class CentralServiceConfig:
         for token, session in raw_sessions.items():
             if not isinstance(token, str) or not token or not isinstance(session, Mapping):
                 raise ValueError("operator_sessions must contain session metadata")
-            operator_id, session_id = session.get("operator_id"), session.get("browser_session_id")
-            if not isinstance(operator_id, str) or not operator_id or not isinstance(session_id, str) or not session_id:
+            operator_id, session_id, csrf_token = (
+                session.get("operator_id"), session.get("browser_session_id"), session.get("csrf_token"),
+            )
+            if (not isinstance(operator_id, str) or not operator_id
+                    or not isinstance(session_id, str) or not session_id
+                    or not isinstance(csrf_token, str) or not csrf_token):
                 raise ValueError("operator session metadata is invalid")
-            operator_sessions[token] = {"operator_id": operator_id, "browser_session_id": session_id}
+            operator_sessions[token] = {
+                "operator_id": operator_id, "browser_session_id": session_id, "csrf_token": csrf_token,
+            }
 
         return cls(
             listen_host=listen_host,
@@ -375,6 +381,8 @@ def create_lifecycle_app(
     bark_dispatch: Callable[[dict[str, object]], object],
     desktop_dispatch: Callable[[dict[str, object]], object],
     operator_session_verifier: Any,
+    browser_cookie_authenticator: Any | None = None,
+    mobile_html_renderer: Any | None = None,
     scheduler_sleep: Waiter = asyncio.sleep,
     notification_scheduler_sleep: Waiter = asyncio.sleep,
 ) -> Application:
@@ -439,6 +447,9 @@ def create_lifecycle_app(
         notification_scheduler_sleep=notification_scheduler_sleep,
         desktop_registration_service=registration,
         operator_session_verifier=operator_session_verifier,
+        browser_cookie_authenticator=browser_cookie_authenticator,
+        mobile_html_renderer=mobile_html_renderer,
+        trusted_browser_origin=config.web_base_url,
     )
     lifecycle_holder["app"] = app
     return app
@@ -457,6 +468,10 @@ class _ConfiguredOperatorSessionVerifier:
             if hmac.compare_digest(token, expected):
                 return dict(session)
         return None
+
+    def authenticate_cookie(self, token: str | None) -> dict[str, str] | None:
+        """Authenticate the configured browser cookie without exposing its value."""
+        return self.verify(token)
 
 
 def _runtime_dependencies(
@@ -491,7 +506,8 @@ def _runtime_dependencies(
             response = await client.post(endpoint, json=body, headers={"x-central-callback": credential})
         return {"accepted": 200 <= response.status_code < 300}
 
-    return bark_dispatch, desktop_dispatch, _ConfiguredOperatorSessionVerifier(config.operator_sessions)
+    verifier = _ConfiguredOperatorSessionVerifier(config.operator_sessions)
+    return bark_dispatch, desktop_dispatch, verifier
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -533,6 +549,8 @@ def main(argv: list[str] | None = None) -> None:
         bark_dispatch=bark_dispatch,
         desktop_dispatch=desktop_dispatch,
         operator_session_verifier=operator_session_verifier,
+        browser_cookie_authenticator=operator_session_verifier,
+        mobile_html_renderer=lambda _view, _csrf_token: None,
     )
     uvicorn.run(app, host=config.listen_host, port=config.listen_port, ssl_certfile=config.tls_cert_file, ssl_keyfile=config.tls_key_file)
 
