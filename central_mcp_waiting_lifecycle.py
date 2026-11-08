@@ -53,6 +53,11 @@ class WaitingLifecycle:
                 call_id TEXT NOT NULL, event_seq INTEGER NOT NULL, body_json TEXT NOT NULL,
                 PRIMARY KEY (call_id, event_seq)
               );
+              CREATE TABLE IF NOT EXISTS lifecycle_submissions (
+                call_id TEXT NOT NULL, submission_id TEXT NOT NULL, actor TEXT NOT NULL,
+                payload_json TEXT NOT NULL, outcome_json TEXT NOT NULL,
+                PRIMARY KEY (call_id, submission_id)
+              );
             """)
             self._migrate_schema(conn)
             self._settle_due(conn)
@@ -455,6 +460,56 @@ class WaitingLifecycle:
                 conn.rollback()
                 raise
 
+    def submit(self, *, call_id: str, device_id: str, session_id: str,
+               submission_id: str, result: Mapping[str, object]) -> dict[str, object]:
+        """Persist one final answer from the exact session which owns a call."""
+        if not submission_id or len(submission_id) > 128:
+            return self._error("invalid_request")
+        actor = f"owner:{session_id}"
+        encoded = self._dump(dict(result))
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._settle_due(conn)
+                call = conn.execute("SELECT * FROM lifecycle_calls WHERE call_id=?", (call_id,)).fetchone()
+                if call is None or call["owner_device_id"] != device_id or call["owner_session_id"] != session_id:
+                    return self._error("session_not_found")
+                previous = conn.execute(
+                    "SELECT actor, payload_json, outcome_json FROM lifecycle_submissions WHERE call_id=? AND submission_id=?",
+                    (call_id, submission_id),
+                ).fetchone()
+                if previous is not None:
+                    if previous["actor"] != actor or previous["payload_json"] != encoded:
+                        return self._error("request_conflict")
+                    return self._load(previous["outcome_json"])
+                if call["call_state"] not in {"accepted", "in_progress"}:
+                    event = conn.execute(
+                        "SELECT body_json FROM lifecycle_events WHERE call_id=? ORDER BY event_seq DESC LIMIT 1",
+                        (call_id,),
+                    ).fetchone()
+                    return self._load(event["body_json"]) if event is not None else self._error("expired")
+                conn.execute(
+                    "UPDATE lifecycle_calls SET call_state='answered', reason=NULL, version=version+1 WHERE call_id=?",
+                    (call_id,),
+                )
+                seq = int(conn.execute(
+                    "SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call_id,)
+                ).fetchone()["n"])
+                outcome: dict[str, object] = {
+                    "success": True, "status": "answered", "call_state": "answered", "human_action": True,
+                    "needs_continuation": False, "interaction_id": call["interaction_id"], "call_id": call_id,
+                    "event_seq": seq, "handled_on": call["handled_on"],
+                    "terminal_platform": call["terminal_platform"], "result": dict(result),
+                }
+                conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call_id, seq, self._dump(outcome)))
+                conn.execute("INSERT INTO lifecycle_submissions VALUES (?, ?, ?, ?, ?)",
+                             (call_id, submission_id, actor, encoded, self._dump(outcome)))
+                conn.commit()
+                return outcome
+            except BaseException:
+                conn.rollback()
+                raise
+
     def terminal_heartbeat(self, *, call_id: str, session_id: str) -> dict[str, object]:
         """Refresh liveness only for the exact session which accepted the call."""
         with self._connection() as conn:
@@ -714,13 +769,13 @@ class Application:
                     response = {**response, "states": [merged[key] for key in sorted(merged)]}
         else:
             await self._send(send, 404, self._error("not_found")); return
-        await self._send(send, 200 if response.get("success") else 404, response)
+        await self._send(send, self._action_status(response), response)
 
     async def _terminal_action_api(self, method: object, path: object, headers: object, receive: Any, send: Any) -> None:
         if method != "POST" or not isinstance(path, str):
             await self._send(send, 404, self._error("not_found")); return
         parts = path.split("/")
-        if len(parts) != 5 or parts[:3] != ["", "api", "calls"] or parts[4] not in {"accept", "decline", "heartbeat"}:
+        if len(parts) != 5 or parts[:3] != ["", "api", "calls"] or parts[4] not in {"accept", "decline", "heartbeat", "submissions"}:
             await self._send(send, 404, self._error("not_found")); return
         session = self._terminal_session(headers)
         context = self._terminal_context(session) if session is not None else None
@@ -730,6 +785,16 @@ class Application:
         if parts[4] == "heartbeat":
             await self._body(receive)
             response = self.lifecycle.terminal_heartbeat(call_id=parts[3], session_id=session)
+        elif parts[4] == "submissions":
+            body = await self._body(receive)
+            submission_id = body.get("submission_id") if body is not None else None
+            result = body.get("result") if body is not None else None
+            if not isinstance(submission_id, str) or not isinstance(result, Mapping):
+                await self._send(send, 400, self._error("invalid_request")); return
+            response = self.lifecycle.submit(
+                call_id=parts[3], device_id=device_id, session_id=session,
+                submission_id=submission_id, result=result,
+            )
         else:
             body = await self._body(receive)
             operation_id = body.get("operation_id") if body is not None else None
@@ -739,7 +804,7 @@ class Application:
                 call_id=parts[3], device_id=device_id, session_id=session, terminal_platform=platform,
                 operation_id=operation_id, action=parts[4],
             )
-        await self._send(send, 200 if response.get("success") else 404, response)
+        await self._send(send, self._action_status(response), response)
 
     async def _browser_call_api(self, method: object, path: object, headers: object, receive: Any, send: Any) -> None:
         if not isinstance(path, str):
@@ -754,10 +819,20 @@ class Application:
         call_id = parts[2]
         if len(parts) == 3 and method == "GET":
             response = self._browser_call_view(call_id, operator_id)
-            await self._send(send, 200 if response.get("success") else 404, response); return
-        if len(parts) != 4 or method != "POST" or parts[3] not in {"accept", "decline"}:
+            await self._send(send, self._action_status(response), response); return
+        if len(parts) != 4 or method != "POST" or parts[3] not in {"accept", "decline", "submissions"}:
             await self._send(send, 404, self._error("not_found")); return
         body = await self._body(receive)
+        if parts[3] == "submissions":
+            submission_id = body.get("submission_id") if body is not None else None
+            result = body.get("result") if body is not None else None
+            if not isinstance(submission_id, str) or not isinstance(result, Mapping):
+                await self._send(send, 400, self._error("invalid_request")); return
+            response = self.lifecycle.submit(
+                call_id=call_id, device_id="iphone_web", session_id=browser_session_id,
+                submission_id=submission_id, result=result,
+            ) if operator_id == self.lifecycle._operator_id else self._terminal_error("session_not_found")
+            await self._send(send, self._action_status(response), response); return
         operation_id = body.get("operation_id") if body is not None else None
         if not isinstance(operation_id, str) or not operation_id:
             await self._send(send, 400, self._error("invalid_request")); return
@@ -765,7 +840,7 @@ class Application:
             call_id=call_id, operator_id=operator_id, session_id=browser_session_id,
             operation_id=operation_id, action=parts[3],
         )
-        await self._send(send, 200 if response.get("success") else 404, response)
+        await self._send(send, self._action_status(response), response)
 
     def _browser_call_view(self, call_id: str, operator_id: str) -> dict[str, object]:
         if operator_id != self.lifecycle._operator_id:
@@ -943,6 +1018,12 @@ class Application:
     @staticmethod
     def _error(status: str) -> dict[str, object]:
         return {"success": False, "status": status, "needs_continuation": False}
+
+    @staticmethod
+    def _action_status(response: Mapping[str, object]) -> int:
+        if response.get("success"):
+            return 200
+        return 400 if response.get("status") == "request_conflict" else 404
 
     @staticmethod
     def _terminal_error(status: str) -> dict[str, object]:
