@@ -118,9 +118,16 @@ class NotificationRouter:
     def validate_route(self) -> dict[str, object]:
         if self._route_mode not in self._CHANNELS:
             return {"success": False, "status": "no_enabled_channel", "needs_continuation": False}
+        if "bark" in self._CHANNELS[self._route_mode] and not self._web_base_url:
+            return {"success": False, "status": "missing_web_base_url", "needs_continuation": False}
         return {"success": True, "status": "ready", "needs_continuation": False}
 
     def enqueue(self, event: dict[str, object]) -> None:
+        # Validation is repeated at the durable write boundary: callers can
+        # invoke enqueue directly, and a route with Bark enabled must never
+        # leave behind a partial notification lacking the central call link.
+        if not self.validate_route()["success"]:
+            return
         now = self._clock()
         with self._store.connection() as conn:
             for channel in self._CHANNELS.get(self._route_mode, ()):
