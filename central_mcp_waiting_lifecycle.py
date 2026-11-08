@@ -7,12 +7,13 @@ boundaries.
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 import sqlite3
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -176,6 +177,22 @@ class WaitingLifecycle:
                 conn.rollback()
                 raise
 
+    def settle_deadlines(self) -> None:
+        """Run one durable, server-owned expiry pass.
+
+        Request paths also call ``_settle_due`` before acting, but the ASGI
+        application owns this public tick so an idle ringing call is settled
+        without requiring another caller, terminal action, or restart.
+        """
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._settle_due(conn)
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+
     def accept(self, *, call_id: str, device_id: str, handled_on: str, terminal_platform: str) -> dict[str, object]:
         del device_id
         return self._human_action(call_id, "opened", "accepted", None, {"handled_on": handled_on, "terminal_platform": terminal_platform})
@@ -258,10 +275,16 @@ class WaitingLifecycle:
 
 
 class Application:
-    def __init__(self, lifecycle: WaitingLifecycle, credentials: Mapping[str, str], wait: Waiter) -> None:
+    def __init__(self, lifecycle: WaitingLifecycle, credentials: Mapping[str, str], wait: Waiter,
+                 deadline_tick_seconds: float, scheduler_sleep: Waiter) -> None:
         self.lifecycle, self._credentials, self._wait = lifecycle, dict(credentials), wait
+        self._deadline_tick_seconds, self._scheduler_sleep = deadline_tick_seconds, scheduler_sleep
+        self._deadline_task: asyncio.Task[None] | None = None
 
     async def __call__(self, scope: Mapping[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") == "lifespan":
+            await self._lifespan(receive, send)
+            return
         if scope.get("type") != "http" or scope.get("method") != "POST" or scope.get("path") != "/mcp":
             await self._send(send, 404, self._error("not_found")); return
         caller = self._caller(scope.get("headers", []))
@@ -282,6 +305,26 @@ class Application:
         await send({"type": "http.response.body", "body": json.dumps(response, separators=(",", ":")).encode(), "more_body": False})
         if should_wait:
             self.lifecycle.response_delivered(caller, response)
+
+    async def _lifespan(self, receive: Any, send: Any) -> None:
+        while True:
+            event = await receive()
+            if event.get("type") == "lifespan.startup":
+                self._deadline_task = asyncio.create_task(self._run_deadline_scheduler())
+                await send({"type": "lifespan.startup.complete"})
+            elif event.get("type") == "lifespan.shutdown":
+                if self._deadline_task is not None:
+                    self._deadline_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await self._deadline_task
+                    self._deadline_task = None
+                await send({"type": "lifespan.shutdown.complete"})
+                return
+
+    async def _run_deadline_scheduler(self) -> None:
+        while True:
+            await self._scheduler_sleep(self._deadline_tick_seconds)
+            self.lifecycle.settle_deadlines()
 
     def _dispatch(self, caller: str, body: Mapping[str, object]) -> tuple[dict[str, object], bool]:
         request_id = body.get("request_id")
@@ -329,9 +372,14 @@ class Application:
 
 
 def create_app(*, database_path: str | Path, credentials: Mapping[str, str], clock: Clock, notify: Notifier,
-               wait: Waiter, ring_timeout_seconds: float = 60, agent_reconnect_seconds: float = 30) -> Application:
+               wait: Waiter, ring_timeout_seconds: float = 60, agent_reconnect_seconds: float = 30,
+               deadline_tick_seconds: float = 1, scheduler_sleep: Waiter = asyncio.sleep) -> Application:
+    if deadline_tick_seconds <= 0:
+        raise ValueError("deadline_tick_seconds must be positive")
     return Application(
         WaitingLifecycle(database_path, clock, notify, ring_timeout_seconds, agent_reconnect_seconds),
         credentials,
         wait,
+        deadline_tick_seconds,
+        scheduler_sleep,
     )
