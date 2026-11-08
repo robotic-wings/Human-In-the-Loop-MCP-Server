@@ -33,7 +33,7 @@ def _registry(tmp_path: Path, clock: FakeClock):
 
 
 def _router(tmp_path: Path, clock: FakeClock, *, desktop, bark, route_mode="both", call_state=None,
-            configured_link: bool = True):
+            configured_link: bool = True, web_base_url: str | None = None):
     """Proposed router boundary; web_base_url is central configuration, not request data."""
     arguments = dict(
         database_path=tmp_path / "outbox.sqlite3",
@@ -44,7 +44,9 @@ def _router(tmp_path: Path, clock: FakeClock, *, desktop, bark, route_mode="both
         route_mode=route_mode,
         call_state=call_state,
     )
-    if configured_link:
+    if web_base_url is not None:
+        arguments["web_base_url"] = web_base_url
+    elif configured_link:
         arguments["web_base_url"] = "https://10.0.0.1:8443/central/"
     return _module().NotificationRouter(**arguments)
 
@@ -208,3 +210,33 @@ def test_iphone_route_without_configured_web_base_url_fails_before_outbox_or_dis
     asyncio.run(router.dispatch_pending())
     assert router.outbox_records("missing-link") == []
     assert attempts == []
+
+
+def test_iphone_route_rejects_malformed_or_non_https_web_base_before_outbox_or_dispatch(tmp_path: Path) -> None:
+    """Bark links must be central HTTPS URLs, not arbitrary request-derived strings."""
+    for invalid_base in ("http://10.0.0.1:8443/central", "not a URL"):
+        clock = FakeClock()
+        attempts: list[dict[str, object]] = []
+
+        async def bark(payload: dict[str, object]) -> dict[str, object]:
+            attempts.append(payload)
+            return {"http_status": 200, "business_success": True}
+
+        router = _router(
+            tmp_path / invalid_base.replace(":", "_").replace("/", "_"),
+            clock,
+            desktop=_desktop_ok,
+            bark=bark,
+            route_mode="iphone",
+            configured_link=False,
+            web_base_url=invalid_base,
+        )
+        assert router.validate_route() == {
+            "success": False,
+            "status": "invalid_web_base_url",
+            "needs_continuation": False,
+        }
+        router.enqueue({"call_id": f"invalid-{len(attempts)}", "ring_deadline": clock() + 60})
+        asyncio.run(router.dispatch_pending())
+        assert router.outbox_records(f"invalid-{len(attempts)}") == []
+        assert attempts == []
