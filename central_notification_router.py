@@ -117,9 +117,13 @@ class NotificationRouter:
         candidate = value.strip()
         try:
             parsed = urlsplit(candidate)
+            hostname = parsed.hostname
+            # Accessing ``port`` validates its numeric range and syntax.
+            parsed.port
         except ValueError:
             return None, True
-        if parsed.scheme != "https" or not parsed.netloc or parsed.query or parsed.fragment:
+        if (parsed.scheme != "https" or not parsed.netloc or not hostname
+                or parsed.query or parsed.fragment):
             return None, True
         return candidate.rstrip("/"), False
 
