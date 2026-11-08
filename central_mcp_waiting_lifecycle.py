@@ -21,6 +21,7 @@ from typing import Any
 Clock = Callable[[], float]
 Waiter = Callable[[float], Awaitable[None]]
 Notifier = Callable[[dict[str, object]], None]
+RouteAdmission = Callable[[], Mapping[str, object]]
 
 
 class WaitingLifecycle:
@@ -276,9 +277,11 @@ class WaitingLifecycle:
 
 class Application:
     def __init__(self, lifecycle: WaitingLifecycle, credentials: Mapping[str, str], wait: Waiter,
-                 deadline_tick_seconds: float, scheduler_sleep: Waiter) -> None:
+                 deadline_tick_seconds: float, scheduler_sleep: Waiter,
+                 route_admission: RouteAdmission) -> None:
         self.lifecycle, self._credentials, self._wait = lifecycle, dict(credentials), wait
         self._deadline_tick_seconds, self._scheduler_sleep = deadline_tick_seconds, scheduler_sleep
+        self._route_admission = route_admission
         self._deadline_task: asyncio.Task[None] | None = None
 
     async def __call__(self, scope: Mapping[str, Any], receive: Any, send: Any) -> None:
@@ -341,7 +344,21 @@ class Application:
         if not isinstance(payload, Mapping):
             return self._error("invalid_request"), False
         replay = self.lifecycle.has_request(caller, request_id)
+        if not replay and not self._route_is_enabled():
+            # Route configuration is a server-side admission check.  In
+            # particular, it must not consume a request id, reserve the busy
+            # slot, or disclose an active call when no human channel is
+            # enabled for this new call.
+            return self._error("no_enabled_channel"), False
         return self.lifecycle.create(caller, request_id, payload), not replay
+
+    def _route_is_enabled(self) -> bool:
+        """Accept only the central configuration's affirmative route result."""
+        try:
+            result = self._route_admission()
+        except Exception:
+            return False
+        return result.get("success") is True and result.get("status") == "ready"
 
     def _caller(self, headers: object) -> str | None:
         if not isinstance(headers, list): return None
@@ -373,7 +390,8 @@ class Application:
 
 def create_app(*, database_path: str | Path, credentials: Mapping[str, str], clock: Clock, notify: Notifier,
                wait: Waiter, ring_timeout_seconds: float = 60, agent_reconnect_seconds: float = 30,
-               deadline_tick_seconds: float = 1, scheduler_sleep: Waiter = asyncio.sleep) -> Application:
+               deadline_tick_seconds: float = 1, scheduler_sleep: Waiter = asyncio.sleep,
+               route_admission: RouteAdmission | None = None) -> Application:
     if deadline_tick_seconds <= 0:
         raise ValueError("deadline_tick_seconds must be positive")
     return Application(
@@ -382,4 +400,5 @@ def create_app(*, database_path: str | Path, credentials: Mapping[str, str], clo
         wait,
         deadline_tick_seconds,
         scheduler_sleep,
+        route_admission if route_admission is not None else (lambda: {"success": True, "status": "ready"}),
     )
