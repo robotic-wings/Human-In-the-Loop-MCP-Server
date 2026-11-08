@@ -90,6 +90,24 @@ def _client(service: Any, presenter: FakePresenter, ring: FakeRing):
     )
 
 
+def _managed_service(
+    tmp_path: Path,
+    clock: FakeClock,
+    states: dict[str, list[dict[str, object]]],
+):
+    """Create a device whose callback target was set by management, not it."""
+
+    service, registry, audit = _service(tmp_path, clock, states)
+    registry.register_desktop(
+        actor_role="management",
+        device_id="desktop-61",
+        endpoint="https://10.0.0.61:9100/terminal/events",
+        callback_credential="central-callback-secret",
+        gui_ready=False,
+    )
+    return service, registry, audit
+
+
 def _ringing(call_id: str, version: int) -> dict[str, object]:
     return {"call_id": call_id, "call_state": "ringing", "version": version}
 
@@ -224,3 +242,63 @@ def test_stale_or_duplicate_versions_never_reopen_or_rering_after_authoritative_
     assert ring.started == ["call-1"]
     assert presenter.closed == ["call-1"]
     assert ring.stopped == ["call-1"]
+
+
+def test_device_credential_cannot_replace_management_preconfigured_callback_endpoint(tmp_path: Path) -> None:
+    clock, states = FakeClock(), {"desktop-61": []}
+    service, registry, _ = _managed_service(tmp_path, clock, states)
+    managed = registry.desktop_state("desktop-61")
+
+    attacker = service.register(
+        credential="desktop-secret",
+        endpoint="https://attacker.invalid/terminal/events",
+        gui_ready=True,
+    )
+
+    assert attacker == {"success": False, "status": "endpoint_not_preconfigured"}
+    assert registry.desktop_state("desktop-61") == managed
+
+    registered = service.register(
+        credential="desktop-secret",
+        endpoint="https://10.0.0.61:9100/terminal/events",
+        gui_ready=True,
+    )
+    assert registered["success"] is True
+    state = registry.desktop_state("desktop-61")
+    assert state is not None
+    assert state["endpoint"] == "https://10.0.0.61:9100/terminal/events"
+    assert state["callback_credential"] == "central-callback-secret"
+
+
+def test_callback_requires_separate_central_credential_before_presentation_or_ringing(tmp_path: Path) -> None:
+    clock = FakeClock()
+    states = {"desktop-61": []}
+    service, _, _ = _managed_service(tmp_path, clock, states)
+    presenter, ring = FakePresenter(), FakeRing()
+    client = _adapter().DesktopRegistrationSyncClient(
+        config={
+            "terminal_credential": "desktop-secret",
+            "listener_endpoint": "https://10.0.0.61:9100/terminal/events",
+            "callback_credential": "central-callback-secret",
+        },
+        central=service,
+        presenter=presenter,
+        ring=ring,
+    )
+    event = _ringing("forged", 1)
+
+    assert client.receive_callback(event) == {"success": False, "status": "callback_not_authenticated"}
+    assert client.receive_callback(event, callback_credential="desktop-secret") == {
+        "success": False,
+        "status": "callback_not_authenticated",
+    }
+    assert presenter.shown == []
+    assert ring.started == []
+
+    assert client.receive_callback(event, callback_credential="central-callback-secret") == {
+        "success": True,
+        "status": "presented",
+        "call_id": "forged",
+    }
+    assert presenter.shown == ["forged"]
+    assert ring.started == ["forged"]
