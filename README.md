@@ -50,7 +50,28 @@ For a desktop or dual route, provide management-owned `desktop_credentials` and 
 
 ## Desktop terminal
 
-`central_desktop_terminal.py` contains the independent terminal client boundary. `central_terminal_http_service.py` contains its authenticated terminal HTTP boundary. They do not start, embed, proxy, or expose an MCP server. The terminal uses configured central and callback credentials, registers/synchronizes with the central service, and submits human actions to it.
+`central_desktop_terminal.py` is an independently runnable terminal program. It starts only its authenticated `/terminal/events` callback listener (never an MCP endpoint), registers/synchronizes with the central service, reports GUI availability, and presents accept/decline plus a response dialog. Install it with the same package, then run:
+
+```bash
+hitl-desktop-terminal --config /path/to/desktop-terminal.json
+```
+
+The terminal configuration is separate from central configuration and uses only placeholders here:
+
+```json
+{
+  "central_url": "https://10.10.0.10:8443",
+  "terminal_credential": "credential-from-secret-store",
+  "callback_credential": "different-central-to-terminal-secret",
+  "listener_host": "10.10.0.61",
+  "listener_port": 9100,
+  "listener_scheme": "http",
+  "verify_tls": true,
+  "heartbeat_seconds": 10
+}
+```
+
+The configured listener address must match the management-preconfigured desktop endpoint. `callback_credential` authenticates central-to-terminal callbacks and is deliberately distinct from `terminal_credential`, which authenticates terminal-to-central registration and actions. On macOS, Windows, and Linux the Tk desktop runtime needs a graphical session; when unavailable, the process exits before registering as GUI-ready. `central_terminal_http_service.py` remains a testable central-side HTTP boundary; it is not embedded by the desktop program.
 
 The desktop packaging and platform UI adapter remain separate from the central-service process. The terminal must report `gui_unavailable` rather than claim it can accept calls when no graphical session is available.
 

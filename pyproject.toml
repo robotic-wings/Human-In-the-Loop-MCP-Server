@@ -66,6 +66,7 @@ test = [
 
 [project.scripts]
 hitl-central-service = "central_http_service:main"
+hitl-desktop-terminal = "central_desktop_terminal:main"
 
 [project.urls]
 Homepage = "https://github.com/GongRzhe/Human-In-the-Loop-MCP-Server"
