@@ -34,7 +34,7 @@ class DesktopTerminalClient:
         self._online = False
         self._gui_ready = False
         self._shown: dict[str, int] = {}
-        self._operations: dict[tuple[str, str], dict[str, object]] = {}
+        self._operations: dict[tuple[str, str, str], dict[str, object]] = {}
 
     def start(self) -> dict[str, object]:
         if self._callback_credential() is None:
@@ -112,7 +112,11 @@ class DesktopTerminalClient:
         return {"success": True, "status": "synchronized", "call_ids": call_ids}
 
     def _act(self, action: str, call_id: str, operation_id: str) -> dict[str, object]:
-        cache_key = (action, operation_id)
+        # Operation identifiers are idempotent only within their call.  A
+        # terminal can receive another ringing call after the first ends, and
+        # that new call must always reach central authority even when a client
+        # reuses a local operation identifier.
+        cache_key = (action, call_id, operation_id)
         if cache_key in self._operations:
             return dict(self._operations[cache_key])
         if not self._online or self._session_id is None or call_id not in self._shown:
