@@ -52,7 +52,6 @@ class DesktopRegistrationStateService:
             "success": True,
             "status": "registered",
             "session_id": session_id,
-            "callback_credential": callback_credential,
         }
 
     def heartbeat(self, *, session_id: str, gui_ready: bool) -> dict[str, object]:
