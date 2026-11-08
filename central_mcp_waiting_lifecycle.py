@@ -786,9 +786,18 @@ class Application:
         await self._send(send, self._action_status(response), response)
 
     async def _terminal_action_api(self, method: object, path: object, headers: object, receive: Any, send: Any) -> None:
-        if method != "POST" or not isinstance(path, str):
+        if not isinstance(path, str):
             await self._send(send, 404, self._error("not_found")); return
         parts = path.split("/")
+        if method == "GET" and len(parts) == 4 and parts[:3] == ["", "api", "calls"]:
+            session = self._terminal_session(headers)
+            context = self._terminal_context(session) if session is not None else None
+            if context is None:
+                await self._send(send, 401, self._terminal_error("session_not_found")); return
+            response = self._terminal_call_view(parts[3], context[0])
+            await self._send(send, self._action_status(response), response); return
+        if method != "POST":
+            await self._send(send, 404, self._error("not_found")); return
         if len(parts) != 5 or parts[:3] != ["", "api", "calls"] or parts[4] not in {"accept", "decline", "heartbeat", "submissions"}:
             await self._send(send, 404, self._error("not_found")); return
         session = self._terminal_session(headers)
@@ -819,6 +828,37 @@ class Application:
                 operation_id=operation_id, action=parts[4],
             )
         await self._send(send, self._action_status(response), response)
+
+    def _terminal_call_view(self, call_id: str, device_id: str) -> dict[str, object]:
+        """Return the immutable presentation data only to its invited terminal."""
+        with self.lifecycle._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self.lifecycle._settle_due(conn)
+                call = conn.execute("SELECT * FROM lifecycle_calls WHERE call_id=?", (call_id,)).fetchone()
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        if call is None:
+            return self._terminal_error("session_not_found")
+        state = str(call["call_state"])
+        invited = call["invited_desktop_id"] == device_id
+        owned = call["owner_device_id"] == device_id
+        if not ((state == "ringing" and invited) or owned):
+            return self._terminal_error("session_not_found")
+        try:
+            payload = self.lifecycle._load(call["payload_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        return {
+            "success": True, "call_id": call_id, "call_state": state,
+            "version": call["version"], "handled_on": call["handled_on"],
+            "terminal_platform": call["terminal_platform"],
+            "can_accept": state == "ringing" and invited,
+            "can_decline": state == "ringing" and invited,
+            "payload": payload if isinstance(payload, Mapping) else {},
+        }
 
     async def _browser_call_api(self, method: object, path: object, headers: object, receive: Any, send: Any) -> None:
         if not isinstance(path, str):

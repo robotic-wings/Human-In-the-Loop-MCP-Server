@@ -268,8 +268,7 @@ class CentralHttpDesktopClient:
     def read_call(self, call_id: str, session_id: str) -> dict[str, object]:
         if session_id != self._session_id:
             return {"success": False, "status": "session_not_found"}
-        self.synchronize()
-        return dict(self._states.get(call_id, {"success": False, "status": "session_not_found"}))
+        return self._request("GET", f"/api/calls/{call_id}")
 
     def act(self, action: str, call_id: str, session_id: str, operation_id: str) -> dict[str, object]:
         if session_id != self._session_id:
@@ -290,6 +289,7 @@ class TkPresentation:
 
     def __init__(self, root: Any, client_ref: Callable[[], DesktopTerminalClient]) -> None:
         self._root, self._client_ref, self._windows = root, client_ref, {}
+        self._calls: dict[str, dict[str, object]] = {}
 
     def show(self, state: dict[str, object]) -> None:
         call_id = state.get("call_id")
@@ -300,10 +300,13 @@ class TkPresentation:
         window.title("Human-in-the-Loop call")
         window.protocol("WM_DELETE_WINDOW", lambda: self._decline(call_id))
         payload = state.get("payload")
-        tk.Label(window, text=str(payload if payload is not None else "Human input requested"), wraplength=520).pack(padx=16, pady=12)
+        payload = dict(payload) if isinstance(payload, Mapping) else {}
+        prompt = payload.get("prompt") or payload.get("message") or payload.get("task_description") or "Human input requested"
+        tk.Label(window, text=str(prompt), wraplength=520, justify="left").pack(padx=16, pady=12)
         tk.Button(window, text="Accept", command=lambda: self._accept(call_id)).pack(side="left", padx=16, pady=12)
         tk.Button(window, text="Decline", command=lambda: self._decline(call_id)).pack(side="right", padx=16, pady=12)
         self._windows[call_id] = window
+        self._calls[call_id] = {**state, "payload": payload}
         window.bell()
 
     def close(self, call_id: str) -> None:
@@ -314,22 +317,106 @@ class TkPresentation:
     def _accept(self, call_id: str) -> None:
         result = self._client_ref().accept(call_id=call_id, operation_id=uuid.uuid4().hex)
         if result.get("success"):
-            self._answer(call_id)
+            self._answer(call_id, self._calls.get(call_id, {}))
 
     def _decline(self, call_id: str) -> None:
         self._client_ref().decline(call_id=call_id, operation_id=uuid.uuid4().hex)
+        self._calls.pop(call_id, None)
 
-    def _answer(self, call_id: str) -> None:
+    def _answer(self, call_id: str, state: Mapping[str, object]) -> None:
         import tkinter as tk
         dialog = tk.Toplevel(self._root)
         dialog.title("Respond to call")
-        box = tk.Text(dialog, width=70, height=12)
-        box.pack(padx=12, pady=12)
+        payload = state.get("payload")
+        payload = dict(payload) if isinstance(payload, Mapping) else {}
+        tool = str(payload.get("tool") or payload.get("interaction_type") or "text").lower()
+        prompt = payload.get("prompt") or payload.get("message") or payload.get("task_description") or "Please complete this request"
+        tk.Label(dialog, text=str(prompt), wraplength=620, justify="left").pack(padx=12, pady=(12, 6), anchor="w")
+        error = tk.StringVar(value="")
+        build_result = self._response_controls(dialog, tool, payload, tk)
+
         def submit() -> None:
-            response = self._client_ref()._central.submit(call_id, uuid.uuid4().hex, {"user_input": box.get("1.0", "end-1c")})
+            result = build_result()
+            if result is None:
+                error.set("Please complete the required response before submitting.")
+                return
+            response = self._client_ref()._central.submit(call_id, uuid.uuid4().hex, result)
             if response.get("success"):
+                self._calls.pop(call_id, None)
                 dialog.destroy()
+            else:
+                error.set("The central service did not accept this response. Refresh or retry.")
+        tk.Label(dialog, textvariable=error, fg="firebrick", justify="left").pack(padx=12, anchor="w")
         tk.Button(dialog, text="Submit", command=submit).pack(pady=(0, 12))
+
+    @staticmethod
+    def _response_controls(dialog: Any, tool: str, payload: Mapping[str, object], tk: Any) -> Callable[[], dict[str, object] | None]:
+        """Build labelled controls for every shared interaction family."""
+        required = bool(payload.get("required", True))
+        if "confirm" in tool:
+            value = tk.StringVar(value="")
+            tk.Label(dialog, text="Choose a confirmation result").pack(padx=12, pady=(6, 0), anchor="w")
+            tk.Radiobutton(dialog, text="Yes, confirm", variable=value, value="true").pack(padx=20, anchor="w")
+            tk.Radiobutton(dialog, text="No, do not confirm", variable=value, value="false").pack(padx=20, anchor="w")
+            return lambda: {"confirmed": value.get() == "true"} if value.get() else None
+        if "info" in tool or "acknowledge" in tool:
+            value = tk.BooleanVar(value=False)
+            tk.Checkbutton(dialog, text="I have read and acknowledge this information", variable=value).pack(padx=12, pady=8, anchor="w")
+            return lambda: {"acknowledged": True} if value.get() else None
+        if "feedback" in tool:
+            box = TkPresentation._labelled_text(dialog, tk, "Feedback")
+            return lambda: TkPresentation._text_result("feedback", box, required)
+        if "task" in tool or "assign" in tool:
+            status = tk.StringVar(value="completed")
+            tk.Label(dialog, text="Task status").pack(padx=12, pady=(6, 0), anchor="w")
+            tk.OptionMenu(dialog, status, "completed", "failed").pack(padx=12, anchor="w")
+            report = TkPresentation._labelled_text(dialog, tk, "Task report")
+            def task_result() -> dict[str, object] | None:
+                text = report.get("1.0", "end-1c")
+                return {"status": status.get(), "report": text} if text or not required else None
+            return task_result
+        choices = payload.get("choices") or payload.get("options")
+        if ("choice" in tool or "select" in tool or isinstance(choices, list)) and isinstance(choices, list):
+            multiple = bool(payload.get("multiple") or payload.get("allow_multiple"))
+            tk.Label(dialog, text="Choose one or more options" if multiple else "Choose one option").pack(padx=12, pady=(6, 0), anchor="w")
+            normalized = [
+                (str(item.get("value", item.get("label", ""))), str(item.get("label", item.get("value", ""))))
+                if isinstance(item, Mapping) else (str(item), str(item)) for item in choices
+            ]
+            if multiple:
+                values = [(raw, tk.BooleanVar(value=False)) for raw, _label in normalized]
+                for (_raw, label), (_value, variable) in zip(normalized, values):
+                    tk.Checkbutton(dialog, text=label, variable=variable).pack(padx=20, anchor="w")
+                def many() -> dict[str, object] | None:
+                    selected = [raw for raw, variable in values if variable.get()]
+                    return {"selected_choices": selected} if selected or not required else None
+                return many
+            selected = tk.StringVar(value="")
+            for raw, label in normalized:
+                tk.Radiobutton(dialog, text=label, variable=selected, value=raw).pack(padx=20, anchor="w")
+            return lambda: {"selected_choices": [selected.get()]} if selected.get() else None
+        multiline = "multiline" in tool or "long" in tool or bool(payload.get("multiline"))
+        numeric = "number" in tool or str(payload.get("input_type", "")).lower() == "number"
+        if multiline:
+            box = TkPresentation._labelled_text(dialog, tk, "Enter your complete response")
+            return lambda: TkPresentation._text_result("user_input", box, required)
+        label = "Enter a number" if numeric else "Enter your response"
+        tk.Label(dialog, text=label).pack(padx=12, pady=(6, 0), anchor="w")
+        entry = tk.Entry(dialog, width=70)
+        entry.pack(padx=12, pady=(0, 8), fill="x")
+        return lambda: {"user_input": entry.get()} if entry.get() or not required else None
+
+    @staticmethod
+    def _labelled_text(dialog: Any, tk: Any, label: str) -> Any:
+        tk.Label(dialog, text=label).pack(padx=12, pady=(6, 0), anchor="w")
+        box = tk.Text(dialog, width=70, height=10)
+        box.pack(padx=12, pady=(0, 8))
+        return box
+
+    @staticmethod
+    def _text_result(key: str, box: Any, required: bool) -> dict[str, object] | None:
+        value = box.get("1.0", "end-1c")
+        return {key: value} if value or not required else None
 
 
 class SilentRing:
