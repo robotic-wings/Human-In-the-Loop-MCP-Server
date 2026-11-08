@@ -172,7 +172,24 @@ def test_exact_desktop_owner_submission_is_durable_replayable_and_agent_readable
     replacement = create(app, "after-answer")
     assert replacement["call_state"] == "ringing"
 
-    restarted, _same_clock = components(tmp_path, clock=_clock)
+    # Rebuild the lifecycle application over the durable lifecycle/router
+    # databases, while deliberately retaining the already-authenticated
+    # registration service.  Its terminal-session map is process-local and
+    # registration-session recovery is outside this submission contract.
+    router = app._notification_router
+    registration = app._desktop_registration_service
+    assert router is not None and registration is not None
+    restarted = create_app(
+        database_path=tmp_path / "lifecycle.sqlite3",
+        credentials={"agent-a": "agent-secret", "agent-b": "other-agent"},
+        clock=_clock,
+        notify=router.enqueue,
+        wait=no_wait,
+        route_admission=router.validate_route,
+        notification_router=router,
+        desktop_registration_service=registration,
+        operator_session_verifier=BrowserVerifier(),
+    )
     replay_after_restart = request(restarted, "POST", f"/api/calls/{call['call_id']}/submissions", terminal=owner, body=answer)
     assert replay_after_restart.status_code == 200 and replay_after_restart.json() == submitted.json()
     assert continuation(restarted, call, after=1)["result"] == answer["result"]
