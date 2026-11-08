@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -29,9 +30,15 @@ class _Store:
                 CREATE TABLE IF NOT EXISTS notification_outbox (
                     call_id TEXT NOT NULL, channel TEXT NOT NULL,
                     ring_deadline REAL NOT NULL, state TEXT NOT NULL,
-                    created_at REAL NOT NULL, PRIMARY KEY (call_id, channel)
+                    created_at REAL NOT NULL, payload TEXT, PRIMARY KEY (call_id, channel)
                 );
             """)
+            # Existing outboxes predate the explicitly persisted Bark payload.
+            # Keep their delivery state immutable while allowing new calls to
+            # carry their configured, call-specific link.
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(notification_outbox)")}
+            if "payload" not in columns:
+                conn.execute("ALTER TABLE notification_outbox ADD COLUMN payload TEXT")
 
     @contextmanager
     def connection(self):
@@ -96,10 +103,17 @@ class NotificationRouter:
     def __init__(self, *, database_path: str | Path, clock: Clock, registry: TerminalRegistry,
                  desktop_dispatch: Dispatch, bark_dispatch: Dispatch, route_mode: str,
                  desktop_timeout_seconds: float = 2.5, bark_timeout_seconds: float = 2.5,
-                 call_state: CallState | None = None) -> None:
+                 call_state: CallState | None = None, web_base_url: str | None = None) -> None:
         self._store, self._clock, self._registry = _Store(database_path), clock, registry
         self._desktop_dispatch, self._bark_dispatch, self._route_mode = desktop_dispatch, bark_dispatch, route_mode
         self._desktop_timeout, self._bark_timeout, self._call_state = desktop_timeout_seconds, bark_timeout_seconds, call_state
+        self._web_base_url = self._normalize_web_base_url(web_base_url)
+
+    @staticmethod
+    def _normalize_web_base_url(value: str | None) -> str | None:
+        if not isinstance(value, str) or not value.strip():
+            return None
+        return value.rstrip("/")
 
     def validate_route(self) -> dict[str, object]:
         if self._route_mode not in self._CHANNELS:
@@ -110,13 +124,40 @@ class NotificationRouter:
         now = self._clock()
         with self._store.connection() as conn:
             for channel in self._CHANNELS.get(self._route_mode, ()):
-                conn.execute("INSERT OR IGNORE INTO notification_outbox VALUES (?, ?, ?, 'pending', ?)",
-                             (event["call_id"], channel, event["ring_deadline"], now))
+                payload = None
+                if channel == "bark" and self._web_base_url:
+                    call_id = str(event["call_id"])
+                    payload = json.dumps({"call_id": call_id, "url": f"{self._web_base_url}/calls/{call_id}"},
+                                         separators=(",", ":"))
+                conn.execute(
+                    "INSERT OR IGNORE INTO notification_outbox "
+                    "(call_id, channel, ring_deadline, state, created_at, payload) VALUES (?, ?, ?, 'pending', ?, ?)",
+                    (event["call_id"], channel, event["ring_deadline"], now, payload),
+                )
 
     def delivery_states(self, call_id: str) -> list[dict[str, object]]:
         with self._store.connection() as conn:
             rows = conn.execute("SELECT channel, state FROM notification_outbox WHERE call_id=? ORDER BY channel", (call_id,)).fetchall()
         return [{"channel": row["channel"], "state": row["state"]} for row in rows]
+
+    def outbox_records(self, call_id: str) -> list[dict[str, object]]:
+        with self._store.connection() as conn:
+            rows = conn.execute(
+                "SELECT channel, state, ring_deadline, payload FROM notification_outbox "
+                "WHERE call_id=? ORDER BY channel", (call_id,)
+            ).fetchall()
+        records: list[dict[str, object]] = []
+        for row in rows:
+            record: dict[str, object] = {
+                "channel": row["channel"], "state": row["state"], "ring_deadline": row["ring_deadline"],
+                "payload": json.loads(row["payload"]) if row["payload"] else {"call_id": call_id},
+            }
+            # Delivery bookkeeping is intentionally separate from the human
+            # state machine.  It is exposed once a transport result exists.
+            if row["state"] != "pending":
+                record.update(human_received=False, human_accepted=False)
+            records.append(record)
+        return records
 
     def recover(self) -> list[str]:
         """Uncertain sends are deliberately not retried after a restart."""
@@ -124,7 +165,7 @@ class NotificationRouter:
 
     async def dispatch_pending(self) -> dict[str, object]:
         with self._store.connection() as conn:
-            rows = conn.execute("SELECT call_id, channel, ring_deadline FROM notification_outbox WHERE state='pending'").fetchall()
+            rows = conn.execute("SELECT call_id, channel, ring_deadline, payload FROM notification_outbox WHERE state='pending'").fetchall()
         await asyncio.gather(*(self._dispatch_row(dict(row)) for row in rows))
         decisions: dict[str, str] = {}
         for call_id in {str(row["call_id"]) for row in rows}:
@@ -150,6 +191,8 @@ class NotificationRouter:
             return
         payload: dict[str, object] = {"call_id": call_id, "ring_deadline": row["ring_deadline"]}
         dispatch, timeout = self._bark_dispatch, self._bark_timeout
+        if channel == "bark" and row.get("payload"):
+            payload = json.loads(str(row["payload"]))
         if channel == "desktop":
             terminal = self._registry.ready_desktop()
             # A configured desktop route may still be worth one bounded
