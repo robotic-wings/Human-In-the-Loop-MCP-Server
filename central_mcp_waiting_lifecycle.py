@@ -194,6 +194,53 @@ class WaitingLifecycle:
                 conn.rollback()
                 raise
 
+    def apply_delivery_decisions(self, decisions: Mapping[str, object]) -> None:
+        """Persist definitive notification-routing outcomes.
+
+        A router may report that every enabled delivery route definitely
+        failed, or that delivery remains uncertain.  Only the former is a
+        business outcome: uncertainty deliberately leaves the ringing call
+        and its original absolute deadline alone.  This method is idempotent
+        so delayed router work cannot append events or resurrect a terminal
+        call after a restart.
+        """
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # Deadline settlement is first so a late router report cannot
+                # replace the earlier ring-timeout business result.
+                self._settle_due(conn)
+                for call_id, decision in decisions.items():
+                    if not isinstance(call_id, str) or decision != "unreachable":
+                        continue
+                    call = conn.execute(
+                        "SELECT * FROM lifecycle_calls WHERE call_id=? AND call_state='ringing'",
+                        (call_id,),
+                    ).fetchone()
+                    if call is None:
+                        continue
+                    conn.execute(
+                        "UPDATE lifecycle_calls SET call_state='unreachable', reason='no_available_channel' "
+                        "WHERE call_id=?",
+                        (call_id,),
+                    )
+                    seq = int(conn.execute(
+                        "SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?",
+                        (call_id,),
+                    ).fetchone()["n"])
+                    body = self._terminal(
+                        call["interaction_id"], call_id, "unreachable", "no_available_channel", seq,
+                    )
+                    body["human_action"] = False
+                    conn.execute(
+                        "INSERT INTO lifecycle_events VALUES (?, ?, ?)",
+                        (call_id, seq, self._dump(body)),
+                    )
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+
     def accept(self, *, call_id: str, device_id: str, handled_on: str, terminal_platform: str) -> dict[str, object]:
         del device_id
         return self._human_action(call_id, "opened", "accepted", None, {"handled_on": handled_on, "terminal_platform": terminal_platform})
