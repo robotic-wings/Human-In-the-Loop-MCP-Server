@@ -15,6 +15,7 @@ These tests stay red until ``upload_attachment`` enforces those bounds.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import sqlite3
 from pathlib import Path
