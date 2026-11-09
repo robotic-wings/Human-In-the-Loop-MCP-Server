@@ -41,7 +41,6 @@ class DesktopTerminalClient:
         self._gui_capability = gui_capability
         self.ring = ring
         self.presenter = presenter
-        self._auto_deny = bool(self._config.get("auto_deny", False))
         self._session_id: str | None = None
         self._online = False
         self._gui_ready = False
@@ -73,9 +72,6 @@ class DesktopTerminalClient:
     def status(self) -> dict[str, object]:
         return {"gui_ready": self._gui_ready, "online": self._online}
 
-    def set_auto_deny(self, enabled: bool) -> None:
-        self._auto_deny = bool(enabled)
-
     def receive_notification(
         self, event: Mapping[str, object], *, callback_credential: str | None
     ) -> dict[str, object]:
@@ -87,15 +83,6 @@ class DesktopTerminalClient:
             return {"success": False, "status": "session_not_found"}
         if self._shown.get(call_id, -1) >= version:
             return {"success": True, "status": "duplicate", "call_id": call_id}
-        if self._auto_deny:
-            try:
-                declined = self._central.act("decline", call_id, self._session_id, uuid.uuid4().hex)
-            except (ConnectionError, OSError):
-                return self._central_lost()
-            if not declined.get("success"):
-                return {"success": False, "status": "session_not_found"}
-            self.listener.acknowledge(dict(event))
-            return {"success": True, "status": "declined", "call_id": call_id}
         try:
             state = self._central.read_call(call_id, self._session_id)
         except (ConnectionError, OSError):
@@ -196,7 +183,6 @@ class DesktopTerminalConfig:
     heartbeat_seconds: float = 10.0
     ringtone_path: str = "ringtone.mp3"
     ringtone_alt_path: str | None = None
-    auto_deny: bool = False
     ringtones_dir: str = "ringtones"
 
     @property
@@ -236,9 +222,6 @@ class DesktopTerminalConfig:
             ringtone_path = "ringtone.mp3"
         ringtone_alt = normalized.get("ringtone_alt_path")
         ringtone_alt_path = ringtone_alt if isinstance(ringtone_alt, str) and ringtone_alt else None
-        auto_deny = normalized.get("auto_deny", False)
-        if not isinstance(auto_deny, bool):
-            auto_deny = False
         ringtones_dir = normalized.get("ringtones_dir", "ringtones")
         if not isinstance(ringtones_dir, str) or not ringtones_dir:
             ringtones_dir = "ringtones"
@@ -249,7 +232,7 @@ class DesktopTerminalConfig:
             listener_tls_cert_file=(str(normalized["listener_tls_cert_file"]) if normalized.get("listener_tls_cert_file") else None),
             listener_tls_key_file=(str(normalized["listener_tls_key_file"]) if normalized.get("listener_tls_key_file") else None),
             heartbeat_seconds=float(interval),
-            ringtone_path=ringtone_path, ringtone_alt_path=ringtone_alt_path, auto_deny=auto_deny,
+            ringtone_path=ringtone_path, ringtone_alt_path=ringtone_alt_path,
             ringtones_dir=ringtones_dir,
         )
 
@@ -262,9 +245,9 @@ def scan_ringtones(directory: str) -> list[str]:
     return sorted(entry.name for entry in path.glob("*.mp3") if entry.is_file())
 
 
-def build_settings_panel(root: Any, ring: Any, client: Any, ringtones_dir: str,
-                         mp3s: list[str], initial_ringtone: str, auto_deny: bool, tk: Any) -> None:
-    """Build the ringtone dropdown and do-not-disturb toggle on the main window."""
+def build_settings_panel(root: Any, ring: Any, central: Any, ringtones_dir: str,
+                         mp3s: list[str], initial_ringtone: str, tk: Any) -> None:
+    """Build the ringtone dropdown and do-not-disturb controls on the main window."""
     initial_basename = os.path.basename(initial_ringtone)
     initial_value = initial_basename if initial_basename in mp3s else (mp3s[0] if mp3s else "")
     ringtone_var = tk.StringVar(value=initial_value)
@@ -274,10 +257,26 @@ def build_settings_panel(root: Any, ring: Any, client: Any, ringtones_dir: str,
     ringtone_var.trace_add("write", on_ringtone_change)
     tk.OptionMenu(root, ringtone_var, *mp3s).pack(anchor="w", padx=12, pady=6)
 
-    auto_deny_var = tk.BooleanVar(value=auto_deny)
+    dnd = central.get_dnd()
+    if not isinstance(dnd, Mapping):
+        dnd = {}
+    enabled = bool(dnd.get("enabled", False))
+    message = dnd.get("message") if isinstance(dnd.get("message"), str) else ""
+
+    auto_deny_var = tk.BooleanVar(value=enabled)
+    message_entry = tk.Entry(root)
+    message_entry.pack(anchor="w", padx=12, pady=6)
+    if message:
+        insert = getattr(message_entry, "insert", None)
+        if callable(insert):
+            insert(0, message)
+        else:
+            setter = getattr(message_entry, "set_text", None)
+            if callable(setter):
+                setter(message)
 
     def on_auto_deny_change(*_args: object) -> None:
-        client.set_auto_deny(auto_deny_var.get())
+        central.set_dnd(bool(auto_deny_var.get()), message_entry.get())
     auto_deny_var.trace_add("write", on_auto_deny_change)
     tk.Checkbutton(root, text="勿扰模式（来电自动拒绝）", variable=auto_deny_var).pack(anchor="w", padx=12, pady=6)
 
@@ -351,6 +350,12 @@ class CentralHttpDesktopClient:
 
     def cancel(self, call_id: str, operation_id: str) -> dict[str, object]:
         return self._request("POST", f"/api/calls/{call_id}/cancel", json_body={"operation_id": operation_id})
+
+    def set_dnd(self, enabled: bool, message: str) -> dict[str, object]:
+        return self._request("POST", "/api/terminals/dnd", json_body={"dnd": enabled, "message": message})
+
+    def get_dnd(self) -> dict[str, object]:
+        return self._request("GET", "/api/terminals/dnd")
 
 
 class _TerminalListener:
@@ -649,9 +654,9 @@ def main(argv: list[str] | None = None) -> None:
     holder: dict[str, DesktopTerminalClient] = {}
     presenter = TkPresentation(root, lambda: holder["client"])
     ring = RingtonePlayer(ringtone_path=config.ringtone_path, ringtone_alt_path=config.ringtone_alt_path, bell=root.bell)
-    client = DesktopTerminalClient(config={"terminal_credential": config.terminal_credential, "callback_credential": config.callback_credential, "auto_deny": config.auto_deny}, central=central, listener=_TerminalListener(), gui_capability=lambda: True, ring=ring, presenter=presenter)
+    client = DesktopTerminalClient(config={"terminal_credential": config.terminal_credential, "callback_credential": config.callback_credential}, central=central, listener=_TerminalListener(), gui_capability=lambda: True, ring=ring, presenter=presenter)
     holder["client"] = client
-    build_settings_panel(root, ring, client, config.ringtones_dir, scan_ringtones(config.ringtones_dir), config.ringtone_path, config.auto_deny, tk)
+    build_settings_panel(root, ring, central, config.ringtones_dir, scan_ringtones(config.ringtones_dir), config.ringtone_path, tk)
     if config.listener_scheme == "https" and (not config.listener_tls_cert_file or not config.listener_tls_key_file):
         raise SystemExit("desktop terminal unavailable: HTTPS listener requires listener_tls_cert_file and listener_tls_key_file")
     server = uvicorn.Server(uvicorn.Config(
