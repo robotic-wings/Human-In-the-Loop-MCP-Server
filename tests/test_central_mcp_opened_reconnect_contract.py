@@ -114,7 +114,7 @@ def test_opened_delivery_and_new_accepted_heartbeat_arm_response_bound_grace(tmp
     assert refreshed["status"] == "heartbeat"
     assert refreshed["call_state"] == "accepted"
     assert wait.legs == [6, 6]
-    assert notifications == [{"call_id": call["call_id"], "ring_deadline": 1_700_000_120.0}]
+    assert notifications == [{"call_id": call["call_id"], "ring_deadline": 1_700_000_120.0, "title": "agent-a", "body": "Human-in-the-Loop request"}]
 
     clock.advance(30)
     assert post(app, continuation(call, "expired", after=1)) == expected_disconnected(call)
@@ -161,4 +161,4 @@ def test_opened_expiry_survives_restart_releases_busy_and_rejects_late_finalizat
     next_call = create(restarted, "next-call")
     assert next_call["status"] == "heartbeat"
     assert len(notifications) == 1
-    assert restarted_notifications == [{"call_id": next_call["call_id"], "ring_deadline": clock() + 120}]
+    assert restarted_notifications == [{"call_id": next_call["call_id"], "ring_deadline": clock() + 120, "title": "agent-a", "body": "Human-in-the-Loop request"}]

@@ -191,4 +191,4 @@ def test_progress_expiry_is_durable_releases_busy_and_late_finalization_replays_
     next_call = create(restarted, "next")
     assert next_call["status"] == "heartbeat"
     assert len(notifications) == 1
-    assert restarted_notifications == [{"call_id": next_call["call_id"], "ring_deadline": clock() + 600}]
+    assert restarted_notifications == [{"call_id": next_call["call_id"], "ring_deadline": clock() + 600, "title": "agent-a", "body": "Human-in-the-Loop request"}]

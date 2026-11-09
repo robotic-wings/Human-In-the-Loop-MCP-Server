@@ -309,6 +309,9 @@ def test_configured_bark_call_link_establishes_authenticated_cookie_without_expo
     assert bark_payload == {
         "call_id": call["call_id"],
         "url": f"https://central.example.test{call_path}",
+        "call": "1",
+        "title": "agent-a",
+        "body": "Approve change?",
     }
     assert "operator-login-secret" not in str(bark_payload)
     assert "operator-cookie" not in str(bark_payload)

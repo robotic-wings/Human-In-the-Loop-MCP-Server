@@ -120,7 +120,15 @@ class WaitingLifecycle:
                         (call_id, interaction_id, caller_id, deadline, encoded, invited_desktop_id, int(mobile_eligible)),
                     )
                     outcome = self._heartbeat(interaction_id, call_id, "ringing")
-                    notification = {"call_id": call_id, "ring_deadline": deadline}
+                    short_title = next(
+                        (str(payload.get(key)) for key in ("title", "task_description", "prompt", "message")
+                         if isinstance(payload.get(key), str) and payload.get(key).strip()),
+                        "Human-in-the-Loop request",
+                    )
+                    notification = {
+                        "call_id": call_id, "ring_deadline": deadline,
+                        "title": caller_id, "body": " ".join(short_title.split())[:200],
+                    }
                 conn.execute("INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?, 'create')", (caller_id, request_id, encoded, self._dump(outcome)))
                 conn.commit()
             except BaseException:

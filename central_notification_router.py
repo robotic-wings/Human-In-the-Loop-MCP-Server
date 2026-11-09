@@ -158,16 +158,26 @@ class NotificationRouter:
                 payload = None
                 if channel == "bark" and self._web_base_url:
                     call_id = str(event["call_id"])
-                    payload = json.dumps({"call_id": call_id, "url": f"{self._web_base_url}/calls/{call_id}"},
-                                         separators=(",", ":"))
+                    bark_payload: dict[str, object] = {
+                        "call_id": call_id, "url": f"{self._web_base_url}/calls/{call_id}",
+                        "call": "1",
+                    }
+                    for key in ("title", "body"):
+                        value = event.get(key)
+                        if isinstance(value, str) and value:
+                            bark_payload[key] = value
+                    payload = json.dumps(bark_payload, separators=(",", ":"))
                 elif channel == "desktop":
                     # Preserve the lifecycle-owned event verbatim in the
                     # outbox.  Registry attributes are added only when the
                     # callback is delivered, so they retain their management
                     # ownership while call state/version survive restarts.
-                    desktop_event = dict(event)
-                    desktop_event.setdefault("call_state", "ringing")
-                    desktop_event.setdefault("version", 1)
+                    desktop_event = {
+                        "call_id": event["call_id"],
+                        "ring_deadline": event["ring_deadline"],
+                        "call_state": event.get("call_state", "ringing"),
+                        "version": event.get("version", 1),
+                    }
                     payload = json.dumps(desktop_event, separators=(",", ":"))
                 conn.execute(
                     "INSERT OR IGNORE INTO notification_outbox "

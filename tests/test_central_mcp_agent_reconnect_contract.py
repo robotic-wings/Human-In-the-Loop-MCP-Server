@@ -171,7 +171,7 @@ def test_replayed_initial_heartbeat_does_not_create_a_ringing_disconnect_deadlin
     clock.advance(29)
     replayed = create(app, "replayed-create")
     assert replayed == call
-    assert notifications == [{"call_id": call["call_id"], "ring_deadline": 1_700_000_120.0}]
+    assert notifications == [{"call_id": call["call_id"], "ring_deadline": 1_700_000_120.0, "title": "agent-a", "body": "Human-in-the-Loop request"}]
 
     # At t=31 a valid continuation remains a normal ringing heartbeat.
     clock.advance(2)
@@ -248,8 +248,8 @@ def test_restart_preserves_ringing_until_its_absolute_deadline(tmp_path: Path) -
     # The original app's injected notifier records only its own initial
     # invitation.  The restarted app owns the notifier used for the newly
     # admitted call.
-    assert notifications == [{"call_id": call["call_id"], "ring_deadline": 1_700_000_060.0}]
-    assert restarted_notifications == [{"call_id": next_call["call_id"], "ring_deadline": clock() + 60}]
+    assert notifications == [{"call_id": call["call_id"], "ring_deadline": 1_700_000_060.0, "title": "agent-a", "body": "Human-in-the-Loop request"}]
+    assert restarted_notifications == [{"call_id": next_call["call_id"], "ring_deadline": clock() + 60, "title": "agent-a", "body": "Human-in-the-Loop request"}]
 
 
 def test_foreign_or_invalid_continuation_cannot_refresh_and_earlier_ring_deadline_wins(tmp_path: Path) -> None:

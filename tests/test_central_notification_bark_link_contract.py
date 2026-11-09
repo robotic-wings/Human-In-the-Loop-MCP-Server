@@ -79,10 +79,10 @@ def test_bark_outbox_persists_normalized_call_link_before_one_bounded_dispatch(t
     records = router.outbox_records(call_id)
     assert records == [{
         "channel": "bark", "state": "pending", "ring_deadline": call["ring_deadline"],
-        "payload": {"call_id": call_id, "url": f"https://10.0.0.1:8443/central/calls/{call_id}"},
+        "payload": {"call_id": call_id, "url": f"https://10.0.0.1:8443/central/calls/{call_id}", "call": "1"},
     }]
     asyncio.run(router.dispatch_pending())
-    assert bark_payloads == [{"call_id": call_id, "url": f"https://10.0.0.1:8443/central/calls/{call_id}"}]
+    assert bark_payloads == [{"call_id": call_id, "url": f"https://10.0.0.1:8443/central/calls/{call_id}", "call": "1"}]
 
 
 def test_bark_gateway_success_is_delivery_only_and_cannot_claim_human_acceptance(tmp_path: Path) -> None:
@@ -109,7 +109,7 @@ def test_bark_gateway_success_is_delivery_only_and_cannot_claim_human_acceptance
     assert record["human_received"] is False
     assert record["human_accepted"] is False
     assert states["call-opaque"] == "ringing"
-    assert set(record["payload"]) == {"call_id", "url"}
+    assert set(record["payload"]) == {"call_id", "url", "call"}
     assert "secret" not in repr(record["payload"]).lower()
     assert "request" not in repr(record["payload"]).lower()
 
