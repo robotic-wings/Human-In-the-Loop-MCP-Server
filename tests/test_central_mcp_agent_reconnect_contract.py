@@ -1,9 +1,4 @@
-"""Red contract for post-heartbeat ringing agent reconnect expiry.
-
-This deliberately narrow contract covers a caller that has already received a
-``heartbeat`` while the call is still ringing.  It does not cover opened or
-in-progress work, human-terminal liveness, cancellation, or any UI channel.
-"""
+"""Regression contract: ringing HTTP wait legs are not agent disconnects."""
 
 from __future__ import annotations
 
@@ -118,12 +113,11 @@ def expected_disconnected(call: dict[str, object]) -> dict[str, object]:
     }
 
 
-def test_ringing_heartbeat_continuation_refreshes_durable_reconnect_deadline_without_notification(tmp_path: Path) -> None:
+def test_ringing_wait_legs_remain_ringing_until_the_absolute_ring_deadline(tmp_path: Path) -> None:
     clock, notifications = FakeClock(), []
-    # The refreshed reconnect deadline is reached at t=79 below.  Keep the
-    # absolute ringing deadline later than that so this test isolates the
-    # reconnect-expiry branch; the next test below covers an earlier ring
-    # deadline winning instead.
+    # Keep the absolute ringing deadline later than the old 30-second
+    # reconnect interval.  A normal heartbeat/continuation must not turn this
+    # unanswered call into agent_disconnected.
     app = make_app(tmp_path, clock, notifications, ring_timeout=120)
     call = create(app)
     clock.advance(20)
@@ -132,11 +126,14 @@ def test_ringing_heartbeat_continuation_refreshes_durable_reconnect_deadline_wit
     assert refreshed["status"] == "heartbeat"
     assert len(notifications) == 1
 
-    # The continuation refreshes the 30-second post-heartbeat allowance.
+    # The call is still ringing well after the former 30-second disconnect
+    # boundary because the Agent is using the same interaction/call pair.
     clock.advance(29)
     assert post(app, continuation(call, "still-live"))["status"] == "heartbeat"
     clock.advance(30)
-    assert post(app, continuation(call, "expired")) == expected_disconnected(call)
+    still_ringing = post(app, continuation(call, "still-ringing-after-old-grace"))
+    assert still_ringing["status"] == "heartbeat"
+    assert still_ringing["call_state"] == "ringing"
 
 
 def test_reconnect_grace_starts_when_the_heartbeat_is_delivered_not_when_wait_begins(tmp_path: Path) -> None:
@@ -164,33 +161,30 @@ def test_reconnect_grace_starts_when_the_heartbeat_is_delivered_not_when_wait_be
     assert terminal["reason"] == "ring_timeout"
 
 
-def test_replayed_initial_heartbeat_does_not_extend_reconnect_deadline(tmp_path: Path) -> None:
+def test_replayed_initial_heartbeat_does_not_create_a_ringing_disconnect_deadline(tmp_path: Path) -> None:
     clock, notifications = FakeClock(), []
     app = make_app(tmp_path, clock, notifications, ring_timeout=120)
 
-    # The initial heartbeat arms a 30-second reconnect grace once. Retrying
-    # the identical create operation replays that response; it must not make
-    # a new delivery or move the already-persisted deadline.
+    # Retrying the identical create operation remains a response replay and
+    # must not make a second notification.
     call = create(app, "replayed-create")
     clock.advance(29)
     replayed = create(app, "replayed-create")
     assert replayed == call
     assert notifications == [{"call_id": call["call_id"], "ring_deadline": 1_700_000_120.0}]
 
-    # The original grace expires at t=30, not t=59. A valid continuation at
-    # t=31 therefore receives the immutable disconnect result.
+    # At t=31 a valid continuation remains a normal ringing heartbeat.
     clock.advance(2)
-    assert post(app, continuation(call, "after-replay-expiry")) == expected_disconnected(call)
+    assert post(app, continuation(call, "after-replay-old-grace"))["call_state"] == "ringing"
 
 
-def test_replayed_continuation_heartbeat_does_not_extend_reconnect_deadline(tmp_path: Path) -> None:
+def test_replayed_continuation_does_not_end_an_unanswered_ringing_call(tmp_path: Path) -> None:
     clock, notifications = FakeClock(), []
     app = make_app(tmp_path, clock, notifications, ring_timeout=120)
     call = create(app, "continuation-replay-create")
 
-    # A new continuation legitimately refreshes the grace from t=30 to t=50.
-    # Retrying that exact operation at t=49 is only a response replay: it must
-    # not deliver another heartbeat or move the durable deadline to t=79.
+    # Retrying an identical continuation is only a response replay and must
+    # not deliver a second notification.
     clock.advance(20)
     request = continuation(call, "continuation-replay")
     first = post(app, request)
@@ -200,11 +194,10 @@ def test_replayed_continuation_heartbeat_does_not_extend_reconnect_deadline(tmp_
     assert replayed == first
     assert len(notifications) == 1
 
-    # The continuation grace originally refreshed at t=20 expires at t=50.
-    # A different valid continuation after that point observes the immutable
-    # disconnect result rather than treating the replay as fresh liveness.
+    # A different valid continuation after the former grace boundary remains
+    # ringing until the actual ring deadline.
     clock.advance(2)
-    assert post(app, continuation(call, "after-continuation-replay-expiry")) == expected_disconnected(call)
+    assert post(app, continuation(call, "after-continuation-replay-old-grace"))["call_state"] == "ringing"
 
 
 def test_request_id_cannot_be_reused_across_create_and_continuation_without_wait_or_deadline_mutation(
@@ -228,13 +221,13 @@ def test_request_id_cannot_be_reused_across_create_and_continuation_without_wait
     assert wait.legs == [6]
     assert len(notifications) == 1
 
-    # The rejected cross-operation reuse did not move the original t=30
-    # reconnect deadline.  A fresh ID at t=31 observes its immutable result.
+    # The rejected cross-operation reuse cannot turn the normal ringing wait
+    # into a disconnect. A fresh ID at t=31 remains ringing.
     clock.advance(2)
-    assert post(app, continuation(call, "after-cross-operation-conflict")) == expected_disconnected(call)
+    assert post(app, continuation(call, "after-cross-operation-conflict"))["call_state"] == "ringing"
 
 
-def test_reconnect_expiry_is_immutable_across_restart_releases_busy_and_rejects_late_action(tmp_path: Path) -> None:
+def test_restart_preserves_ringing_until_its_absolute_deadline(tmp_path: Path) -> None:
     clock, notifications = FakeClock(), []
     first = make_app(tmp_path, clock, notifications)
     call = create(first)
@@ -242,13 +235,14 @@ def test_reconnect_expiry_is_immutable_across_restart_releases_busy_and_rejects_
 
     restarted_notifications: list[dict[str, object]] = []
     restarted = make_app(tmp_path, clock, restarted_notifications)
-    terminal = post(restarted, continuation(call, "after-restart"))
-    assert terminal == expected_disconnected(call)
-    assert post(restarted, continuation(call, "replay")) == terminal
-    assert restarted.lifecycle.accept(
-        call_id=str(call["call_id"]), device_id="desktop-1", handled_on="desktop", terminal_platform="windows"
-    ) == terminal
+    still_ringing = post(restarted, continuation(call, "after-restart"))
+    assert still_ringing["call_state"] == "ringing"
 
+    # The original call only releases the busy slot at its real ring deadline.
+    clock.advance(30)
+    terminal = post(restarted, continuation(call, "ring-deadline"))
+    assert terminal["status"] == "not_accepted"
+    assert terminal["reason"] == "ring_timeout"
     next_call = create(restarted, "new-after-release")
     assert next_call["status"] == "heartbeat"
     # The original app's injected notifier records only its own initial

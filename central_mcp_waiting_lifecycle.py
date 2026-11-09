@@ -246,6 +246,13 @@ class WaitingLifecycle:
     def response_delivered(self, caller_id: str, response: Mapping[str, object]) -> None:
         """Persist grace only after a newly executed resumable response is sent."""
         status, state = response.get("status"), response.get("call_state")
+        # A ringing heartbeat is the normal end of an HTTP wait leg.  It is
+        # not evidence that the caller has disconnected: the same agent may
+        # immediately continue with this interaction/call pair, and the
+        # absolute ring deadline already governs an unanswered invitation.
+        # Never arm agent-disconnect expiry for this state.
+        if state == "ringing":
+            return
         if state not in {"ringing", "accepted", "in_progress"}:
             return
         if status != "heartbeat" and not (status == "opened" and state == "accepted") and not (
@@ -620,7 +627,7 @@ class WaitingLifecycle:
             body["human_action"] = False
             conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call["call_id"], seq, self._dump(body)))
         rows = conn.execute(
-            "SELECT * FROM lifecycle_calls WHERE call_state IN ('ringing', 'accepted', 'in_progress') "
+            "SELECT * FROM lifecycle_calls WHERE call_state IN ('accepted', 'in_progress') "
             "AND agent_reconnect_deadline IS NOT NULL AND agent_reconnect_deadline<=?",
             (now,),
         ).fetchall()
