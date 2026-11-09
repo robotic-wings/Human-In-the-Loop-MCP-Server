@@ -272,14 +272,14 @@ def build_settings_panel(root: Any, ring: Any, client: Any, ringtones_dir: str,
     def on_ringtone_change(*_args: object) -> None:
         ring.set_ringtone(os.path.join(ringtones_dir, ringtone_var.get()))
     ringtone_var.trace_add("write", on_ringtone_change)
-    tk.OptionMenu(root, ringtone_var, *mp3s)
+    tk.OptionMenu(root, ringtone_var, *mp3s).pack(anchor="w", padx=12, pady=6)
 
     auto_deny_var = tk.BooleanVar(value=auto_deny)
 
     def on_auto_deny_change(*_args: object) -> None:
         client.set_auto_deny(auto_deny_var.get())
     auto_deny_var.trace_add("write", on_auto_deny_change)
-    tk.Checkbutton(root, text="勿扰模式（来电自动拒绝）", variable=auto_deny_var)
+    tk.Checkbutton(root, text="勿扰模式（来电自动拒绝）", variable=auto_deny_var).pack(anchor="w", padx=12, pady=6)
 
 
 class CentralHttpDesktopClient:
