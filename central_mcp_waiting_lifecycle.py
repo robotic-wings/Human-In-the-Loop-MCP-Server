@@ -378,12 +378,23 @@ class WaitingLifecycle:
                     outcome = self._load(event["body_json"]) if event else self._error("expired")
                 else:
                     state, status, reason = ("accepted", "opened", None) if action == "accept" else ("declined", "declined", "human_declined")
-                    conn.execute(
-                        "UPDATE lifecycle_calls SET call_state=?, reason=?, owner_device_id=?, owner_session_id=?, handled_on='desktop', terminal_platform=?, terminal_last_seen_at=?, terminal_disconnect_deadline=?, agent_reconnect_deadline=?, version=version+1 WHERE call_id=?",
-                        (state, reason, device_id, session_id, terminal_platform, self._clock(),
-                         self._clock() + self._terminal_disconnect_seconds if action == "accept" else None,
-                         None, call_id),
-                    )
+                    if action == "accept":
+                        conn.execute(
+                            "UPDATE lifecycle_calls SET call_state=?, reason=?, owner_device_id=?, owner_session_id=?, handled_on='desktop', terminal_platform=?, terminal_last_seen_at=?, terminal_disconnect_deadline=?, agent_reconnect_deadline=?, version=version+1 WHERE call_id=?",
+                            (state, reason, device_id, session_id, terminal_platform, self._clock(),
+                             self._clock() + self._terminal_disconnect_seconds, None, call_id),
+                        )
+                    else:
+                        # A decline ends the invitation without assigning a
+                        # processing owner.  Keep its audit endpoint separate
+                        # from handled_on / terminal_platform.  The internal
+                        # device/session association remains so the declining
+                        # desktop receives the terminal state on its next
+                        # synchronization and can close its old alert.
+                        conn.execute(
+                            "UPDATE lifecycle_calls SET call_state=?, reason=?, owner_device_id=?, owner_session_id=?, handled_on=NULL, terminal_platform=NULL, terminal_last_seen_at=NULL, terminal_disconnect_deadline=NULL, agent_reconnect_deadline=NULL, version=version+1 WHERE call_id=?",
+                            (state, reason, device_id, session_id, call_id),
+                        )
                     seq = int(conn.execute("SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call_id,)).fetchone()["n"])
                     outcome: dict[str, object] = {
                         "success": True, "status": status, "call_state": state, "human_action": True,
@@ -394,7 +405,8 @@ class WaitingLifecycle:
                         outcome.update(owner_device_id=device_id, owner_session_id=session_id,
                                        handled_on="desktop", terminal_platform=terminal_platform)
                     else:
-                        outcome["reason"] = reason
+                        outcome.update(reason=reason, acted_on="desktop", handled_on=None,
+                                       terminal_platform=None, retryable=False)
                     conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call_id, seq, self._dump(outcome)))
                 conn.execute("INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?, ?)", (actor, operation_id, encoded, self._dump(outcome), kind))
                 conn.commit()
@@ -451,12 +463,17 @@ class WaitingLifecycle:
                     else ("declined", "declined", "human_declined")
                 )
                 now = self._clock()
-                conn.execute(
-                    "UPDATE lifecycle_calls SET call_state=?, reason=?, owner_device_id=?, owner_session_id=?, handled_on='iphone_web', terminal_platform='ios', terminal_last_seen_at=?, terminal_disconnect_deadline=?, agent_reconnect_deadline=?, version=version+1 WHERE call_id=?",
-                    (state, reason, "iphone_web", session_id, now,
-                     now + self._terminal_disconnect_seconds if action == "accept" else None,
-                     None, call_id),
-                )
+                if action == "accept":
+                    conn.execute(
+                        "UPDATE lifecycle_calls SET call_state=?, reason=?, owner_device_id=?, owner_session_id=?, handled_on='iphone_web', terminal_platform='ios', terminal_last_seen_at=?, terminal_disconnect_deadline=?, agent_reconnect_deadline=?, version=version+1 WHERE call_id=?",
+                        (state, reason, "iphone_web", session_id, now,
+                         now + self._terminal_disconnect_seconds, None, call_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE lifecycle_calls SET call_state=?, reason=?, owner_device_id=?, owner_session_id=?, handled_on=NULL, terminal_platform=NULL, terminal_last_seen_at=NULL, terminal_disconnect_deadline=NULL, agent_reconnect_deadline=NULL, version=version+1 WHERE call_id=?",
+                        (state, reason, "iphone_web", session_id, call_id),
+                    )
                 seq = int(conn.execute(
                     "SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call_id,)
                 ).fetchone()["n"])
@@ -469,7 +486,8 @@ class WaitingLifecycle:
                     outcome.update(owner_device_id="iphone_web", owner_session_id=session_id,
                                    handled_on="iphone_web", terminal_platform="ios")
                 else:
-                    outcome["reason"] = reason
+                    outcome.update(reason=reason, acted_on="iphone_web", handled_on=None,
+                                   terminal_platform=None, retryable=False)
                 conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call_id, seq, self._dump(outcome)))
                 conn.execute("INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?, ?)",
                              (actor, operation_id, encoded, self._dump(outcome), kind))
