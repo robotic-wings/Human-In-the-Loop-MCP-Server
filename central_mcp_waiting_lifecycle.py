@@ -8,6 +8,8 @@ boundaries.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import hmac
 import html
 import json
@@ -34,7 +36,9 @@ class WaitingLifecycle:
         self._ring_timeout, self._agent_reconnect_seconds = ring_timeout, agent_reconnect_seconds
         self._terminal_disconnect_seconds = terminal_disconnect_seconds
         self._operator_id = operator_id
+        self._attachments_dir = Path(self._path).parent / "attachments"
         Path(self._path).parent.mkdir(parents=True, exist_ok=True)
+        self._attachments_dir.mkdir(parents=True, exist_ok=True)
         with self._connection() as conn:
             conn.executescript("""
               CREATE TABLE IF NOT EXISTS lifecycle_calls (
@@ -60,6 +64,11 @@ class WaitingLifecycle:
                 call_id TEXT NOT NULL, submission_id TEXT NOT NULL, actor TEXT NOT NULL,
                 payload_json TEXT NOT NULL, outcome_json TEXT NOT NULL,
                 PRIMARY KEY (call_id, submission_id)
+              );
+              CREATE TABLE IF NOT EXISTS lifecycle_attachments (
+                attachment_id TEXT PRIMARY KEY, call_id TEXT NOT NULL,
+                filename TEXT NOT NULL, media_type TEXT NOT NULL,
+                byte_count INTEGER NOT NULL, checksum TEXT NOT NULL, stored_path TEXT NOT NULL
               );
             """)
             self._migrate_schema(conn)
@@ -545,6 +554,9 @@ class WaitingLifecycle:
                     "terminal_platform": call["terminal_platform"], "result": dict(result),
                 }
                 outcome.update(extras)
+                attachments = dict(result).get("attachments")
+                if isinstance(attachments, list):
+                    outcome["attachments"] = self._resolve_attachments(conn, call_id, attachments)
                 conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call_id, seq, self._dump(outcome)))
                 conn.execute("INSERT INTO lifecycle_submissions VALUES (?, ?, ?, ?, ?)",
                              (call_id, submission_id, actor, encoded, self._dump(outcome)))
@@ -609,6 +621,75 @@ class WaitingLifecycle:
             except BaseException:
                 conn.rollback()
                 raise
+
+    def upload_attachment(self, *, call_id: str, device_id: str, session_id: str,
+                          filename: str, media_type: str, content: bytes) -> dict[str, object]:
+        """Store one file body centrally and return its server-owned metadata.
+
+        The file entity lives in the central data directory, never on the
+        submitting terminal; the returned ``attachment_id`` is the only handle
+        the Agent and later submissions may reference.
+        """
+        if not filename or not isinstance(filename, str):
+            return self._error("invalid_request")
+        if not isinstance(content, bytes) or not content:
+            return self._error("invalid_request")
+        media_type = media_type if isinstance(media_type, str) and media_type else "application/octet-stream"
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._settle_due(conn)
+                call = conn.execute("SELECT * FROM lifecycle_calls WHERE call_id=?", (call_id,)).fetchone()
+                if call is None or call["owner_device_id"] != device_id or call["owner_session_id"] != session_id:
+                    return self._error("session_not_found")
+                if call["call_state"] not in {"accepted", "in_progress"}:
+                    return self._error("expired")
+                attachment_id = str(uuid.uuid4())
+                byte_count = len(content)
+                checksum = hashlib.sha256(content).hexdigest()
+                stored_path = self._attachments_dir / f"{attachment_id}.bin"
+                stored_path.write_bytes(content)
+                conn.execute(
+                    "INSERT INTO lifecycle_attachments "
+                    "(attachment_id, call_id, filename, media_type, byte_count, checksum, stored_path) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (attachment_id, call_id, filename, media_type, byte_count, checksum, str(stored_path)),
+                )
+                conn.commit()
+                return {
+                    "success": True, "attachment_id": attachment_id, "filename": filename,
+                    "media_type": media_type, "byte_count": byte_count, "checksum": checksum,
+                }
+            except BaseException:
+                conn.rollback()
+                raise
+
+    def _attachment_metadata(self, conn: sqlite3.Connection, call_id: str,
+                             attachment_id: str) -> dict[str, object] | None:
+        row = conn.execute(
+            "SELECT attachment_id, filename, media_type, byte_count, checksum "
+            "FROM lifecycle_attachments WHERE call_id=? AND attachment_id=?",
+            (call_id, attachment_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "attachment_id": row["attachment_id"], "filename": row["filename"],
+            "media_type": row["media_type"], "byte_count": row["byte_count"], "checksum": row["checksum"],
+        }
+
+    def _resolve_attachments(self, conn: sqlite3.Connection, call_id: str,
+                             attachment_ids: Any) -> list[dict[str, object]]:
+        resolved: list[dict[str, object]] = []
+        if not isinstance(attachment_ids, list):
+            return resolved
+        for attachment_id in attachment_ids:
+            if not isinstance(attachment_id, str):
+                continue
+            metadata = self._attachment_metadata(conn, call_id, attachment_id)
+            if metadata is not None:
+                resolved.append(metadata)
+        return resolved
 
     def terminal_heartbeat(self, *, call_id: str, session_id: str) -> dict[str, object]:
         """Refresh liveness only for the exact session which accepted the call."""
@@ -911,7 +992,7 @@ class Application:
             await self._send(send, self._action_status(response), response); return
         if method != "POST":
             await self._send(send, 404, self._error("not_found")); return
-        if len(parts) != 5 or parts[:3] != ["", "api", "calls"] or parts[4] not in {"accept", "decline", "heartbeat", "submissions", "cancel"}:
+        if len(parts) != 5 or parts[:3] != ["", "api", "calls"] or parts[4] not in {"accept", "decline", "heartbeat", "submissions", "cancel", "attachments"}:
             await self._send(send, 404, self._error("not_found")); return
         session = self._terminal_session(headers)
         context = self._terminal_context(session) if session is not None else None
@@ -939,6 +1020,16 @@ class Application:
             response = self.lifecycle.terminal_cancel(
                 call_id=parts[3], device_id=device_id, session_id=session,
                 operation_id=operation_id,
+            )
+        elif parts[4] == "attachments":
+            body = await self._body(receive)
+            upload = self._attachment_upload(body)
+            if isinstance(upload, str):
+                await self._send(send, 400, self._error(upload)); return
+            filename, media_type, content = upload
+            response = self.lifecycle.upload_attachment(
+                call_id=parts[3], device_id=device_id, session_id=session,
+                filename=filename, media_type=media_type, content=content,
             )
         else:
             body = await self._body(receive)
@@ -1007,7 +1098,7 @@ class Application:
             if response.get("success") and cookie_mode:
                 await self._send_html(send, 200, self._render_browser_page(response, csrf_token)); return
             await self._send(send, self._action_status(response), response); return
-        if len(parts) != 4 or method != "POST" or parts[3] not in {"accept", "decline", "submissions"}:
+        if len(parts) != 4 or method != "POST" or parts[3] not in {"accept", "decline", "submissions", "attachments"}:
             await self._send(send, 404, self._error("not_found")); return
         if cookie_mode:
             if not self._browser_write_is_trusted(headers):
@@ -1030,6 +1121,18 @@ class Application:
             response = self.lifecycle.submit(
                 call_id=call_id, device_id="iphone_web", session_id=browser_session_id,
                 submission_id=submission_id, result=result,
+            ) if operator_id == self.lifecycle._operator_id else self._terminal_error("session_not_found")
+            if cookie_mode:
+                await self._send_html(send, self._action_status(response), self._render_browser_page(response, csrf_token, response)); return
+            await self._send(send, self._action_status(response), response); return
+        if parts[3] == "attachments":
+            upload = self._attachment_upload(body)
+            if isinstance(upload, str):
+                await self._send(send, 400, self._error(upload)); return
+            filename, media_type, content = upload
+            response = self.lifecycle.upload_attachment(
+                call_id=call_id, device_id="iphone_web", session_id=browser_session_id,
+                filename=filename, media_type=media_type, content=content,
             ) if operator_id == self.lifecycle._operator_id else self._terminal_error("session_not_found")
             if cookie_mode:
                 await self._send_html(send, self._action_status(response), self._render_browser_page(response, csrf_token, response)); return
@@ -1353,6 +1456,36 @@ class Application:
         try: value = json.loads(event.get("body", b""))
         except (TypeError, UnicodeDecodeError, json.JSONDecodeError): return None
         return value if isinstance(value, dict) else None
+
+    @staticmethod
+    def _attachment_upload(body: Mapping[str, object] | None) -> tuple[str, str, bytes] | str:
+        """Validate and decode an attachment upload body.
+
+        Returns ``(filename, media_type, content)`` on success, or an error
+        status string.  A local filesystem path is never an accepted source:
+        only inline base64 content is honoured, so a path-only body yields the
+        distinct ``local_path_not_accepted`` rejection.
+        """
+        if body is None:
+            return "invalid_request"
+        filename = body.get("filename")
+        media_type = body.get("media_type")
+        content = body.get("content")
+        path = body.get("path")
+        has_path = isinstance(path, str) and bool(path)
+        if not isinstance(filename, str) or not filename:
+            return "invalid_request"
+        if not isinstance(media_type, str) or not media_type:
+            media_type = "application/octet-stream"
+        if not isinstance(content, str) or not content:
+            return "local_path_not_accepted" if has_path else "invalid_request"
+        try:
+            decoded = base64.b64decode(content, validate=True)
+        except ValueError:
+            return "invalid_request"
+        if not decoded:
+            return "local_path_not_accepted" if has_path else "invalid_request"
+        return filename, media_type, decoded
 
     @staticmethod
     async def _form_body(receive: Any) -> dict[str, object] | None:
