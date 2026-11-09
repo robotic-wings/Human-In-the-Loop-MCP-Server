@@ -130,6 +130,11 @@ class WaitingLifecycle:
                 filename TEXT NOT NULL, media_type TEXT NOT NULL,
                 byte_count INTEGER NOT NULL, checksum TEXT NOT NULL, stored_path TEXT NOT NULL
               );
+              CREATE TABLE IF NOT EXISTS lifecycle_dnd (
+                operator_id TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                message TEXT NOT NULL DEFAULT ''
+              );
             """)
             self._migrate_schema(conn)
             self._settle_due(conn)
@@ -176,6 +181,15 @@ class WaitingLifecycle:
                         return self._error("request_conflict")
                     return self._load(existing["outcome_json"])
                 self._settle_due(conn)
+                dnd = self._dnd_state(conn)
+                if dnd["enabled"]:
+                    outcome = {
+                        "success": True, "status": "declined", "reason": "do_not_disturb",
+                        "message": dnd["message"], "human_action": False, "needs_continuation": False,
+                    }
+                    conn.execute("INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?, 'create')", (caller_id, request_id, encoded, self._dump(outcome)))
+                    conn.commit()
+                    return outcome
                 active = conn.execute("SELECT call_id FROM lifecycle_calls WHERE call_state IN ('ringing', 'accepted', 'in_progress') LIMIT 1").fetchone()
                 if active is not None:
                     outcome = {
@@ -211,6 +225,36 @@ class WaitingLifecycle:
         if notification is not None:
             self._notify(notification)
         return outcome
+
+    def set_dnd(self, enabled: bool, message: str) -> dict[str, object]:
+        """Persist the operator-level do-not-disturb state and auto-reply."""
+        message = message if isinstance(message, str) else ""
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "INSERT INTO lifecycle_dnd (operator_id, enabled, message) VALUES (?, ?, ?) "
+                    "ON CONFLICT(operator_id) DO UPDATE SET enabled=excluded.enabled, message=excluded.message",
+                    (self._operator_id, int(enabled), message),
+                )
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        return {"success": True, "enabled": bool(enabled), "message": message}
+
+    def get_dnd(self) -> dict[str, object]:
+        with self._connection() as conn:
+            state = self._dnd_state(conn)
+        return {"success": True, **state}
+
+    def _dnd_state(self, conn: sqlite3.Connection) -> dict[str, object]:
+        row = conn.execute(
+            "SELECT enabled, message FROM lifecycle_dnd WHERE operator_id=?", (self._operator_id,)
+        ).fetchone()
+        if row is None:
+            return {"enabled": False, "message": ""}
+        return {"enabled": bool(row["enabled"]), "message": str(row["message"])}
 
     def has_request(self, caller_id: str, request_id: str) -> bool:
         with self._connection() as conn:
@@ -1011,7 +1055,7 @@ class Application:
                 await self._send(send, 400, self._error("invalid_request")); return
             response = service.register(credential=credential, endpoint=endpoint, gui_ready=gui_ready)
             await self._send(send, 201 if response.get("success") else 401, response); return
-        if path not in {"/api/terminals/heartbeat", "/api/terminals/state"}:
+        if path not in {"/api/terminals/heartbeat", "/api/terminals/state", "/api/terminals/dnd"}:
             await self._send(send, 404, self._error("not_found")); return
         session = self._terminal_session(headers)
         if session is None:
@@ -1037,6 +1081,17 @@ class Application:
                     }
                     merged.update({str(item["call_id"]): item for item in central_states})
                     response = {**response, "states": [merged[key] for key in sorted(merged)]}
+        elif method == "POST" and path == "/api/terminals/dnd":
+            body = await self._body(receive)
+            dnd = body.get("dnd") if body is not None else None
+            message = body.get("message") if body is not None else ""
+            if not isinstance(dnd, bool):
+                await self._send(send, 400, self._error("invalid_request")); return
+            if not isinstance(message, str):
+                message = ""
+            response = self.lifecycle.set_dnd(dnd, message)
+        elif method == "GET" and path == "/api/terminals/dnd":
+            response = self.lifecycle.get_dnd()
         else:
             await self._send(send, 404, self._error("not_found")); return
         await self._send(send, self._action_status(response), response)
