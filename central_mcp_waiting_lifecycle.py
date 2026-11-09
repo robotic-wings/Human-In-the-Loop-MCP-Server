@@ -109,7 +109,12 @@ class WaitingLifecycle:
                 self._settle_due(conn)
                 active = conn.execute("SELECT call_id FROM lifecycle_calls WHERE call_state IN ('ringing', 'accepted', 'in_progress') LIMIT 1").fetchone()
                 if active is not None:
-                    outcome = {"success": True, "status": "busy", "call_state": None, "call_id": None, "needs_continuation": False}
+                    outcome = {
+                        "success": True, "status": "busy", "call_state": None, "call_id": None,
+                        "reason": None, "interaction_id": None, "human_action": False,
+                        "handled_on": None, "terminal_platform": None, "event_seq": None,
+                        "needs_continuation": False,
+                    }
                 else:
                     call_id, interaction_id = str(uuid.uuid4()), str(uuid.uuid4())
                     deadline = self._clock() + self._ring_timeout
