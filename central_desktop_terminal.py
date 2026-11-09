@@ -8,6 +8,7 @@ listener seam; it neither starts nor proxies an MCP server.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import sys
 import threading
@@ -275,8 +276,19 @@ class CentralHttpDesktopClient:
             return {"success": False, "status": "session_not_found"}
         return self._request("POST", f"/api/calls/{call_id}/{action}", json_body={"operation_id": operation_id})
 
-    def submit(self, call_id: str, submission_id: str, result: Mapping[str, object]) -> dict[str, object]:
-        return self._request("POST", f"/api/calls/{call_id}/submissions", json_body={"submission_id": submission_id, "result": dict(result)})
+    def submit(self, call_id: str, submission_id: str, result: Mapping[str, object],
+               attachment_ids: list[str] | None = None) -> dict[str, object]:
+        merged = dict(result)
+        if attachment_ids:
+            merged["attachments"] = list(attachment_ids)
+        return self._request("POST", f"/api/calls/{call_id}/submissions", json_body={"submission_id": submission_id, "result": merged})
+
+    def upload_attachment(self, call_id: str, filename: str, media_type: str, content: bytes) -> dict[str, object]:
+        return self._request("POST", f"/api/calls/{call_id}/attachments", json_body={
+            "filename": filename,
+            "media_type": media_type,
+            "content": base64.b64encode(content).decode("ascii"),
+        })
 
 
 class _TerminalListener:
@@ -335,12 +347,31 @@ class TkPresentation:
         error = tk.StringVar(value="")
         build_result = self._response_controls(dialog, tool, payload, tk)
 
+        attachment_ids: list[str] = []
+        attachment_box = tk.Listbox(dialog, height=4)
+        attachment_box.pack(padx=12, pady=(6, 0), fill="x")
+
+        def choose_files() -> None:
+            from tkinter import filedialog
+            central = self._client_ref()._central
+            for path in filedialog.askopenfilenames():
+                selected = Path(path)
+                uploaded = central.upload_attachment(
+                    call_id=call_id, filename=selected.name,
+                    media_type="application/octet-stream", content=selected.read_bytes(),
+                )
+                attachment_id = uploaded.get("attachment_id")
+                if uploaded.get("success") and isinstance(attachment_id, str):
+                    attachment_ids.append(attachment_id)
+                    attachment_box.insert("end", str(path))
+        tk.Button(dialog, text="Attach files", command=choose_files).pack(padx=12, anchor="w")
+
         def submit() -> None:
             result = build_result()
             if result is None:
                 error.set("Please complete the required response before submitting.")
                 return
-            response = self._client_ref()._central.submit(call_id, uuid.uuid4().hex, result)
+            response = self._client_ref()._central.submit(call_id, uuid.uuid4().hex, result, attachment_ids)
             if response.get("success"):
                 self._calls.pop(call_id, None)
                 dialog.destroy()
