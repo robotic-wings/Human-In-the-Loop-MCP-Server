@@ -444,6 +444,8 @@ class TkPresentation:
                 if uploaded.get("success") and isinstance(attachment_id, str):
                     attachment_ids.append(attachment_id)
                     attachment_box.insert("end", str(path))
+                else:
+                    error.set("附件上传失败，请重试。")
         tk.Button(dialog, text="Attach files", command=choose_files).pack(padx=12, anchor="w")
 
         def submit() -> None:
@@ -465,8 +467,10 @@ class TkPresentation:
 
         def report_progress() -> None:
             response = self._client_ref()._central.submit(call_id, uuid.uuid4().hex, build_progress(), attachment_ids)
-            if not response.get("success"):
-                error.set("The central service did not accept this progress report. Retry.")
+            if response.get("success"):
+                error.set("进度已上报")
+            else:
+                error.set("进度上报失败，请重试。")
         tk.Label(dialog, textvariable=error, fg="firebrick", justify="left").pack(padx=12, anchor="w")
         if build_progress is not None:
             tk.Button(dialog, text="Report progress", command=report_progress).pack(pady=(0, 12))
