@@ -132,11 +132,28 @@ class FakeWidget:
         return self
 
 
+class FakeButton:
+    def __init__(self, text: str, command: Any) -> None:
+        self.text = text
+        self.command = command
+        self.pack_calls: list[dict[str, object]] = []
+
+    def config(self, **kwargs: object) -> "FakeButton":
+        if "text" in kwargs:
+            self.text = str(kwargs["text"])
+        return self
+
+    def pack(self, **kwargs: object) -> "FakeButton":
+        self.pack_calls.append(dict(kwargs))
+        return self
+
+
 class FakeTk:
     def __init__(self) -> None:
         self.option_menus: list[dict[str, object]] = []
         self.checkbuttons: list[dict[str, object]] = []
         self.entries: list[FakeEntry] = []
+        self.buttons: list[FakeButton] = []
 
     def StringVar(self, value: str = "") -> FakeVar:
         return FakeVar(value)
@@ -159,16 +176,31 @@ class FakeTk:
         self.entries.append(entry)
         return entry
 
-    def Label(self, *_args: object, **_kwargs: object) -> object:
-        return object()
+    def Label(self, *_args: object, **_kwargs: object) -> FakeWidget:
+        return FakeWidget()
+
+    def Button(self, _root: object, **kwargs: object) -> FakeButton:
+        button = FakeButton(str(kwargs.get("text", "")), kwargs.get("command"))
+        self.buttons.append(button)
+        return button
 
 
 class FakeRing:
     def __init__(self) -> None:
         self.set_ringtone_calls: list[str] = []
+        self.stop_preview_calls: int = 0
+        self._previewing = False
 
     def set_ringtone(self, path: str) -> None:
         self.set_ringtone_calls.append(path)
+
+    def toggle_preview(self) -> bool:
+        self._previewing = not self._previewing
+        return self._previewing
+
+    def stop_preview(self) -> None:
+        self.stop_preview_calls += 1
+        self._previewing = False
 
 
 class FakeCentral:
