@@ -40,6 +40,7 @@ class DesktopTerminalClient:
         self._gui_capability = gui_capability
         self.ring = ring
         self.presenter = presenter
+        self._auto_deny = bool(self._config.get("auto_deny", False))
         self._session_id: str | None = None
         self._online = False
         self._gui_ready = False
@@ -82,6 +83,15 @@ class DesktopTerminalClient:
             return {"success": False, "status": "session_not_found"}
         if self._shown.get(call_id, -1) >= version:
             return {"success": True, "status": "duplicate", "call_id": call_id}
+        if self._auto_deny:
+            try:
+                declined = self._central.act("decline", call_id, self._session_id, uuid.uuid4().hex)
+            except (ConnectionError, OSError):
+                return self._central_lost()
+            if not declined.get("success"):
+                return {"success": False, "status": "session_not_found"}
+            self.listener.acknowledge(dict(event))
+            return {"success": True, "status": "declined", "call_id": call_id}
         try:
             state = self._central.read_call(call_id, self._session_id)
         except (ConnectionError, OSError):
@@ -180,6 +190,9 @@ class DesktopTerminalConfig:
     listener_tls_key_file: str | None = None
     verify_tls: bool | str = True
     heartbeat_seconds: float = 10.0
+    ringtone_path: str = "ringtone.mp3"
+    ringtone_alt_path: str | None = None
+    auto_deny: bool = False
 
     @property
     def listener_endpoint(self) -> str:
@@ -213,6 +226,14 @@ class DesktopTerminalConfig:
             raise ValueError("verify_tls must be true, false, or a CA bundle path")
         if normalized["terminal_credential"] == normalized["callback_credential"]:
             raise ValueError("callback_credential must differ from terminal_credential")
+        ringtone_path = normalized.get("ringtone_path", "ringtone.mp3")
+        if not isinstance(ringtone_path, str) or not ringtone_path:
+            ringtone_path = "ringtone.mp3"
+        ringtone_alt = normalized.get("ringtone_alt_path")
+        ringtone_alt_path = ringtone_alt if isinstance(ringtone_alt, str) and ringtone_alt else None
+        auto_deny = normalized.get("auto_deny", False)
+        if not isinstance(auto_deny, bool):
+            auto_deny = False
         return cls(
             central_url=central_url.rstrip("/"), terminal_credential=str(normalized["terminal_credential"]),
             callback_credential=str(normalized["callback_credential"]), listener_host=str(normalized["listener_host"]),
@@ -220,6 +241,7 @@ class DesktopTerminalConfig:
             listener_tls_cert_file=(str(normalized["listener_tls_cert_file"]) if normalized.get("listener_tls_cert_file") else None),
             listener_tls_key_file=(str(normalized["listener_tls_key_file"]) if normalized.get("listener_tls_key_file") else None),
             heartbeat_seconds=float(interval),
+            ringtone_path=ringtone_path, ringtone_alt_path=ringtone_alt_path, auto_deny=auto_deny,
         )
 
 
@@ -476,6 +498,78 @@ class SilentRing:
     def stop(self, call_id: str) -> None: del call_id
 
 
+class _PlatformPlayer:
+    """Cross-platform default ringtone backend (afplay / winsound / aplay)."""
+
+    def play(self, path: str, loop: bool = True) -> object:
+        import subprocess
+        import sys as _sys
+        if _sys.platform == "win32":
+            try:
+                import winsound
+                flags = winsound.SND_FILENAME | winsound.SND_ASYNC | (winsound.SND_LOOP if loop else 0)
+                winsound.PlaySound(path, flags)
+                return ("winsound", path)
+            except Exception:
+                return None
+        command = ["afplay"] if _sys.platform == "darwin" else (["aplay", "-q"] if loop else ["paplay"])
+        try:
+            proc = subprocess.Popen(command + [path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return proc
+        except Exception:
+            return None
+
+    def stop(self, handle: object) -> None:
+        if isinstance(handle, tuple) and handle and handle[0] == "winsound":
+            try:
+                import winsound
+                winsound.PlaySound(None, winsound.SND_PURGE)
+            except Exception:
+                pass
+            return
+        if handle is not None and hasattr(handle, "terminate"):
+            try:
+                handle.terminate()
+            except Exception:
+                pass
+
+
+class RingtonePlayer:
+    """Loop a configured ringtone file and fall back to the window bell."""
+
+    def __init__(self, ringtone_path: str, ringtone_alt_path: str | None = None,
+                 player: Any = None, bell: Any = None) -> None:
+        self._ringtone_path = ringtone_path
+        self._ringtone_alt_path = ringtone_alt_path
+        self._player = player if player is not None else _PlatformPlayer()
+        self._bell = bell
+        self._handles: dict[str, object] = {}
+
+    def start(self, call_id: str) -> None:
+        if call_id in self._handles:
+            return
+        path = self._select_ringtone()
+        if path is None:
+            if self._bell is not None:
+                self._bell()
+            return
+        handle = self._player.play(path, loop=True)
+        if handle is not None:
+            self._handles[call_id] = handle
+
+    def stop(self, call_id: str) -> None:
+        handle = self._handles.pop(call_id, None)
+        if handle is not None:
+            self._player.stop(handle)
+
+    def _select_ringtone(self) -> str | None:
+        if self._ringtone_path and Path(self._ringtone_path).is_file():
+            return self._ringtone_path
+        if self._ringtone_alt_path and Path(self._ringtone_alt_path).is_file():
+            return self._ringtone_alt_path
+        return None
+
+
 def _callback_app(client: DesktopTerminalClient) -> Callable[..., Any]:
     async def app(scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope.get("type") != "http" or scope.get("method") != "POST" or scope.get("path") != "/terminal/events":
@@ -514,7 +608,8 @@ def main(argv: list[str] | None = None) -> None:
     central = CentralHttpDesktopClient(config)
     holder: dict[str, DesktopTerminalClient] = {}
     presenter = TkPresentation(root, lambda: holder["client"])
-    client = DesktopTerminalClient(config={"terminal_credential": config.terminal_credential, "callback_credential": config.callback_credential}, central=central, listener=_TerminalListener(), gui_capability=lambda: True, ring=SilentRing(), presenter=presenter)
+    ring = RingtonePlayer(ringtone_path=config.ringtone_path, ringtone_alt_path=config.ringtone_alt_path, bell=root.bell)
+    client = DesktopTerminalClient(config={"terminal_credential": config.terminal_credential, "callback_credential": config.callback_credential, "auto_deny": config.auto_deny}, central=central, listener=_TerminalListener(), gui_capability=lambda: True, ring=ring, presenter=presenter)
     holder["client"] = client
     if config.listener_scheme == "https" and (not config.listener_tls_cert_file or not config.listener_tls_key_file):
         raise SystemExit("desktop terminal unavailable: HTTPS listener requires listener_tls_cert_file and listener_tls_key_file")
