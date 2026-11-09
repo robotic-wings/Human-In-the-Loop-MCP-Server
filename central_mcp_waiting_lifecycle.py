@@ -525,22 +525,80 @@ class WaitingLifecycle:
                         (call_id,),
                     ).fetchone()
                     return self._load(event["body_json"]) if event is not None else self._error("expired")
+                status, state, needs_continuation, extras = self._interpret_submission(result)
                 conn.execute(
-                    "UPDATE lifecycle_calls SET call_state='answered', reason=NULL, version=version+1 WHERE call_id=?",
-                    (call_id,),
+                    "UPDATE lifecycle_calls SET call_state=?, reason=NULL, version=version+1 WHERE call_id=?",
+                    (state, call_id),
                 )
                 seq = int(conn.execute(
                     "SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call_id,)
                 ).fetchone()["n"])
                 outcome: dict[str, object] = {
-                    "success": True, "status": "answered", "call_state": "answered", "human_action": True,
-                    "needs_continuation": False, "interaction_id": call["interaction_id"], "call_id": call_id,
+                    "success": True, "status": status, "call_state": state, "human_action": True,
+                    "needs_continuation": needs_continuation, "interaction_id": call["interaction_id"], "call_id": call_id,
                     "event_seq": seq, "handled_on": call["handled_on"],
                     "terminal_platform": call["terminal_platform"], "result": dict(result),
                 }
+                outcome.update(extras)
                 conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call_id, seq, self._dump(outcome)))
                 conn.execute("INSERT INTO lifecycle_submissions VALUES (?, ?, ?, ?, ?)",
                              (call_id, submission_id, actor, encoded, self._dump(outcome)))
+                conn.commit()
+                return outcome
+            except BaseException:
+                conn.rollback()
+                raise
+
+    def terminal_cancel(self, *, call_id: str, device_id: str, session_id: str,
+                        operation_id: str) -> dict[str, object]:
+        """Cancel an accepted call from its exact owning terminal session.
+
+        A human cancellation is an immutable terminal event distinct from an
+        Agent cancellation: it records ``reason='human_cancelled'`` with
+        ``human_action=True`` and releases the single busy slot.
+        """
+        actor = f"terminal_cancel:{session_id}"
+        encoded = self._dump({"call_id": call_id})
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = conn.execute(
+                    "SELECT payload_json, outcome_json, operation_kind FROM lifecycle_requests "
+                    "WHERE caller_id=? AND request_id=?",
+                    (actor, operation_id),
+                ).fetchone()
+                if existing is not None:
+                    if existing["operation_kind"] != "terminal_cancel" or existing["payload_json"] != encoded:
+                        return self._error("request_conflict")
+                    return self._load(existing["outcome_json"])
+                self._settle_due(conn)
+                call = conn.execute("SELECT * FROM lifecycle_calls WHERE call_id=?", (call_id,)).fetchone()
+                if call is None or call["owner_device_id"] != device_id or call["owner_session_id"] != session_id:
+                    return self._error("session_not_found")
+                if call["call_state"] not in {"accepted", "in_progress"}:
+                    event = conn.execute(
+                        "SELECT body_json FROM lifecycle_events WHERE call_id=? ORDER BY event_seq DESC LIMIT 1",
+                        (call_id,),
+                    ).fetchone()
+                    outcome = self._load(event["body_json"]) if event is not None else self._error("expired")
+                else:
+                    conn.execute(
+                        "UPDATE lifecycle_calls SET call_state='cancelled', reason='human_cancelled', version=version+1 WHERE call_id=?",
+                        (call_id,),
+                    )
+                    seq = int(conn.execute(
+                        "SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?",
+                        (call_id,),
+                    ).fetchone()["n"])
+                    outcome: dict[str, object] = {
+                        "success": True, "status": "cancelled", "call_state": "cancelled",
+                        "reason": "human_cancelled", "human_action": True, "needs_continuation": False,
+                        "interaction_id": call["interaction_id"], "call_id": call_id, "event_seq": seq,
+                        "handled_on": call["handled_on"], "terminal_platform": call["terminal_platform"],
+                    }
+                    conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call_id, seq, self._dump(outcome)))
+                conn.execute("INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?, ?)",
+                             (actor, operation_id, encoded, self._dump(outcome), "terminal_cancel"))
                 conn.commit()
                 return outcome
             except BaseException:
@@ -666,6 +724,23 @@ class WaitingLifecycle:
             body = self._terminal(call["interaction_id"], call["call_id"], "disconnected", "agent_disconnected", seq)
             body["human_action"] = False
             conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call["call_id"], seq, self._dump(body)))
+
+    @staticmethod
+    def _interpret_submission(result: Mapping[str, object]) -> tuple[str, str, bool, dict[str, object]]:
+        """Map a task-family result onto its top-level status, state and flags.
+
+        A task report carries its own ``status``; a progress report holds the
+        round in ``in_progress`` with ``needs_continuation``.  Any other result
+        keeps the established single-answer ``answered`` behaviour.
+        """
+        status = result.get("status")
+        if status == "completed":
+            return "completed", "completed", False, {"report": result.get("report"), "resubmittable": True}
+        if status == "failed":
+            return "failed", "failed", False, {"report": result.get("report"), "resubmittable": True}
+        if status == "in_progress":
+            return "in_progress", "in_progress", True, {"progress": result.get("progress")}
+        return "answered", "answered", False, {}
 
     @staticmethod
     def _heartbeat(interaction_id: str, call_id: str, state: str) -> dict[str, object]:
@@ -831,7 +906,7 @@ class Application:
             await self._send(send, self._action_status(response), response); return
         if method != "POST":
             await self._send(send, 404, self._error("not_found")); return
-        if len(parts) != 5 or parts[:3] != ["", "api", "calls"] or parts[4] not in {"accept", "decline", "heartbeat", "submissions"}:
+        if len(parts) != 5 or parts[:3] != ["", "api", "calls"] or parts[4] not in {"accept", "decline", "heartbeat", "submissions", "cancel"}:
             await self._send(send, 404, self._error("not_found")); return
         session = self._terminal_session(headers)
         context = self._terminal_context(session) if session is not None else None
@@ -850,6 +925,15 @@ class Application:
             response = self.lifecycle.submit(
                 call_id=parts[3], device_id=device_id, session_id=session,
                 submission_id=submission_id, result=result,
+            )
+        elif parts[4] == "cancel":
+            body = await self._body(receive)
+            operation_id = body.get("operation_id") if body is not None else None
+            if not isinstance(operation_id, str) or not operation_id:
+                await self._send(send, 400, self._error("invalid_request")); return
+            response = self.lifecycle.terminal_cancel(
+                call_id=parts[3], device_id=device_id, session_id=session,
+                operation_id=operation_id,
             )
         else:
             body = await self._body(receive)
