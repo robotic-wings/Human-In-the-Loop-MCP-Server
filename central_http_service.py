@@ -633,7 +633,7 @@ def _runtime_dependencies(
         if not config.bark_endpoint or not config.bark_credential:
             return {"http_status": 503, "business_success": False}
         body = {**payload, "device_key": config.bark_credential}
-        async with httpx.AsyncClient(timeout=2.5) as client:
+        async with httpx.AsyncClient(timeout=2.5, trust_env=False) as client:
             response = await client.post(config.bark_endpoint, json=body)
         try:
             content = response.json()
@@ -648,7 +648,7 @@ def _runtime_dependencies(
         if not isinstance(endpoint, str) or not endpoint or not isinstance(credential, str) or not credential:
             return {"accepted": False}
         body = {key: value for key, value in payload.items() if key not in {"endpoint", "callback_credential"}}
-        async with httpx.AsyncClient(timeout=2.5) as client:
+        async with httpx.AsyncClient(timeout=2.5, trust_env=False) as client:
             response = await client.post(endpoint, json=body, headers={"x-central-callback": credential})
         return {"accepted": 200 <= response.status_code < 300}
 
