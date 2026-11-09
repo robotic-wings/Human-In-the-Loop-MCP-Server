@@ -672,6 +672,33 @@ def _callback_app(client: DesktopTerminalClient) -> Callable[..., Any]:
     return app
 
 
+def run_heartbeat_tick(central: Any, client: Any, *, callback_credential: str | None,
+                       heartbeat_seconds: float, run_worker: Callable[[Callable[[], None]], None],
+                       schedule_ui: Callable[[int, Callable[[], None]], None]) -> None:
+    """Run one heartbeat/sync group off the UI thread and re-arm the next tick."""
+
+    def next_tick() -> None:
+        run_heartbeat_tick(
+            central, client,
+            callback_credential=callback_credential,
+            heartbeat_seconds=heartbeat_seconds,
+            run_worker=run_worker,
+            schedule_ui=schedule_ui,
+        )
+
+    def network_group() -> None:
+        try:
+            central.heartbeat()
+            for state in central.synchronize():
+                client.receive_notification(state, callback_credential=callback_credential)
+            client.sync()
+        except ConnectionError:
+            schedule_ui(0, client._central_lost)
+
+    run_worker(network_group)
+    schedule_ui(int(heartbeat_seconds * 1000), next_tick)
+
+
 def main(argv: list[str] | None = None) -> None:
     """Run the independent desktop terminal; it never starts an MCP endpoint."""
     parser = argparse.ArgumentParser(prog="hitl-desktop-terminal")
@@ -704,16 +731,18 @@ def main(argv: list[str] | None = None) -> None:
     if not started.get("success"):
         server.should_exit = True
         raise SystemExit(f"desktop terminal unavailable: {started.get('status')}")
-    def tick() -> None:
-        try:
-            central.heartbeat()
-            for state in central.synchronize():
-                client.receive_notification(state, callback_credential=config.callback_credential)
-            client.sync()
-        except ConnectionError:
-            client._central_lost()
-        root.after(int(config.heartbeat_seconds * 1000), tick)
-    root.deiconify(); root.title("HITL Desktop Terminal"); root.after(0, tick)
+
+    def run_worker(fn: Callable[[], None]) -> None:
+        threading.Thread(target=fn, daemon=True, name="hitl-heartbeat").start()
+
+    run_heartbeat_tick(
+        central, client,
+        callback_credential=config.callback_credential,
+        heartbeat_seconds=config.heartbeat_seconds,
+        run_worker=run_worker,
+        schedule_ui=root.after,
+    )
+    root.deiconify(); root.title("HITL Desktop Terminal")
     try:
         root.mainloop()
     finally:
