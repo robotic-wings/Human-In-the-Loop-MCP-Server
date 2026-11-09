@@ -260,6 +260,7 @@ def test_upload_rejects_local_path_without_content(tmp_path: Path) -> None:
     response = request(app, "POST", f"/api/calls/{call['call_id']}/attachments", terminal=owner, body={
         "filename": "secret.png", "path": "C:\\Users\\operator\\secret.png",
     })
-    assert response.status_code in {400, 401, 404}
+    assert response.status_code == 400
     assert response.json()["success"] is False
+    assert response.json()["status"] == "local_path_not_accepted"
     assert "attachment_id" not in response.json()
