@@ -1187,7 +1187,17 @@ class Application:
             expected_host = expected.split("://", 1)[1]
         except IndexError:
             return False
-        return hmac.compare_digest(origin or "", expected) and hmac.compare_digest(host or "", expected_host)
+        # The Host header is always present and anchors the request to the
+        # configured central origin.  ``Origin`` is an optional second signal:
+        # in-app iPhone browsers may omit it on same-origin form posts, and the
+        # synchronizer token (login entry cookie / per-form CSRF value) is the
+        # durable cross-site defence.  Reject a mismatched Origin only when one
+        # is actually supplied.
+        if not hmac.compare_digest(host or "", expected_host):
+            return False
+        if origin is not None and not hmac.compare_digest(origin, expected):
+            return False
+        return True
 
     def _render_browser_page(self, view: Mapping[str, object], csrf_token: str,
                              action_response: Mapping[str, object] | None = None) -> str:

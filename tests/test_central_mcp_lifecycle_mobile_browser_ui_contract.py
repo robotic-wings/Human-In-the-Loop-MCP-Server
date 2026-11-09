@@ -375,6 +375,29 @@ def test_configured_bark_call_link_establishes_authenticated_cookie_without_expo
     assert call["call_id"] not in foreign.text
 
 
+def test_login_entry_succeeds_without_origin_header_for_inapp_browser(tmp_path: Path) -> None:
+    """An in-app iPhone browser may omit Origin on a same-origin form post.
+
+    The one-time login-entry cookie plus the always-present Host header are the
+    durable cross-site defences; a missing Origin must not turn a valid login
+    into ``session_not_found``.
+    """
+    app = _configured_lifecycle_app(tmp_path)
+    call = _create(app, request_id="no-origin-login")
+    call_path = f"/calls/{call['call_id']}"
+
+    entry = _request(app, "GET", call_path)
+    entry_token = entry.headers["set-cookie"].split("browser_entry=", 1)[1].split(";", 1)[0]
+
+    established = _request(
+        app, "POST", "/operator/login", raw_cookie=f"browser_entry={entry_token}",
+        form={"credential": "operator-login-secret"},
+        headers={"host": "central.example.test"},
+    )
+    assert established.status_code in {302, 303}
+    assert established.headers["location"] == call_path
+
+
 def test_configured_operator_identity_is_derived_from_login_sessions_not_hardcoded(tmp_path: Path) -> None:
     """A real operator identity must own its call, not a hardcoded literal.
 
