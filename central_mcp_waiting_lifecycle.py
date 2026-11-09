@@ -28,6 +28,66 @@ Notifier = Callable[[dict[str, object]], None]
 RouteAdmission = Callable[[], Mapping[str, object]]
 
 
+class _RpcError(Exception):
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(message)
+        self.code, self.message = code, message
+
+
+_MCP_TOOLS = (
+    {"name": "get_user_input", "kind": "interaction",
+     "description": "Request a single text or numeric answer from the operator.",
+     "inputSchema": {"type": "object", "properties": {
+         "prompt": {"type": "string"}, "required": {"type": "boolean"},
+         "interaction_id": {"type": "string"}, "call_id": {"type": "string"},
+         "after_event_seq": {"type": "integer"}}}},
+    {"name": "get_user_choice", "kind": "interaction",
+     "description": "Ask the operator to choose one or more options.",
+     "inputSchema": {"type": "object", "properties": {
+         "choices": {"type": "array"}, "prompt": {"type": "string"},
+         "multiple": {"type": "boolean"}, "interaction_id": {"type": "string"},
+         "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}}}},
+    {"name": "get_multiline_input", "kind": "interaction",
+     "description": "Request a free-form multi-line answer from the operator.",
+     "inputSchema": {"type": "object", "properties": {
+         "prompt": {"type": "string"}, "interaction_id": {"type": "string"},
+         "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}}}},
+    {"name": "show_confirmation_dialog", "kind": "interaction",
+     "description": "Ask the operator to confirm or deny a proposal.",
+     "inputSchema": {"type": "object", "properties": {
+         "prompt": {"type": "string"}, "interaction_id": {"type": "string"},
+         "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}}}},
+    {"name": "show_info_message", "kind": "interaction",
+     "description": "Present information and require the operator to acknowledge it.",
+     "inputSchema": {"type": "object", "properties": {
+         "message": {"type": "string"}, "interaction_id": {"type": "string"},
+         "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}}}},
+    {"name": "get_feedback_from_user", "kind": "interaction",
+     "description": "Request unstructured feedback from the operator.",
+     "inputSchema": {"type": "object", "properties": {
+         "prompt": {"type": "string"}, "interaction_id": {"type": "string"},
+         "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}}}},
+    {"name": "assign_task_to_human", "kind": "interaction",
+     "description": "Assign a task for the operator to perform and report on.",
+     "inputSchema": {"type": "object", "properties": {
+         "task_description": {"type": "string"}, "interaction_id": {"type": "string"},
+         "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}}}},
+    {"name": "get_operator_profile", "kind": "readonly",
+     "description": "Read the operator profile without requesting human action.",
+     "inputSchema": {"type": "object"}},
+    {"name": "health_check", "kind": "readonly",
+     "description": "Report central service health without requesting human action.",
+     "inputSchema": {"type": "object"}},
+    {"name": "get_human_loop_prompt", "kind": "readonly",
+     "description": "Return the human-in-the-loop protocol guidance.",
+     "inputSchema": {"type": "object"}},
+    {"name": "cancel_interaction", "kind": "control",
+     "description": "Cancel an existing call round.",
+     "inputSchema": {"type": "object", "properties": {
+         "interaction_id": {"type": "string"}, "call_id": {"type": "string"}}}},
+)
+
+
 class WaitingLifecycle:
     def __init__(self, path: str | Path, clock: Clock, notify: Notifier, ring_timeout: float,
                  agent_reconnect_seconds: float, terminal_disconnect_seconds: float = 180,
@@ -922,6 +982,8 @@ class Application:
         body = await self._body(receive)
         if body is None:
             await self._send(send, 400, self._error("invalid_request")); return
+        if "jsonrpc" in body or "method" in body or "id" in body:
+            await self._send(send, 200, self._rpc(caller, body)); return
         timeout = body.get("client_timeout_seconds")
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 2:
             await self._send(send, 400, self._error("invalid_client_timeout")); return
@@ -1290,6 +1352,117 @@ class Application:
         while True:
             await self._notification_scheduler_sleep(self._notification_dispatch_tick_seconds)
             await self.dispatch_notification_delivery()
+
+    def _rpc(self, caller: str, body: Mapping[str, object]) -> dict[str, object]:
+        rid = body.get("id")
+        jsonrpc = body.get("jsonrpc")
+        method = body.get("method")
+        if jsonrpc != "2.0":
+            return self._rpc_error(rid, -32600, "Invalid Request")
+        if not isinstance(method, str) or not method:
+            return self._rpc_error(rid, -32600, "Invalid Request")
+        try:
+            if method == "initialize":
+                result = self._rpc_initialize()
+            elif method == "tools/list":
+                result = {"tools": self._tool_catalog()}
+            elif method == "tools/call":
+                result = self._rpc_tools_call(caller, body.get("params"), rid)
+            else:
+                return self._rpc_error(rid, -32601, "Method not found")
+        except _RpcError as error:
+            return self._rpc_error(rid, error.code, error.message)
+        return {"jsonrpc": "2.0", "id": rid, "result": result}
+
+    @staticmethod
+    def _rpc_initialize() -> dict[str, object]:
+        return {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "hitl-central-mcp", "version": "1.0.0"},
+        }
+
+    @staticmethod
+    def _tool_catalog() -> list[dict[str, object]]:
+        return [
+            {"name": tool["name"], "description": tool["description"], "inputSchema": tool["inputSchema"]}
+            for tool in _MCP_TOOLS
+        ]
+
+    @staticmethod
+    def _tool_by_name(name: str) -> dict[str, object] | None:
+        for tool in _MCP_TOOLS:
+            if tool["name"] == name:
+                return tool
+        return None
+
+    def _rpc_tools_call(self, caller: str, params: object, rid: object) -> dict[str, object]:
+        if not isinstance(params, Mapping):
+            raise _RpcError(-32602, "Invalid params")
+        name = params.get("name")
+        if not isinstance(name, str) or not name:
+            raise _RpcError(-32602, "Invalid params")
+        tool = self._tool_by_name(name)
+        if tool is None:
+            raise _RpcError(-32602, "Invalid params")
+        arguments = params.get("arguments")
+        if not isinstance(arguments, Mapping):
+            arguments = {}
+        kind = tool["kind"]
+        if kind == "interaction":
+            structured = self._rpc_interaction(caller, name, arguments, rid)
+        elif kind == "control":
+            structured = self._rpc_cancel(caller, arguments, rid)
+        else:
+            structured = self._rpc_readonly(name)
+        return {
+            "content": [{"type": "text", "text": self._rpc_summary(name, structured)}],
+            "isError": False,
+            "structuredContent": structured,
+        }
+
+    def _rpc_interaction(self, caller: str, name: str, arguments: Mapping[str, object], rid: object) -> dict[str, object]:
+        request_id = f"rpc-{rid}"
+        interaction_id = arguments.get("interaction_id")
+        call_id = arguments.get("call_id")
+        if isinstance(interaction_id, str) and interaction_id and isinstance(call_id, str) and call_id:
+            after = arguments.get("after_event_seq", 0)
+            if isinstance(after, bool) or not isinstance(after, int):
+                raise _RpcError(-32602, "Invalid params")
+            result = self.lifecycle.continue_call(caller, request_id, interaction_id, call_id, after)
+        else:
+            payload = {"tool": name, **dict(arguments)}
+            result = self.lifecycle.create(
+                caller, request_id, payload, self._invited_desktop_id(), self._mobile_eligible(),
+            )
+        if result is None:
+            result = {"success": False, "status": "session_not_found", "needs_continuation": False}
+        return dict(result)
+
+    def _rpc_cancel(self, caller: str, arguments: Mapping[str, object], rid: object) -> dict[str, object]:
+        interaction_id = arguments.get("interaction_id")
+        call_id = arguments.get("call_id")
+        if not isinstance(interaction_id, str) or not interaction_id or not isinstance(call_id, str) or not call_id:
+            raise _RpcError(-32602, "Invalid params")
+        return dict(self.lifecycle.cancel(caller, f"rpc-{rid}", interaction_id, call_id))
+
+    def _rpc_readonly(self, name: str) -> dict[str, object]:
+        if name == "get_operator_profile":
+            return {"success": True, "status": "ok", "operator_id": self.lifecycle._operator_id}
+        if name == "health_check":
+            return {"success": True, "status": "healthy", "storage": "sqlite", "scheduler": "ready"}
+        if name == "get_human_loop_prompt":
+            return {"success": True, "status": "ok", "prompt": "Use tools/call to request human action; continue with interaction_id and call_id."}
+        raise _RpcError(-32602, "Invalid params")
+
+    @staticmethod
+    def _rpc_summary(name: str, structured: Mapping[str, object]) -> str:
+        status = structured.get("status", structured.get("call_state", "ok"))
+        return f"{name}: {status}"
+
+    @staticmethod
+    def _rpc_error(rid: object, code: int, message: str) -> dict[str, object]:
+        return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}
 
     def _dispatch(self, caller: str, body: Mapping[str, object]) -> tuple[dict[str, object], bool]:
         request_id = body.get("request_id")
