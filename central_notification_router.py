@@ -88,8 +88,13 @@ class TerminalRegistry:
         return self._state(row)
 
     def ready_desktop(self) -> dict[str, object] | None:
+        fresh_cutoff = self._clock() - 30
         with self._store.connection() as conn:
-            row = conn.execute("SELECT * FROM desktop_terminals ORDER BY device_id LIMIT 1").fetchone()
+            row = conn.execute(
+                "SELECT * FROM desktop_terminals WHERE gui_ready=1 AND last_seen>=? "
+                "ORDER BY device_id LIMIT 1",
+                (fresh_cutoff,),
+            ).fetchone()
         return self._state(row)
 
     def _state(self, row: sqlite3.Row | None) -> dict[str, object] | None:
