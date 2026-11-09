@@ -1,19 +1,17 @@
-"""Red contract for the desktop terminal ringtone picker GUI wiring.
+"""Contract for the desktop terminal ringtone picker GUI wiring.
 
-The contract seams ``scan_ringtones``, ``RingtonePlayer.set_ringtone`` and
-``DesktopTerminalClient.set_auto_deny`` already exist, but ``main()`` still has
-no settings panel: the main window is empty, with no ringtone dropdown and no
-do-not-disturb toggle.  These tests pin an extractable, headless-testable
-build function that the main window calls:
+The contract seams ``scan_ringtones`` and ``RingtonePlayer.set_ringtone`` exist,
+and ``main()`` must render a settings panel.  These tests pin an extractable,
+headless-testable build function that the main window calls:
 
-``build_settings_panel(root, ring, client, ringtones_dir, mp3s, initial_ringtone, auto_deny, tk)``
+``build_settings_panel(root, ring, central, ringtones_dir, mp3s, initial_ringtone, tk)``
 
 It must create a ``tk.OptionMenu`` whose options are the ``*.mp3`` filenames
 and a ``tk.Checkbutton`` labelled 勿扰模式（来电自动拒绝）, preselect the
-filename matching ``initial_ringtone`` (or the first filename), initialise the
-checkbutton from ``auto_deny``, and wire a ringtone change to
-``ring.set_ringtone(os.path.join(ringtones_dir, <selected filename>))`` and a
-checkbutton change to ``client.set_auto_deny``.
+filename matching ``initial_ringtone`` (or the first filename), and wire a
+ringtone change to ``ring.set_ringtone(os.path.join(ringtones_dir, <selected
+filename>))``.  Do-not-disturb is driven through ``central`` (covered by the
+central DND contract) rather than a local toggle.
 """
 
 from __future__ import annotations
@@ -54,10 +52,24 @@ class FakeWidget:
         return self
 
 
+class FakeEntry:
+    def __init__(self) -> None:
+        self._text = ""
+        self.pack_calls: list[dict[str, object]] = []
+
+    def get(self) -> str:
+        return self._text
+
+    def pack(self, **kwargs: object) -> "FakeEntry":
+        self.pack_calls.append(dict(kwargs))
+        return self
+
+
 class FakeTk:
     def __init__(self) -> None:
         self.option_menus: list[dict[str, object]] = []
         self.checkbuttons: list[dict[str, object]] = []
+        self.entries: list[FakeEntry] = []
 
     def StringVar(self, value: str = "") -> FakeVar:
         return FakeVar(value)
@@ -75,6 +87,11 @@ class FakeTk:
         self.checkbuttons.append({**dict(kwargs), "widget": widget})
         return widget
 
+    def Entry(self, *_args: object, **_kwargs: object) -> FakeEntry:
+        entry = FakeEntry()
+        self.entries.append(entry)
+        return entry
+
     def Label(self, *_args: object, **_kwargs: object) -> object:
         return object()
 
@@ -87,18 +104,23 @@ class FakeRing:
         self.set_ringtone_calls.append(path)
 
 
-class FakeClient:
+class FakeCentral:
     def __init__(self) -> None:
-        self.set_auto_deny_calls: list[bool] = []
+        self.set_dnd_calls: list[tuple[bool, str]] = []
+        self.get_dnd_calls: int = 0
 
-    def set_auto_deny(self, enabled: bool) -> None:
-        self.set_auto_deny_calls.append(enabled)
+    def set_dnd(self, enabled: bool, message: str) -> None:
+        self.set_dnd_calls.append((enabled, message))
+
+    def get_dnd(self) -> dict[str, object]:
+        self.get_dnd_calls += 1
+        return {"enabled": False, "message": ""}
 
 
 def test_build_settings_panel_creates_option_menu_and_checkbutton() -> None:
     build_settings_panel = _build()
     tk = FakeTk()
-    build_settings_panel(None, FakeRing(), FakeClient(), "/sounds", ["alpha.mp3", "beta.mp3"], "/sounds/beta.mp3", False, tk)
+    build_settings_panel(None, FakeRing(), FakeCentral(), "/sounds", ["alpha.mp3", "beta.mp3"], "/sounds/beta.mp3", tk)
 
     assert len(tk.option_menus) == 1
     assert tk.option_menus[0]["options"] == ["alpha.mp3", "beta.mp3"]
@@ -111,31 +133,19 @@ def test_build_settings_panel_creates_option_menu_and_checkbutton() -> None:
 def test_initial_selection_matches_ringtone_path_or_first() -> None:
     build_settings_panel = _build()
     matching = FakeTk()
-    build_settings_panel(None, FakeRing(), FakeClient(), "/sounds", ["alpha.mp3", "beta.mp3"], "/sounds/beta.mp3", False, matching)
+    build_settings_panel(None, FakeRing(), FakeCentral(), "/sounds", ["alpha.mp3", "beta.mp3"], "/sounds/beta.mp3", matching)
     assert matching.option_menus[0]["variable"].get() == "beta.mp3"
-    assert matching.checkbuttons[0]["variable"].get() is False
 
     missing = FakeTk()
-    build_settings_panel(None, FakeRing(), FakeClient(), "/sounds", ["alpha.mp3", "beta.mp3"], "/sounds/missing.mp3", True, missing)
+    build_settings_panel(None, FakeRing(), FakeCentral(), "/sounds", ["alpha.mp3", "beta.mp3"], "/sounds/missing.mp3", missing)
     assert missing.option_menus[0]["variable"].get() == "alpha.mp3"
-    assert missing.checkbuttons[0]["variable"].get() is True
 
 
 def test_option_menu_change_calls_set_ringtone_with_full_path() -> None:
     build_settings_panel = _build()
     tk = FakeTk()
     ring = FakeRing()
-    build_settings_panel(None, ring, FakeClient(), "/sounds", ["alpha.mp3", "beta.mp3"], "/sounds/alpha.mp3", False, tk)
+    build_settings_panel(None, ring, FakeCentral(), "/sounds", ["alpha.mp3", "beta.mp3"], "/sounds/alpha.mp3", tk)
 
     tk.option_menus[0]["variable"].set("beta.mp3")
     assert ring.set_ringtone_calls == [os.path.join("/sounds", "beta.mp3")]
-
-
-def test_checkbutton_change_calls_set_auto_deny() -> None:
-    build_settings_panel = _build()
-    tk = FakeTk()
-    client = FakeClient()
-    build_settings_panel(None, FakeRing(), client, "/sounds", ["alpha.mp3"], "/sounds/alpha.mp3", False, tk)
-
-    tk.checkbuttons[0]["variable"].set(True)
-    assert client.set_auto_deny_calls == [True]
