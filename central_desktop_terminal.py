@@ -72,6 +72,9 @@ class DesktopTerminalClient:
     def status(self) -> dict[str, object]:
         return {"gui_ready": self._gui_ready, "online": self._online}
 
+    def set_auto_deny(self, enabled: bool) -> None:
+        self._auto_deny = bool(enabled)
+
     def receive_notification(
         self, event: Mapping[str, object], *, callback_credential: str | None
     ) -> dict[str, object]:
@@ -193,6 +196,7 @@ class DesktopTerminalConfig:
     ringtone_path: str = "ringtone.mp3"
     ringtone_alt_path: str | None = None
     auto_deny: bool = False
+    ringtones_dir: str = "ringtones"
 
     @property
     def listener_endpoint(self) -> str:
@@ -234,6 +238,9 @@ class DesktopTerminalConfig:
         auto_deny = normalized.get("auto_deny", False)
         if not isinstance(auto_deny, bool):
             auto_deny = False
+        ringtones_dir = normalized.get("ringtones_dir", "ringtones")
+        if not isinstance(ringtones_dir, str) or not ringtones_dir:
+            ringtones_dir = "ringtones"
         return cls(
             central_url=central_url.rstrip("/"), terminal_credential=str(normalized["terminal_credential"]),
             callback_credential=str(normalized["callback_credential"]), listener_host=str(normalized["listener_host"]),
@@ -242,7 +249,16 @@ class DesktopTerminalConfig:
             listener_tls_key_file=(str(normalized["listener_tls_key_file"]) if normalized.get("listener_tls_key_file") else None),
             heartbeat_seconds=float(interval),
             ringtone_path=ringtone_path, ringtone_alt_path=ringtone_alt_path, auto_deny=auto_deny,
+            ringtones_dir=ringtones_dir,
         )
+
+
+def scan_ringtones(directory: str) -> list[str]:
+    """Return the sorted ``*.mp3`` filenames present in a directory."""
+    path = Path(directory)
+    if not path.is_dir():
+        return []
+    return sorted(entry.name for entry in path.glob("*.mp3") if entry.is_file())
 
 
 class CentralHttpDesktopClient:
@@ -556,6 +572,9 @@ class RingtonePlayer:
         handle = self._player.play(path, loop=True)
         if handle is not None:
             self._handles[call_id] = handle
+
+    def set_ringtone(self, path: str) -> None:
+        self._ringtone_path = path
 
     def stop(self, call_id: str) -> None:
         handle = self._handles.pop(call_id, None)
