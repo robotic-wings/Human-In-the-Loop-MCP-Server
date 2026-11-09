@@ -231,6 +231,11 @@ def test_decline_is_terminal_releases_busy_and_authoritative_terminal_state_is_v
     assert declined.json()["reason"] == "human_declined"
     assert declined.json()["human_action"] is True
     assert declined.json()["needs_continuation"] is False
+    assert declined.json()["acted_on"] == "desktop"
+    assert declined.json()["handled_on"] is None
+    assert declined.json()["terminal_platform"] is None
+    assert declined.json()["retryable"] is False
+    assert "resubmittable" not in declined.json()
     state = _request(app, "GET", "/api/terminals/state", session=session)
     assert state.status_code == 200
     assert state.json()["states"] == [{

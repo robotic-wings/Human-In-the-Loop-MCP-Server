@@ -229,6 +229,11 @@ def test_web_decline_releases_busy_and_auth_or_route_failures_are_opaque_and_ine
     assert declined.status_code == 200
     assert declined.json()["call_state"] == "declined"
     assert declined.json()["reason"] == "human_declined"
+    assert declined.json()["acted_on"] == "iphone_web"
+    assert declined.json()["handled_on"] is None
+    assert declined.json()["terminal_platform"] is None
+    assert declined.json()["retryable"] is False
+    assert "resubmittable" not in declined.json()
     replacement = _create(app, "after-iphone-decline")
     assert replacement["call_state"] == "ringing"
 
