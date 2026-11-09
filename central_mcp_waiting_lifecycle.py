@@ -97,11 +97,17 @@ _MCP_TOOLS = (
 class WaitingLifecycle:
     def __init__(self, path: str | Path, clock: Clock, notify: Notifier, ring_timeout: float,
                  agent_reconnect_seconds: float, terminal_disconnect_seconds: float = 180,
-                 operator_id: str = "only-operator") -> None:
+                 operator_id: str = "only-operator",
+                 max_attachment_bytes: int = 20 * 1024 * 1024,
+                 max_submission_bytes: int = 50 * 1024 * 1024,
+                 max_storage_bytes: int = 1024 * 1024 * 1024) -> None:
         self._path, self._clock, self._notify = str(path), clock, notify
         self._ring_timeout, self._agent_reconnect_seconds = ring_timeout, agent_reconnect_seconds
         self._terminal_disconnect_seconds = terminal_disconnect_seconds
         self._operator_id = operator_id
+        self._max_attachment_bytes = max_attachment_bytes
+        self._max_submission_bytes = max_submission_bytes
+        self._max_storage_bytes = max_storage_bytes
         self._attachments_dir = Path(self._path).parent / "attachments"
         Path(self._path).parent.mkdir(parents=True, exist_ok=True)
         self._attachments_dir.mkdir(parents=True, exist_ok=True)
@@ -754,6 +760,19 @@ class WaitingLifecycle:
                     return self._error("session_not_found")
                 if call["call_state"] not in {"accepted", "in_progress"}:
                     return self._error("expired")
+                if len(content) > self._max_attachment_bytes:
+                    return self._error("attachment_too_large")
+                submission_total = int(conn.execute(
+                    "SELECT COALESCE(SUM(byte_count), 0) FROM lifecycle_attachments WHERE call_id=?",
+                    (call_id,),
+                ).fetchone()[0])
+                if submission_total + len(content) > self._max_submission_bytes:
+                    return self._error("submission_too_large")
+                storage_total = int(conn.execute(
+                    "SELECT COALESCE(SUM(byte_count), 0) FROM lifecycle_attachments",
+                ).fetchone()[0])
+                if storage_total + len(content) > self._max_storage_bytes:
+                    return self._error("storage_full")
                 attachment_id = str(uuid.uuid4())
                 byte_count = len(content)
                 checksum = hashlib.sha256(content).hexdigest()
@@ -1740,7 +1759,10 @@ class Application:
     def _action_status(response: Mapping[str, object]) -> int:
         if response.get("success"):
             return 200
-        return 400 if response.get("status") == "request_conflict" else 404
+        status = response.get("status")
+        if status in {"attachment_too_large", "submission_too_large", "storage_full"}:
+            return 200
+        return 400 if status == "request_conflict" else 404
 
     @staticmethod
     def _terminal_error(status: str) -> dict[str, object]:
@@ -1777,12 +1799,16 @@ def create_app(*, database_path: str | Path, credentials: Mapping[str, str], clo
                browser_cookie_authenticator: Any | None = None,
                mobile_html_renderer: Any | None = None,
                trusted_browser_origin: str | None = None,
-               operator_id: str = "only-operator") -> Application:
+               operator_id: str = "only-operator",
+               max_attachment_bytes: int = 20 * 1024 * 1024,
+               max_submission_bytes: int = 50 * 1024 * 1024,
+               max_storage_bytes: int = 1024 * 1024 * 1024) -> Application:
     if deadline_tick_seconds <= 0 or notification_dispatch_tick_seconds <= 0 or terminal_disconnect_seconds <= 0:
         raise ValueError("scheduler tick seconds must be positive")
     return Application(
         WaitingLifecycle(database_path, clock, notify, ring_timeout_seconds, agent_reconnect_seconds,
-                         terminal_disconnect_seconds, operator_id),
+                         terminal_disconnect_seconds, operator_id,
+                         max_attachment_bytes, max_submission_bytes, max_storage_bytes),
         credentials,
         wait,
         deadline_tick_seconds,
