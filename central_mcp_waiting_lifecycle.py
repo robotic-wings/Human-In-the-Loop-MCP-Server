@@ -41,6 +41,12 @@ _MCP_TOOLS = (
          "prompt": {"type": "string"}, "required": {"type": "boolean"},
          "interaction_id": {"type": "string"}, "call_id": {"type": "string"},
          "after_event_seq": {"type": "integer"}}}},
+    {"name": "get_number_input", "kind": "interaction",
+     "description": "Request a numeric answer from the operator.",
+     "inputSchema": {"type": "object", "properties": {
+         "prompt": {"type": "string"}, "required": {"type": "boolean"},
+         "interaction_id": {"type": "string"}, "call_id": {"type": "string"},
+         "after_event_seq": {"type": "integer"}}}},
     {"name": "get_user_choice", "kind": "interaction",
      "description": "Ask the operator to choose one or more options.",
      "inputSchema": {"type": "object", "properties": {
