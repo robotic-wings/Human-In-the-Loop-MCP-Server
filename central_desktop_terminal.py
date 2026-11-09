@@ -252,10 +252,22 @@ def build_settings_panel(root: Any, ring: Any, central: Any, ringtones_dir: str,
     initial_value = initial_basename if initial_basename in mp3s else (mp3s[0] if mp3s else "")
     ringtone_var = tk.StringVar(value=initial_value)
 
+    def on_preview() -> None:
+        if ring.toggle_preview():
+            preview_button.config(text="停止播放")
+        else:
+            preview_button.config(text="测试播放")
+
     def on_ringtone_change(*_args: object) -> None:
         ring.set_ringtone(os.path.join(ringtones_dir, ringtone_var.get()))
+        ring.stop_preview()
+        preview_button.config(text="测试播放")
+
+    tk.Label(root, text="铃声：").pack(anchor="w", padx=12, pady=6)
     ringtone_var.trace_add("write", on_ringtone_change)
     tk.OptionMenu(root, ringtone_var, *mp3s).pack(anchor="w", padx=12, pady=6)
+    preview_button = tk.Button(root, text="测试播放", command=on_preview)
+    preview_button.pack(anchor="w", padx=12, pady=6)
 
     dnd = central.get_dnd()
     if not isinstance(dnd, Mapping):
@@ -586,6 +598,7 @@ class RingtonePlayer:
         self._player = player if player is not None else _PlatformPlayer()
         self._bell = bell
         self._handles: dict[str, object] = {}
+        self._preview_handle: object | None = None
 
     def start(self, call_id: str) -> None:
         if call_id in self._handles:
@@ -601,6 +614,29 @@ class RingtonePlayer:
 
     def set_ringtone(self, path: str) -> None:
         self._ringtone_path = path
+
+    def toggle_preview(self) -> bool:
+        if self._preview_handle is not None:
+            self.stop_preview()
+            return False
+        path = self._select_ringtone()
+        if path is None:
+            if self._bell is not None:
+                self._bell()
+            return False
+        handle = self._player.play(path, loop=True)
+        if handle is None:
+            if self._bell is not None:
+                self._bell()
+            return False
+        self._preview_handle = handle
+        return True
+
+    def stop_preview(self) -> None:
+        handle = self._preview_handle
+        self._preview_handle = None
+        if handle is not None:
+            self._player.stop(handle)
 
     def stop(self, call_id: str) -> None:
         handle = self._handles.pop(call_id, None)
