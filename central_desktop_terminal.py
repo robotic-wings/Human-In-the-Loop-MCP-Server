@@ -290,6 +290,9 @@ class CentralHttpDesktopClient:
             "content": base64.b64encode(content).decode("ascii"),
         })
 
+    def cancel(self, call_id: str, operation_id: str) -> dict[str, object]:
+        return self._request("POST", f"/api/calls/{call_id}/cancel", json_body={"operation_id": operation_id})
+
 
 class _TerminalListener:
     def acknowledge(self, event: dict[str, object]) -> None:
@@ -377,8 +380,14 @@ class TkPresentation:
                 dialog.destroy()
             else:
                 error.set("The central service did not accept this response. Refresh or retry.")
+
+        def cancel() -> None:
+            self._client_ref()._central.cancel(call_id=call_id, operation_id=uuid.uuid4().hex)
+            self._calls.pop(call_id, None)
+            dialog.destroy()
         tk.Label(dialog, textvariable=error, fg="firebrick", justify="left").pack(padx=12, anchor="w")
         tk.Button(dialog, text="Submit", command=submit).pack(pady=(0, 12))
+        tk.Button(dialog, text="Cancel", command=cancel).pack(pady=(0, 12))
 
     @staticmethod
     def _response_controls(dialog: Any, tool: str, payload: Mapping[str, object], tk: Any) -> Callable[[], dict[str, object] | None]:
