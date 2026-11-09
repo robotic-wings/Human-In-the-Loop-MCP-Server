@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import sys
 import threading
 import uuid
@@ -259,6 +260,26 @@ def scan_ringtones(directory: str) -> list[str]:
     if not path.is_dir():
         return []
     return sorted(entry.name for entry in path.glob("*.mp3") if entry.is_file())
+
+
+def build_settings_panel(root: Any, ring: Any, client: Any, ringtones_dir: str,
+                         mp3s: list[str], initial_ringtone: str, auto_deny: bool, tk: Any) -> None:
+    """Build the ringtone dropdown and do-not-disturb toggle on the main window."""
+    initial_basename = os.path.basename(initial_ringtone)
+    initial_value = initial_basename if initial_basename in mp3s else (mp3s[0] if mp3s else "")
+    ringtone_var = tk.StringVar(value=initial_value)
+
+    def on_ringtone_change(*_args: object) -> None:
+        ring.set_ringtone(os.path.join(ringtones_dir, ringtone_var.get()))
+    ringtone_var.trace_add("write", on_ringtone_change)
+    tk.OptionMenu(root, ringtone_var, *mp3s)
+
+    auto_deny_var = tk.BooleanVar(value=auto_deny)
+
+    def on_auto_deny_change(*_args: object) -> None:
+        client.set_auto_deny(auto_deny_var.get())
+    auto_deny_var.trace_add("write", on_auto_deny_change)
+    tk.Checkbutton(root, text="勿扰模式（来电自动拒绝）", variable=auto_deny_var)
 
 
 class CentralHttpDesktopClient:
@@ -630,6 +651,7 @@ def main(argv: list[str] | None = None) -> None:
     ring = RingtonePlayer(ringtone_path=config.ringtone_path, ringtone_alt_path=config.ringtone_alt_path, bell=root.bell)
     client = DesktopTerminalClient(config={"terminal_credential": config.terminal_credential, "callback_credential": config.callback_credential, "auto_deny": config.auto_deny}, central=central, listener=_TerminalListener(), gui_capability=lambda: True, ring=ring, presenter=presenter)
     holder["client"] = client
+    build_settings_panel(root, ring, client, config.ringtones_dir, scan_ringtones(config.ringtones_dir), config.ringtone_path, config.auto_deny, tk)
     if config.listener_scheme == "https" and (not config.listener_tls_cert_file or not config.listener_tls_key_file):
         raise SystemExit("desktop terminal unavailable: HTTPS listener requires listener_tls_cert_file and listener_tls_key_file")
     server = uvicorn.Server(uvicorn.Config(
