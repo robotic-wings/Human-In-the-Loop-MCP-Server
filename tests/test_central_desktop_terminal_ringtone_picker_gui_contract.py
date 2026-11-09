@@ -45,6 +45,15 @@ class FakeVar:
         return "trace-id"
 
 
+class FakeWidget:
+    def __init__(self) -> None:
+        self.pack_calls: list[dict[str, object]] = []
+
+    def pack(self, **kwargs: object) -> "FakeWidget":
+        self.pack_calls.append(dict(kwargs))
+        return self
+
+
 class FakeTk:
     def __init__(self) -> None:
         self.option_menus: list[dict[str, object]] = []
@@ -56,13 +65,15 @@ class FakeTk:
     def BooleanVar(self, value: bool = False) -> FakeVar:
         return FakeVar(value)
 
-    def OptionMenu(self, _root: object, variable: FakeVar, *options: str) -> object:
-        self.option_menus.append({"variable": variable, "options": list(options)})
-        return object()
+    def OptionMenu(self, _root: object, variable: FakeVar, *options: str) -> FakeWidget:
+        widget = FakeWidget()
+        self.option_menus.append({"variable": variable, "options": list(options), "widget": widget})
+        return widget
 
-    def Checkbutton(self, _root: object, **kwargs: object) -> object:
-        self.checkbuttons.append(dict(kwargs))
-        return object()
+    def Checkbutton(self, _root: object, **kwargs: object) -> FakeWidget:
+        widget = FakeWidget()
+        self.checkbuttons.append({**dict(kwargs), "widget": widget})
+        return widget
 
     def Label(self, *_args: object, **_kwargs: object) -> object:
         return object()
@@ -93,6 +104,8 @@ def test_build_settings_panel_creates_option_menu_and_checkbutton() -> None:
     assert tk.option_menus[0]["options"] == ["alpha.mp3", "beta.mp3"]
     assert len(tk.checkbuttons) == 1
     assert tk.checkbuttons[0]["text"] == "勿扰模式（来电自动拒绝）"
+    assert tk.option_menus[0]["widget"].pack_calls == [{"anchor": "w", "padx": 12, "pady": 6}]
+    assert tk.checkbuttons[0]["widget"].pack_calls == [{"anchor": "w", "padx": 12, "pady": 6}]
 
 
 def test_initial_selection_matches_ringtone_path_or_first() -> None:
