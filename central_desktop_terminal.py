@@ -349,6 +349,7 @@ class TkPresentation:
         tk.Label(dialog, text=str(prompt), wraplength=620, justify="left").pack(padx=12, pady=(12, 6), anchor="w")
         error = tk.StringVar(value="")
         build_result = self._response_controls(dialog, tool, payload, tk)
+        build_progress = getattr(build_result, "progress", None)
 
         attachment_ids: list[str] = []
         attachment_box = tk.Listbox(dialog, height=4)
@@ -385,7 +386,14 @@ class TkPresentation:
             self._client_ref()._central.cancel(call_id=call_id, operation_id=uuid.uuid4().hex)
             self._calls.pop(call_id, None)
             dialog.destroy()
+
+        def report_progress() -> None:
+            response = self._client_ref()._central.submit(call_id, uuid.uuid4().hex, build_progress(), attachment_ids)
+            if not response.get("success"):
+                error.set("The central service did not accept this progress report. Retry.")
         tk.Label(dialog, textvariable=error, fg="firebrick", justify="left").pack(padx=12, anchor="w")
+        if build_progress is not None:
+            tk.Button(dialog, text="Report progress", command=report_progress).pack(pady=(0, 12))
         tk.Button(dialog, text="Submit", command=submit).pack(pady=(0, 12))
         tk.Button(dialog, text="Cancel", command=cancel).pack(pady=(0, 12))
 
@@ -414,6 +422,9 @@ class TkPresentation:
             def task_result() -> dict[str, object] | None:
                 text = report.get("1.0", "end-1c")
                 return {"status": status.get(), "report": text} if text or not required else None
+            def task_progress() -> dict[str, object]:
+                return {"status": "in_progress", "progress": report.get("1.0", "end-1c")}
+            task_result.progress = task_progress  # type: ignore[attr-defined]
             return task_result
         choices = payload.get("choices") or payload.get("options")
         if ("choice" in tool or "select" in tool or isinstance(choices, list)) and isinstance(choices, list):
