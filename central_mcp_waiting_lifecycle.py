@@ -893,7 +893,8 @@ class WaitingLifecycle:
                 raise
 
     def resubmit(self, caller_id: str, request_id: str, interaction_id: str, call_id: str,
-                 revision_id: str, payload: Mapping[str, object]) -> dict[str, object]:
+                 revision_id: str, payload: Mapping[str, object],
+                 invited_desktop_id: str | None = None, mobile_eligible: bool = False) -> dict[str, object]:
         """Open a new call round for a completed/failed task under a revision."""
         if not isinstance(revision_id, str) or not revision_id or len(revision_id) > 128:
             return self._error("invalid_request")
@@ -904,6 +905,7 @@ class WaitingLifecycle:
             "interaction_id": interaction_id, "call_id": call_id,
             "revision_id": revision_id, "payload": dict(payload),
         })
+        notification: dict[str, object] | None = None
         busy = {
             "success": True, "status": "busy", "call_state": None, "call_id": None,
             "reason": None, "interaction_id": None, "human_action": False,
@@ -957,21 +959,33 @@ class WaitingLifecycle:
                 conn.execute(
                     "INSERT INTO lifecycle_calls "
                     "(call_id, interaction_id, caller_id, call_state, ring_deadline, reason, payload_json, agent_reconnect_deadline, invited_desktop_id, mobile_eligible) "
-                    "VALUES (?, ?, ?, 'ringing', ?, NULL, ?, NULL, NULL, 0)",
-                    (new_call_id, interaction_id, caller_id, deadline, encoded),
+                    "VALUES (?, ?, ?, 'ringing', ?, NULL, ?, NULL, ?, ?)",
+                    (new_call_id, interaction_id, caller_id, deadline, encoded,
+                     invited_desktop_id, int(mobile_eligible)),
                 )
                 conn.execute(
                     "INSERT INTO lifecycle_revisions VALUES (?, ?, ?, ?, ?)",
                     (caller_id, interaction_id, revision_id, new_call_id, encoded),
                 )
                 outcome = self._heartbeat(interaction_id, new_call_id, "ringing")
+                short_title = next(
+                    (str(payload.get(key)) for key in ("title", "task_description", "prompt", "message")
+                     if isinstance(payload.get(key), str) and payload.get(key).strip()),
+                    "Human-in-the-Loop request",
+                )
+                notification = {
+                    "call_id": new_call_id, "ring_deadline": deadline,
+                    "title": caller_id, "body": " ".join(short_title.split())[:200],
+                }
                 conn.execute("INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?, 'resubmit')",
                              (caller_id, request_id, request_encoded, self._dump(outcome)))
                 conn.commit()
-                return outcome
             except BaseException:
                 conn.rollback()
                 raise
+        if notification is not None:
+            self._notify(notification)
+        return outcome
 
     def call_version(self, call_id: str) -> int:
         with self._connection() as conn:
@@ -1733,7 +1747,12 @@ class Application:
             if not isinstance(interaction, str) or not isinstance(call_id, str) or not isinstance(revision_id, str) or not isinstance(payload, Mapping):
                 return self._error("invalid_request"), False
             replay = self.lifecycle.has_request(caller, request_id)
-            return self.lifecycle.resubmit(caller, request_id, interaction, call_id, revision_id, payload), not replay
+            invited_desktop_id = self._invited_desktop_id() if not replay else None
+            mobile_eligible = self._mobile_eligible() if not replay else False
+            return self.lifecycle.resubmit(
+                caller, request_id, interaction, call_id, revision_id, payload,
+                invited_desktop_id, mobile_eligible,
+            ), not replay
         if interaction is not None or call_id is not None:
             after = body.get("after_event_seq", 0)
             if not isinstance(interaction, str) or not isinstance(call_id, str) or isinstance(after, bool) or not isinstance(after, int):
