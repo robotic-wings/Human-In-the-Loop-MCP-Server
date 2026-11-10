@@ -2061,6 +2061,8 @@ class Application:
         request_id = body.get("request_id")
         if not isinstance(request_id, str) or not request_id:
             return self._error("invalid_request"), False
+        if len(request_id) > 128 or not request_id.isascii():
+            return self._error("invalid_request"), False
         interaction, call_id = body.get("interaction_id"), body.get("call_id")
         if body.get("operation") == "cancel_interaction":
             if not isinstance(interaction, str) or not isinstance(call_id, str):
