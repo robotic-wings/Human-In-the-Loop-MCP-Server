@@ -636,13 +636,25 @@ class TkPresentation:
             window.destroy()
 
     def _accept(self, call_id: str) -> None:
+        self._stop_ring_now(call_id)
         result = self._client_ref().accept(call_id=call_id, operation_id=uuid.uuid4().hex)
         if result.get("success"):
             self._answer(call_id, self._calls.get(call_id, {}))
+        else:
+            self._calls.pop(call_id, None)
 
     def _decline(self, call_id: str) -> None:
+        self._stop_ring_now(call_id)
         self._client_ref().decline(call_id=call_id, operation_id=uuid.uuid4().hex)
         self._calls.pop(call_id, None)
+
+    def _stop_ring_now(self, call_id: str) -> None:
+        """Stop the ring and close the alert instantly on user action."""
+        client = self._client_ref()
+        ring = getattr(client, "ring", None)
+        if ring is not None:
+            ring.stop(call_id)
+        self._close(call_id)
 
     def _answer(self, call_id: str, state: Mapping[str, object]) -> None:
         import tkinter as tk
