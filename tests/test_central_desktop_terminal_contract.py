@@ -338,6 +338,32 @@ def test_remote_acceptance_shows_handled_on_phone_hint_not_silent_close() -> Non
     assert client.presenter.closed == ["call-1"]
 
 
+def test_remote_acceptance_with_unreadable_call_uses_event_state_for_handled_hint() -> None:
+    """After mobile accepts, the desktop cannot read the call (session_not_found).
+
+    The callback event itself still carries the authoritative ``call_state`` and
+    ``handled_on``.  The terminal must fall back to the event rather than return
+    ``session_not_found``, so the "handled on phone" hint is shown and the local
+    alert closes.
+    """
+    central = FakeCentral(states={"call-1": _ringing("call-1")})
+    client = _client(central=central)
+    client.start()
+    client.receive_notification(
+        {"call_id": "call-1", "version": 1},
+        callback_credential="central-callback-secret",
+    )
+
+    central.states["call-1"] = {"success": False, "status": "session_not_found"}
+    event = {"call_id": "call-1", "version": 2, "call_state": "accepted", "handled_on": "iphone_web"}
+    client.receive_notification(event, callback_credential="central-callback-secret")
+
+    assert client.presenter.hints, "event-only handled_on must still show the handled-on-phone hint"
+    assert client.presenter.hints[0][0] == "call-1"
+    assert client.presenter.closed == ["call-1"]
+    assert client.ring.stopped == ["call-1"]
+
+
 def test_central_loss_stops_ringing_and_restart_reauthenticates_before_resync() -> None:
     central = FakeCentral(states={"call-1": _ringing("call-1")})
     client = _client(central=central)

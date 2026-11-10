@@ -527,3 +527,7 @@ def test_mobile_accept_dispatches_accepted_callback_to_desktop(tmp_path: Path) -
     accepted = [r for r in recorded if r.get("call_state") == "accepted"]
     assert accepted, "mobile accept must dispatch an accepted callback to the desktop"
     assert accepted[0].get("version", 0) > initial.get("version", 0)
+    assert accepted[0].get("handled_on") == "iphone_web", (
+        "the accepted desktop callback must carry handled_on so the desktop can "
+        "show the handled hint even when read_call now returns session_not_found"
+    )
