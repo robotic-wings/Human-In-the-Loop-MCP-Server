@@ -79,6 +79,12 @@ def test_cancel_posts_operation_id_to_call_cancel_endpoint_with_terminal_session
 class FakeWidget:
     def pack(self, *args: object, **kwargs: object) -> "FakeWidget":
         return self
+    def grid(self, *_args: object, **_kwargs: object) -> "FakeWidget":
+        return self
+
+    def columnconfigure(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
 
     def destroy(self) -> None:
         pass
@@ -110,6 +116,12 @@ class FakeStringVar:
 class FakeTk:
     def __init__(self) -> None:
         self.buttons: list[dict[str, object]] = []
+    def LabelFrame(self, _root: object, **kwargs: object) -> object:
+        return FakeWidget()
+
+    def Frame(self, _root: object, **kwargs: object) -> object:
+        return FakeWidget()
+
 
     def Toplevel(self, *_args: object, **_kwargs: object) -> FakeWidget:
         return FakeWidget()
@@ -175,7 +187,7 @@ def test_answer_dialog_exposes_cancel_button_that_ends_the_round(monkeypatch: An
     presentation._answer("call-1", {"payload": {"tool": "get_text_input", "prompt": "x"}})
 
     cancel_button = next(
-        (button for button in fake_tk.buttons if str(button.get("text", "")) == "Cancel"),
+        (button for button in fake_tk.buttons if str(button.get("text", "")) == "取消"),
         None,
     )
     assert cancel_button is not None, "answer dialog must expose a cancel button"

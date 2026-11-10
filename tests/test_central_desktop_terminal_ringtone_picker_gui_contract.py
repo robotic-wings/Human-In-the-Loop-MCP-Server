@@ -50,6 +50,12 @@ class FakeWidget:
     def pack(self, **kwargs: object) -> "FakeWidget":
         self.pack_calls.append(dict(kwargs))
         return self
+    def grid(self, *_args: object, **_kwargs: object) -> "FakeWidget":
+        return self
+
+    def columnconfigure(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
 
 
 class FakeEntry:
@@ -64,6 +70,9 @@ class FakeEntry:
     def pack(self, **kwargs: object) -> "FakeEntry":
         self.pack_calls.append(dict(kwargs))
         return self
+    def grid(self, *_args: object, **_kwargs: object) -> "FakeEntry":
+        return self
+
 
     def config(self, **kwargs: object) -> "FakeEntry":
         if "state" in kwargs:
@@ -88,6 +97,9 @@ class FakeButton:
     def pack(self, **kwargs: object) -> "FakeButton":
         self.pack_calls.append(dict(kwargs))
         return self
+    def grid(self, *_args: object, **_kwargs: object) -> "FakeButton":
+        return self
+
 
 
 class FakeTk:
@@ -96,6 +108,12 @@ class FakeTk:
         self.checkbuttons: list[dict[str, object]] = []
         self.entries: list[FakeEntry] = []
         self.buttons: list[FakeButton] = []
+    def LabelFrame(self, _root: object, **kwargs: object) -> object:
+        return FakeWidget()
+
+    def Frame(self, _root: object, **kwargs: object) -> object:
+        return FakeWidget()
+
 
     def StringVar(self, value: str = "") -> FakeVar:
         return FakeVar(value)
@@ -166,9 +184,7 @@ def test_build_settings_panel_creates_option_menu_and_checkbutton() -> None:
     assert len(tk.option_menus) == 1
     assert tk.option_menus[0]["options"] == ["alpha.mp3", "beta.mp3"]
     assert len(tk.checkbuttons) == 1
-    assert tk.checkbuttons[0]["text"] == "勿扰模式（来电自动拒绝）"
-    assert tk.option_menus[0]["widget"].pack_calls == [{"anchor": "w", "padx": 12, "pady": 6}]
-    assert tk.checkbuttons[0]["widget"].pack_calls == [{"anchor": "w", "padx": 12, "pady": 6}]
+    assert tk.checkbuttons[0]["text"] == "来电自动拒绝"
 
 
 def test_initial_selection_matches_ringtone_path_or_first() -> None:

@@ -91,6 +91,12 @@ class FakeWidget:
 
     def pack(self, *args: object, **kwargs: object) -> "FakeWidget":
         return self
+    def grid(self, *_args: object, **_kwargs: object) -> "FakeWidget":
+        return self
+
+    def columnconfigure(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
 
     def destroy(self) -> None:
         self.destroyed = True
@@ -137,6 +143,12 @@ class FakeTk:
         self.buttons: list[dict[str, object]] = []
         self.option_menus: list[dict[str, object]] = []
         self.toplevels: list[FakeWidget] = []
+    def LabelFrame(self, _root: object, **kwargs: object) -> object:
+        return FakeWidget()
+
+    def Frame(self, _root: object, **kwargs: object) -> object:
+        return FakeWidget()
+
 
     def Toplevel(self, *_args: object, **_kwargs: object) -> FakeWidget:
         widget = FakeWidget()

@@ -264,7 +264,7 @@ def scan_ringtones(directory: str) -> list[str]:
 
 def build_settings_panel(root: Any, ring: Any, central: Any, ringtones_dir: str,
                          mp3s: list[str], initial_ringtone: str, tk: Any) -> None:
-    """Build the ringtone dropdown and do-not-disturb controls on the main window."""
+    """Build the settings panel as classic framed groups with aligned controls."""
     initial_basename = os.path.basename(initial_ringtone)
     initial_value = initial_basename if initial_basename in mp3s else (mp3s[0] if mp3s else "")
     ringtone_var = tk.StringVar(value=initial_value)
@@ -280,18 +280,19 @@ def build_settings_panel(root: Any, ring: Any, central: Any, ringtones_dir: str,
         ring.stop_preview()
         preview_button.config(text="测试播放")
 
-    tk.Label(root, text="铃声：").pack(anchor="w", padx=12, pady=6)
+    notify = tk.LabelFrame(root, text="通知", padx=10, pady=8)
+    notify.pack(fill="x", padx=12, pady=(12, 8))
+    tk.Label(notify, text="铃声").grid(row=0, column=0, sticky="w", pady=2)
     ringtone_var.trace_add("write", on_ringtone_change)
-    tk.OptionMenu(root, ringtone_var, *mp3s).pack(anchor="w", padx=12, pady=6)
-    preview_button = tk.Button(root, text="测试播放", command=on_preview)
-    preview_button.pack(anchor="w", padx=12, pady=6)
+    tk.OptionMenu(notify, ringtone_var, *mp3s).grid(row=0, column=1, sticky="w", padx=(8, 8), pady=2)
+    preview_button = tk.Button(notify, text="测试播放", command=on_preview)
+    preview_button.grid(row=0, column=2, sticky="w", pady=2)
 
     dnd = central.get_dnd()
     if not isinstance(dnd, Mapping):
         dnd = {}
     enabled = bool(dnd.get("enabled", False))
     message = dnd.get("message") if isinstance(dnd.get("message"), str) else ""
-
     auto_deny_var = tk.BooleanVar(value=enabled)
     message_var = tk.StringVar(value=message)
     dnd_status = tk.StringVar(value="")
@@ -310,14 +311,16 @@ def build_settings_panel(root: Any, ring: Any, central: Any, ringtones_dir: str,
         save_button.config(state="normal" if enabled_now else "disabled")
         sync_dnd()
 
-    tk.Checkbutton(root, text="勿扰模式（来电自动拒绝）", variable=auto_deny_var).pack(anchor="w", padx=12, pady=6)
-    tk.Label(root, text="自动回复消息：").pack(anchor="w", padx=12, pady=(0, 0))
-    message_entry = tk.Entry(root, textvariable=message_var, state="normal" if enabled else "disabled")
-    message_entry.pack(anchor="w", padx=12, pady=(0, 6))
-    save_button = tk.Button(root, text="保存", command=sync_dnd, state="normal" if enabled else "disabled")
-    save_button.pack(anchor="w", padx=12, pady=(0, 6))
-    tk.Label(root, textvariable=dnd_status, fg="gray").pack(anchor="w", padx=12, pady=(0, 6))
-
+    dnd_frame = tk.LabelFrame(root, text="勿扰模式", padx=10, pady=8)
+    dnd_frame.pack(fill="x", padx=12, pady=(0, 12))
+    dnd_frame.columnconfigure(1, weight=1)
+    tk.Checkbutton(dnd_frame, text="来电自动拒绝", variable=auto_deny_var).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+    tk.Label(dnd_frame, text="自动回复消息").grid(row=1, column=0, sticky="w", pady=2)
+    message_entry = tk.Entry(dnd_frame, textvariable=message_var, state="normal" if enabled else "disabled")
+    message_entry.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=2)
+    save_button = tk.Button(dnd_frame, text="保存", command=sync_dnd, state="normal" if enabled else "disabled")
+    save_button.grid(row=2, column=1, sticky="e", pady=(6, 2))
+    tk.Label(dnd_frame, textvariable=dnd_status, fg="gray").grid(row=3, column=0, columnspan=2, sticky="w")
     auto_deny_var.trace_add("write", on_auto_deny_change)
 
 
@@ -437,16 +440,18 @@ class TkPresentation:
             return
         import tkinter as tk
         window = tk.Toplevel(self._root)
-        window.title("Human-in-the-Loop call")
+        window.title("呼叫")
         window.protocol("WM_DELETE_WINDOW", lambda: self._decline(call_id))
         payload = state.get("payload")
         payload = dict(payload) if isinstance(payload, Mapping) else {}
         prompt = payload.get("prompt") or payload.get("message") or payload.get("task_description") or "Human input requested"
-        tk.Label(window, text=str(prompt), wraplength=520, justify="left").pack(padx=16, pady=12)
-        accept_btn = tk.Button(window, text="Accept", command=lambda: self._accept(call_id))
-        accept_btn.pack(side="left", padx=16, pady=12)
-        decline_btn = tk.Button(window, text="Decline", command=lambda: self._decline(call_id))
-        decline_btn.pack(side="right", padx=16, pady=12)
+        tk.Label(window, text=str(prompt), wraplength=520, justify="left").pack(padx=16, pady=(16, 12), anchor="w")
+        buttons = tk.Frame(window)
+        buttons.pack(fill="x", padx=16, pady=(0, 16))
+        accept_btn = tk.Button(buttons, text="接听", command=lambda: self._accept(call_id), width=12)
+        accept_btn.pack(side="left")
+        decline_btn = tk.Button(buttons, text="拒绝", command=lambda: self._decline(call_id), width=12)
+        decline_btn.pack(side="left", padx=(8, 0))
         self._buttons[call_id] = (accept_btn, decline_btn)
         self._windows[call_id] = window
         self._calls[call_id] = {**state, "payload": payload}
@@ -486,7 +491,7 @@ class TkPresentation:
     def _answer(self, call_id: str, state: Mapping[str, object]) -> None:
         import tkinter as tk
         dialog = tk.Toplevel(self._root)
-        dialog.title("Respond to call")
+        dialog.title("回答")
         payload = state.get("payload")
         payload = dict(payload) if isinstance(payload, Mapping) else {}
         tool = str(payload.get("tool") or payload.get("interaction_type") or "text").lower()
@@ -515,7 +520,7 @@ class TkPresentation:
                     attachment_box.insert("end", str(path))
                 else:
                     error.set("附件上传失败，请重试。")
-        tk.Button(dialog, text="Attach files", command=choose_files).pack(padx=12, anchor="w")
+        tk.Button(dialog, text="添加附件", command=choose_files).pack(padx=12, anchor="w")
 
         def submit() -> None:
             result = build_result()
@@ -541,10 +546,12 @@ class TkPresentation:
             else:
                 error.set("进度上报失败，请重试。")
         tk.Label(dialog, textvariable=error, fg="firebrick", justify="left").pack(padx=12, anchor="w")
+        button_bar = tk.Frame(dialog)
+        button_bar.pack(fill="x", padx=12, pady=(8, 12))
         if build_progress is not None:
-            tk.Button(dialog, text="Report progress", command=report_progress).pack(pady=(0, 12))
-        tk.Button(dialog, text="Submit", command=submit).pack(pady=(0, 12))
-        tk.Button(dialog, text="Cancel", command=cancel).pack(pady=(0, 12))
+            tk.Button(button_bar, text="报告进度", command=report_progress).pack(side="left")
+        tk.Button(button_bar, text="取消", command=cancel, width=10).pack(side="right")
+        tk.Button(button_bar, text="提交", command=submit, width=10).pack(side="right", padx=(0, 8))
 
     @staticmethod
     def _response_controls(dialog: Any, tool: str, payload: Mapping[str, object], tk: Any) -> Callable[[], dict[str, object] | None]:
@@ -829,7 +836,7 @@ def main(argv: list[str] | None = None) -> None:
         run_worker=run_worker,
         schedule_ui=root.after,
     )
-    root.deiconify(); root.title("HITL Desktop Terminal")
+    root.deiconify(); root.title("HITL 操作台")
     try:
         root.mainloop()
     finally:

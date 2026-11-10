@@ -33,6 +33,12 @@ class FakeToplevel:
 class FakeWidget:
     def pack(self, *_args: object, **_kwargs: object) -> "FakeWidget":
         return self
+    def grid(self, *_args: object, **_kwargs: object) -> "FakeWidget":
+        return self
+
+    def columnconfigure(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
 
 
 class FakeStringVar:
@@ -60,6 +66,9 @@ class FakeText:
 class FakeEntry:
     def pack(self, *_args: object, **_kwargs: object) -> "FakeEntry":
         return self
+    def grid(self, *_args: object, **_kwargs: object) -> "FakeEntry":
+        return self
+
 
     def get(self) -> str:
         return ""
@@ -84,6 +93,12 @@ class FakeTk:
         self.buttons: list[dict[str, object]] = []
         self.string_vars: list[FakeStringVar] = []
         self.toplevels: list[FakeToplevel] = []
+    def LabelFrame(self, _root: object, **kwargs: object) -> object:
+        return FakeWidget()
+
+    def Frame(self, _root: object, **kwargs: object) -> object:
+        return FakeWidget()
+
 
     def Toplevel(self, *_args: object, **_kwargs: object) -> FakeToplevel:
         toplevel = FakeToplevel()
@@ -152,7 +167,7 @@ def _report_progress_command(monkeypatch: Any, central: FakeCentral) -> tuple[Fa
     terminal = FakeTerminal(central)
     presentation = TkPresentation(root=object(), client_ref=lambda: terminal)
     presentation._answer("call-1", {"payload": {"tool": "assign_task_to_human", "task_description": "deploy"}})
-    button = next(b for b in tk.buttons if b.get("text") == "Report progress")
+    button = next(b for b in tk.buttons if b.get("text") == "报告进度")
     return tk, button["command"]
 
 

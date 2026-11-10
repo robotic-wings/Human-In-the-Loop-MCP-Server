@@ -248,12 +248,24 @@ class FakeVar:
 class FakeWidget:
     def pack(self, *_args: object, **_kwargs: object) -> "FakeWidget":
         return self
+    def grid(self, *_args: object, **_kwargs: object) -> "FakeWidget":
+        return self
+
+    def columnconfigure(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
 
 
 class FakeTk:
     def __init__(self) -> None:
         self.string_vars: list[FakeVar] = []
         self.boolean_vars: list[FakeVar] = []
+    def LabelFrame(self, _root: object, **kwargs: object) -> object:
+        return FakeWidget()
+
+    def Frame(self, _root: object, **kwargs: object) -> object:
+        return FakeWidget()
+
 
     def StringVar(self, value: str = "") -> FakeVar:
         var = FakeVar(value)

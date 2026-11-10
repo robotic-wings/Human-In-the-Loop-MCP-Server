@@ -31,6 +31,12 @@ class FakeToplevel:
 class FakeWidget:
     def pack(self, *_args: object, **_kwargs: object) -> "FakeWidget":
         return self
+    def grid(self, *_args: object, **_kwargs: object) -> "FakeWidget":
+        return self
+
+    def columnconfigure(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
 
 
 class FakeStringVar:
@@ -47,6 +53,9 @@ class FakeStringVar:
 class FakeEntry:
     def pack(self, *_args: object, **_kwargs: object) -> "FakeEntry":
         return self
+    def grid(self, *_args: object, **_kwargs: object) -> "FakeEntry":
+        return self
+
 
     def get(self) -> str:
         return ""
@@ -77,6 +86,12 @@ class FakeTk:
         self.buttons: list[dict[str, object]] = []
         self.listboxes: list[FakeListbox] = []
         self.string_vars: list[FakeStringVar] = []
+    def LabelFrame(self, _root: object, **kwargs: object) -> object:
+        return FakeWidget()
+
+    def Frame(self, _root: object, **kwargs: object) -> object:
+        return FakeWidget()
+
 
     def Toplevel(self, *_args: object, **_kwargs: object) -> FakeToplevel:
         return FakeToplevel()
@@ -147,7 +162,7 @@ def _attach_command(monkeypatch: Any, tk: FakeTk, central: FakeCentral) -> Any:
     monkeypatch.setitem(sys.modules, "tkinter", tk)
     presentation = _presentation(central)
     presentation._answer("call-1", {"payload": {"tool": "get_text_input", "prompt": "x"}})
-    attach = next(button for button in tk.buttons if button.get("text") == "Attach files")
+    attach = next(button for button in tk.buttons if button.get("text") == "添加附件")
     return attach["command"]
 
 

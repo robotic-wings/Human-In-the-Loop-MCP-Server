@@ -122,6 +122,9 @@ class FakeEntry:
     def pack(self, **kwargs: object) -> "FakeEntry":
         self.pack_calls.append(dict(kwargs))
         return self
+    def grid(self, *_args: object, **_kwargs: object) -> "FakeEntry":
+        return self
+
 
     def config(self, **kwargs: object) -> "FakeEntry":
         if "state" in kwargs:
@@ -139,6 +142,12 @@ class FakeWidget:
     def pack(self, **kwargs: object) -> "FakeWidget":
         self.pack_calls.append(dict(kwargs))
         return self
+    def grid(self, *_args: object, **_kwargs: object) -> "FakeWidget":
+        return self
+
+    def columnconfigure(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
 
 
 class FakeButton:
@@ -155,6 +164,9 @@ class FakeButton:
     def pack(self, **kwargs: object) -> "FakeButton":
         self.pack_calls.append(dict(kwargs))
         return self
+    def grid(self, *_args: object, **_kwargs: object) -> "FakeButton":
+        return self
+
 
 
 class FakeTk:
@@ -165,6 +177,12 @@ class FakeTk:
         self.buttons: list[FakeButton] = []
         self.labels: list[str] = []
         self.order: list[tuple[str, str]] = []
+    def LabelFrame(self, _root: object, **kwargs: object) -> object:
+        return FakeWidget()
+
+    def Frame(self, _root: object, **kwargs: object) -> object:
+        return FakeWidget()
+
 
     def StringVar(self, value: str = "") -> FakeVar:
         return FakeVar(value)
@@ -257,7 +275,7 @@ def test_message_entry_has_auto_reply_label_before_it() -> None:
     tk = FakeTk()
     build_settings_panel(None, FakeRing(), FakeCentral(), "/sounds", ["a.mp3"], "/sounds/a.mp3", tk)
 
-    assert "自动回复消息：" in tk.labels
-    label_index = tk.order.index(("label", "自动回复消息："))
+    assert "自动回复消息" in tk.labels
+    label_index = tk.order.index(("label", "自动回复消息"))
     entry_index = next(index for index, event in enumerate(tk.order) if event[0] == "entry")
     assert label_index < entry_index

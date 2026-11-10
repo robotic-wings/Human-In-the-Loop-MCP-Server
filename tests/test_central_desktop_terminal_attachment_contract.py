@@ -105,6 +105,12 @@ def test_submit_merges_attachment_ids_into_result_attachments(monkeypatch: Any) 
 class FakeWidget:
     def pack(self, *args: object, **kwargs: object) -> "FakeWidget":
         return self
+    def grid(self, *_args: object, **_kwargs: object) -> "FakeWidget":
+        return self
+
+    def columnconfigure(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
 
     def destroy(self) -> None:
         pass
@@ -146,6 +152,12 @@ class FakeTk:
         self.buttons: list[dict[str, object]] = []
         self.listboxes: list[FakeWidget] = []
         self.filedialog = FakeFileDialog()
+    def LabelFrame(self, _root: object, **kwargs: object) -> object:
+        return FakeWidget()
+
+    def Frame(self, _root: object, **kwargs: object) -> object:
+        return FakeWidget()
+
 
     def Toplevel(self, *_args: object, **_kwargs: object) -> FakeWidget:
         return FakeWidget()
@@ -206,6 +218,6 @@ def test_answer_dialog_exposes_file_selection_and_attachment_list(monkeypatch: A
     presentation._answer("call-1", {"payload": {"tool": "get_text_input", "prompt": "x"}})
 
     assert fake_tk.listboxes, "answer dialog must render an attachment list"
-    assert any(str(button.get("text", "")) != "Submit" for button in fake_tk.buttons), (
+    assert any(str(button.get("text", "")) != "提交" for button in fake_tk.buttons), (
         "answer dialog must expose a file-selection button"
     )

@@ -105,6 +105,12 @@ class FakeWidget:
     def pack(self, **kwargs: object) -> "FakeWidget":
         self.pack_calls.append(dict(kwargs))
         return self
+    def grid(self, *_args: object, **_kwargs: object) -> "FakeWidget":
+        return self
+
+    def columnconfigure(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
 
 
 class FakeEntry:
@@ -120,6 +126,9 @@ class FakeEntry:
 
     def pack(self, **kwargs: object) -> "FakeEntry":
         return self
+    def grid(self, *_args: object, **_kwargs: object) -> "FakeEntry":
+        return self
+
 
     def config(self, **kwargs: object) -> "FakeEntry":
         if "state" in kwargs:
@@ -144,6 +153,9 @@ class FakeButton:
     def pack(self, **kwargs: object) -> "FakeButton":
         self.pack_calls.append(dict(kwargs))
         return self
+    def grid(self, *_args: object, **_kwargs: object) -> "FakeButton":
+        return self
+
 
 
 class FakeTk:
@@ -153,6 +165,12 @@ class FakeTk:
         self.entries: list[FakeEntry] = []
         self.labels: list[str] = []
         self.buttons: list[FakeButton] = []
+    def LabelFrame(self, _root: object, **kwargs: object) -> object:
+        return FakeWidget()
+
+    def Frame(self, _root: object, **kwargs: object) -> object:
+        return FakeWidget()
+
 
     def StringVar(self, value: str = "") -> FakeVar:
         return FakeVar(value)
@@ -218,7 +236,7 @@ def test_settings_panel_has_label_and_preview_button() -> None:
     tk = FakeTk()
     build_settings_panel(None, FakeRing(), FakeCentral(), "/sounds", ["a.mp3"], "/sounds/a.mp3", tk)
 
-    assert "铃声：" in tk.labels
+    assert "铃声" in tk.labels
     assert any(b.text == "测试播放" for b in tk.buttons)
     assert any(b.text == "保存" for b in tk.buttons)
 
