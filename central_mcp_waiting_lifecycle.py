@@ -1542,7 +1542,37 @@ class Application:
         if body is None:
             await self._send(send, 400, self._error("invalid_request")); return
         if "jsonrpc" in body or "method" in body or "id" in body:
-            await self._send(send, 200, self._rpc(caller, body)); return
+            result = self._rpc(caller, body)
+            # Long-poll: if heartbeat, wait for the human then re-check once.
+            params = body.get("params") if isinstance(body.get("params"), dict) else {}
+            args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
+            sc = result.get("result", {}).get("structuredContent", {})
+            if (isinstance(sc, dict) and sc.get("needs_continuation")
+                    and sc.get("status") == "heartbeat"
+                    and isinstance(sc.get("interaction_id"), str)):
+                timeout = args.get("client_timeout_seconds", 30)
+                if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0:
+                    await self._wait(max(1, float(timeout) - min(30, max(1, float(timeout) // 4))))
+                    tool_name = params.get("name", "")
+                    try:
+                        poll_seq = 0
+                        for _ in range(8):
+                            sc2 = self.lifecycle.continue_call(
+                                caller, f"rpc-{body.get('id')}-w{poll_seq}",
+                                sc["interaction_id"], sc["call_id"], poll_seq)
+                            if not isinstance(sc2, dict) or not sc2.get("success"):
+                                break
+                            evt_seq = sc2.get("event_seq")
+                            if isinstance(evt_seq, int):
+                                poll_seq = evt_seq
+                            if sc2.get("status") not in ("heartbeat", "opened"):
+                                break  # terminal state reached
+                    except Exception:
+                        sc2 = None
+                    if isinstance(sc2, dict) and sc2.get("success"):
+                        result["result"]["structuredContent"] = sc2
+                        result["result"]["content"] = [{"type": "text", "text": self._rpc_summary(tool_name, sc2)}]
+            await self._send(send, 200, result); return
         timeout = body.get("client_timeout_seconds")
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 2:
             await self._send(send, 400, self._error("invalid_client_timeout")); return
