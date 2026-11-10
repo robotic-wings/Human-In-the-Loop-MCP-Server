@@ -1009,7 +1009,7 @@ class WaitingLifecycle:
     def read_interaction_result(self, caller_id: str, interaction_id: str,
                                 result_id: object = None, cursor: object = None,
                                 max_result_bytes: object = None) -> dict[str, object]:
-        del result_id, cursor, max_result_bytes
+        del cursor
         with self._connection() as conn:
             call = conn.execute(
                 "SELECT call_id FROM lifecycle_calls WHERE interaction_id=? AND caller_id=? LIMIT 1",
@@ -1018,27 +1018,56 @@ class WaitingLifecycle:
             if call is None:
                 return {"success": False, "status": "session_not_found"}
             call_id = call["call_id"]
-            submission = conn.execute(
-                "SELECT outcome_json FROM lifecycle_submissions WHERE call_id=? ORDER BY rowid DESC LIMIT 1",
-                (call_id,),
-            ).fetchone()
             body: object = None
-            if submission is not None:
-                try:
-                    body = self._load(submission["outcome_json"]).get("result")
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    body = None
-            attachments = [
-                {"attachment_id": row["attachment_id"], "byte_count": row["byte_count"], "checksum": row["checksum"]}
+            if isinstance(result_id, str) and result_id:
+                found = False
                 for row in conn.execute(
-                    "SELECT attachment_id, byte_count, checksum FROM lifecycle_attachments WHERE call_id=?",
+                    "SELECT outcome_json FROM lifecycle_submissions WHERE call_id=?",
+                    (call_id,),
+                ).fetchall():
+                    try:
+                        outcome = self._load(row["outcome_json"])
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    if outcome.get("result_id") == result_id:
+                        body = outcome.get("result")
+                        found = True
+                        break
+                if not found:
+                    return {"success": False, "status": "not_found"}
+            else:
+                submission = conn.execute(
+                    "SELECT outcome_json FROM lifecycle_submissions WHERE call_id=? ORDER BY rowid DESC LIMIT 1",
+                    (call_id,),
+                ).fetchone()
+                if submission is not None:
+                    try:
+                        body = self._load(submission["outcome_json"]).get("result")
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        body = None
+            attachments = [
+                {"attachment_id": row["attachment_id"], "filename": row["filename"], "media_type": row["media_type"],
+                 "byte_count": row["byte_count"], "checksum": row["checksum"]}
+                for row in conn.execute(
+                    "SELECT attachment_id, filename, media_type, byte_count, checksum FROM lifecycle_attachments WHERE call_id=?",
                     (call_id,),
                 ).fetchall()
             ]
-        return {
+        result: dict[str, object] = {
             "success": True, "interaction_id": interaction_id, "call_id": call_id,
             "result": body, "attachments": attachments,
         }
+        if isinstance(max_result_bytes, int) and not isinstance(max_result_bytes, bool) and max_result_bytes > 0:
+            if isinstance(body, Mapping):
+                if len(json.dumps(body, separators=(",", ":"))) > max_result_bytes:
+                    truncated = {
+                        key: (value[:max_result_bytes] if isinstance(value, str) else value)
+                        for key, value in dict(body).items()
+                    }
+                    result["result"] = truncated
+                    result["has_more"] = True
+                    result["next_cursor"] = str(max_result_bytes)
+        return result
 
     def read_interaction_attachment(self, caller_id: str, interaction_id: str, attachment_id: str,
                                     offset_bytes: object = 0, max_result_bytes: object = None) -> dict[str, object]:
