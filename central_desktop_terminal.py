@@ -654,7 +654,7 @@ class TkPresentation:
         ring = getattr(client, "ring", None)
         if ring is not None:
             ring.stop(call_id)
-        self._close(call_id)
+        self.close(call_id)
 
     def _answer(self, call_id: str, state: Mapping[str, object]) -> None:
         import tkinter as tk
