@@ -307,13 +307,15 @@ def build_settings_panel(root: Any, ring: Any, central: Any, ringtones_dir: str,
     def on_auto_deny_change(*_args: object) -> None:
         enabled_now = bool(auto_deny_var.get())
         message_entry.config(state="normal" if enabled_now else "disabled")
+        save_button.config(state="normal" if enabled_now else "disabled")
         sync_dnd()
 
     tk.Checkbutton(root, text="勿扰模式（来电自动拒绝）", variable=auto_deny_var).pack(anchor="w", padx=12, pady=6)
     tk.Label(root, text="自动回复消息：").pack(anchor="w", padx=12, pady=(0, 0))
     message_entry = tk.Entry(root, textvariable=message_var, state="normal" if enabled else "disabled")
     message_entry.pack(anchor="w", padx=12, pady=(0, 6))
-    tk.Button(root, text="保存", command=sync_dnd).pack(anchor="w", padx=12, pady=(0, 6))
+    save_button = tk.Button(root, text="保存", command=sync_dnd, state="normal" if enabled else "disabled")
+    save_button.pack(anchor="w", padx=12, pady=(0, 6))
     tk.Label(root, textvariable=dnd_status, fg="gray").pack(anchor="w", padx=12, pady=(0, 6))
 
     auto_deny_var.trace_add("write", on_auto_deny_change)
