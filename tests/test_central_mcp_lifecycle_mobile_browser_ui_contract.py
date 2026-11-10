@@ -189,6 +189,12 @@ def _configured_lifecycle_app(tmp_path: Path, *, operator_id: str = "only-operat
     )
 
 
+def _strip_operation_ids(text: str) -> str:
+    """Neutralise the fresh-per-render operation_id so an inert read still compares byte-identically."""
+
+    return re.sub(r'name="operation_id" value="[^"]*"', 'name="operation_id" value=""', text)
+
+
 def test_cookie_authenticated_initial_page_is_html_and_inert_while_link_or_foreign_session_is_opaque(tmp_path: Path) -> None:
     app, _state = _components(tmp_path, route_mode="iphone")
     call = _create(app)
@@ -302,7 +308,7 @@ def test_configured_runtime_composition_uses_cookie_html_not_legacy_header_json(
         headers={"origin": "https://evil.example", "host": "evil.example"},
     )
     assert bad_origin.status_code in {401, 403, 404}
-    assert _request(app, "GET", f"/calls/{call['call_id']}", cookie="operator-cookie").text == page.text
+    assert _strip_operation_ids(_request(app, "GET", f"/calls/{call['call_id']}", cookie="operator-cookie").text) == _strip_operation_ids(page.text)
 
 
 def test_configured_bark_call_link_establishes_authenticated_cookie_without_exposing_credentials(tmp_path: Path) -> None:
@@ -382,7 +388,7 @@ def test_configured_bark_call_link_establishes_authenticated_cookie_without_expo
     assert page.headers["content-type"].startswith("text/html")
     assert "csrf-61" in page.text
     assert "accept" in page.text.lower()
-    assert _request(app, "GET", call_path, cookie=session_token).text == page.text
+    assert _strip_operation_ids(_request(app, "GET", call_path, cookie=session_token).text) == _strip_operation_ids(page.text)
 
     foreign = _request(app, "GET", call_path, cookie="foreign-cookie")
     assert foreign.status_code in {401, 404}
