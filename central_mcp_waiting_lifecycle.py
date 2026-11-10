@@ -138,6 +138,11 @@ class WaitingLifecycle:
                 payload_json TEXT NOT NULL, outcome_json TEXT NOT NULL,
                 PRIMARY KEY (call_id, submission_id)
               );
+              CREATE TABLE IF NOT EXISTS lifecycle_revisions (
+                caller_id TEXT NOT NULL, interaction_id TEXT NOT NULL, revision_id TEXT NOT NULL,
+                call_id TEXT NOT NULL, payload_json TEXT NOT NULL,
+                PRIMARY KEY (caller_id, interaction_id, revision_id)
+              );
               CREATE TABLE IF NOT EXISTS lifecycle_attachments (
                 attachment_id TEXT PRIMARY KEY, call_id TEXT NOT NULL,
                 filename TEXT NOT NULL, media_type TEXT NOT NULL,
@@ -883,6 +888,87 @@ class WaitingLifecycle:
                 )
                 conn.commit()
                 return {"success": True, "status": "draft_saved", "draft_version": draft_version}
+            except BaseException:
+                conn.rollback()
+                raise
+
+    def resubmit(self, caller_id: str, request_id: str, interaction_id: str, call_id: str,
+                 revision_id: str, payload: Mapping[str, object]) -> dict[str, object]:
+        """Open a new call round for a completed/failed task under a revision."""
+        if not isinstance(revision_id, str) or not revision_id or len(revision_id) > 128:
+            return self._error("invalid_request")
+        if not isinstance(payload, Mapping):
+            return self._error("invalid_request")
+        encoded = self._dump(payload)
+        request_encoded = self._dump({
+            "interaction_id": interaction_id, "call_id": call_id,
+            "revision_id": revision_id, "payload": dict(payload),
+        })
+        busy = {
+            "success": True, "status": "busy", "call_state": None, "call_id": None,
+            "reason": None, "interaction_id": None, "human_action": False,
+            "handled_on": None, "terminal_platform": None, "event_seq": None,
+            "needs_continuation": False, "retryable": True, "retry_after_seconds": 30,
+        }
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = conn.execute(
+                    "SELECT payload_json, outcome_json, operation_kind FROM lifecycle_requests "
+                    "WHERE caller_id=? AND request_id=?",
+                    (caller_id, request_id),
+                ).fetchone()
+                if existing is not None:
+                    if existing["operation_kind"] != "resubmit" or existing["payload_json"] != request_encoded:
+                        return self._error("request_conflict")
+                    return self._load(existing["outcome_json"])
+                self._settle_due(conn)
+                revision = conn.execute(
+                    "SELECT call_id, payload_json FROM lifecycle_revisions "
+                    "WHERE caller_id=? AND interaction_id=? AND revision_id=?",
+                    (caller_id, interaction_id, revision_id),
+                ).fetchone()
+                if revision is not None:
+                    if revision["payload_json"] != encoded:
+                        return self._error("revision_conflict")
+                    outcome = self._heartbeat(interaction_id, revision["call_id"], "ringing")
+                    conn.execute("INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?, 'resubmit')",
+                                 (caller_id, request_id, request_encoded, self._dump(outcome)))
+                    conn.commit()
+                    return outcome
+                parent = conn.execute(
+                    "SELECT * FROM lifecycle_calls WHERE call_id=? AND interaction_id=? AND caller_id=?",
+                    (call_id, interaction_id, caller_id),
+                ).fetchone()
+                if parent is None:
+                    return self._error("session_not_found")
+                if parent["call_state"] not in {"completed", "failed"}:
+                    return self._error("invalid_request")
+                active = conn.execute(
+                    "SELECT call_id FROM lifecycle_calls WHERE call_state IN ('ringing', 'accepted', 'in_progress') LIMIT 1"
+                ).fetchone()
+                if active is not None:
+                    conn.execute("INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?, 'resubmit')",
+                                 (caller_id, request_id, request_encoded, self._dump(busy)))
+                    conn.commit()
+                    return busy
+                new_call_id = str(uuid.uuid4())
+                deadline = self._clock() + self._ring_timeout
+                conn.execute(
+                    "INSERT INTO lifecycle_calls "
+                    "(call_id, interaction_id, caller_id, call_state, ring_deadline, reason, payload_json, agent_reconnect_deadline, invited_desktop_id, mobile_eligible) "
+                    "VALUES (?, ?, ?, 'ringing', ?, NULL, ?, NULL, NULL, 0)",
+                    (new_call_id, interaction_id, caller_id, deadline, encoded),
+                )
+                conn.execute(
+                    "INSERT INTO lifecycle_revisions VALUES (?, ?, ?, ?, ?)",
+                    (caller_id, interaction_id, revision_id, new_call_id, encoded),
+                )
+                outcome = self._heartbeat(interaction_id, new_call_id, "ringing")
+                conn.execute("INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?, 'resubmit')",
+                             (caller_id, request_id, request_encoded, self._dump(outcome)))
+                conn.commit()
+                return outcome
             except BaseException:
                 conn.rollback()
                 raise
@@ -1641,6 +1727,13 @@ class Application:
             if not isinstance(interaction, str) or not isinstance(call_id, str):
                 return self._error("session_not_found"), False
             return self.lifecycle.cancel(caller, request_id, interaction, call_id), False
+        revision_id = body.get("revision_id")
+        if revision_id is not None:
+            payload = body.get("payload")
+            if not isinstance(interaction, str) or not isinstance(call_id, str) or not isinstance(revision_id, str) or not isinstance(payload, Mapping):
+                return self._error("invalid_request"), False
+            replay = self.lifecycle.has_request(caller, request_id)
+            return self.lifecycle.resubmit(caller, request_id, interaction, call_id, revision_id, payload), not replay
         if interaction is not None or call_id is not None:
             after = body.get("after_event_seq", 0)
             if not isinstance(interaction, str) or not isinstance(call_id, str) or isinstance(after, bool) or not isinstance(after, int):
