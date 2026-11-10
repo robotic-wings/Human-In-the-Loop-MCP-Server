@@ -128,6 +128,9 @@ class FakeEntry:
             self.state = str(kwargs["state"])
         return self
 
+    def bind(self, _event: str, _callback: Any) -> str:
+        return "bind-id"
+
 
 class FakeWidget:
     def __init__(self) -> None:
