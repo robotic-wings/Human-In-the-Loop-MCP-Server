@@ -91,6 +91,10 @@ class DesktopTerminalClient:
             return {"success": False, "status": "session_not_found"}
         self.listener.acknowledge(dict(event))
         if state.get("call_state") != "ringing":
+            if state.get("call_state") == "accepted" and state.get("handled_on") == "iphone_web":
+                show_hint = getattr(self.presenter, "show_handled_hint", None)
+                if callable(show_hint):
+                    show_hint(call_id, "已在手机端接听")
             self._close(call_id)
             return {"success": True, "status": "synchronized", "call_id": call_id}
         self._shown[call_id] = version
@@ -276,6 +280,7 @@ def build_settings_panel(root: Any, ring: Any, central: Any, ringtones_dir: str,
     message = dnd.get("message") if isinstance(dnd.get("message"), str) else ""
 
     auto_deny_var = tk.BooleanVar(value=enabled)
+    tk.Label(root, text="自动回复消息：").pack(anchor="w", padx=12, pady=6)
     message_entry = tk.Entry(root)
     message_entry.pack(anchor="w", padx=12, pady=6)
     if message:
@@ -403,6 +408,19 @@ class TkPresentation:
     def close(self, call_id: str) -> None:
         window = self._windows.pop(call_id, None)
         if window is not None:
+            window.destroy()
+
+    def show_handled_hint(self, call_id: str, hint: str) -> None:
+        """Briefly show that the call is now handled elsewhere before closing."""
+        window = self._windows.pop(call_id, None)
+        if window is None:
+            return
+        import tkinter as tk
+        tk.Label(window, text=str(hint)).pack(padx=16, pady=12)
+        after = getattr(window, "after", None)
+        if callable(after):
+            after(1500, window.destroy)
+        else:
             window.destroy()
 
     def _accept(self, call_id: str) -> None:

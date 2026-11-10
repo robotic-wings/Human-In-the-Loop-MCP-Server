@@ -233,6 +233,28 @@ class NotificationRouter:
             self._decision_sink(decisions)
         return {"call_decisions": decisions}
 
+    async def dispatch_desktop_state_change(self, call_id: str, call_state: str, version: int) -> None:
+        """Push an authoritative call-state change to the ready desktop terminal.
+
+        This mirrors the desktop branch of ``_dispatch_row`` but is invoked
+        directly after a mobile action changes the call state, so the desktop
+        stops ringing (or shows a handled hint) without waiting for its next
+        polling synchronization.
+        """
+        terminal = self._registry.ready_desktop()
+        if terminal is None:
+            return
+        payload: dict[str, object] = {"call_id": call_id, "call_state": call_state, "version": version}
+        payload.update(terminal)
+        try:
+            response = self._desktop_dispatch(payload)
+            if inspect.isawaitable(response):
+                await asyncio.wait_for(response, self._desktop_timeout)
+        except (asyncio.TimeoutError, TimeoutError):
+            pass
+        except Exception:
+            pass
+
     async def _dispatch_row(self, row: dict[str, object]) -> None:
         call_id, channel = str(row["call_id"]), str(row["channel"])
         state = self._call_state(call_id) if self._call_state else "ringing"

@@ -857,6 +857,13 @@ class WaitingLifecycle:
             ).fetchall()
         return [{"call_id": row["call_id"], "call_state": row["call_state"], "version": row["version"]} for row in rows]
 
+    def call_version(self, call_id: str) -> int:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT version FROM lifecycle_calls WHERE call_id=?", (call_id,)
+            ).fetchone()
+        return int(row["version"]) if row is not None else 0
+
     def accept(self, *, call_id: str, device_id: str, handled_on: str,
                terminal_platform: str) -> dict[str, object]:
         """Compatibility helper for existing lifecycle consumers.
@@ -1286,6 +1293,12 @@ class Application:
             call_id=call_id, operator_id=operator_id, session_id=browser_session_id,
             operation_id=operation_id, action=parts[3],
         )
+        if parts[3] == "accept" and response.get("success") and response.get("call_state") == "accepted":
+            router = self._notification_router
+            if router is not None:
+                dispatch = getattr(router, "dispatch_desktop_state_change", None)
+                if callable(dispatch):
+                    await dispatch(call_id, "accepted", self.lifecycle.call_version(call_id))
         if cookie_mode:
             view = self._browser_call_view(call_id, operator_id, browser_session_id)
             await self._send_html(send, self._action_status(response), self._render_browser_page(view, csrf_token, response))
