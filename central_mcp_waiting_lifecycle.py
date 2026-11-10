@@ -676,6 +676,11 @@ class WaitingLifecycle:
                         (call_id,),
                     ).fetchone()
                     return self._load(event["body_json"]) if event is not None else self._error("expired")
+                now = self._clock()
+                conn.execute(
+                    "UPDATE lifecycle_calls SET terminal_last_seen_at=?, terminal_disconnect_deadline=? WHERE call_id=?",
+                    (now, now + self._terminal_disconnect_seconds, call_id),
+                )
                 status, state, needs_continuation, extras = self._interpret_submission(result)
                 conn.execute(
                     "UPDATE lifecycle_calls SET call_state=?, reason=NULL, version=version+1 WHERE call_id=?",
@@ -795,6 +800,11 @@ class WaitingLifecycle:
                 ).fetchone()[0])
                 if storage_total + len(content) > self._max_storage_bytes:
                     return self._error("storage_full")
+                now = self._clock()
+                conn.execute(
+                    "UPDATE lifecycle_calls SET terminal_last_seen_at=?, terminal_disconnect_deadline=? WHERE call_id=?",
+                    (now, now + self._terminal_disconnect_seconds, call_id),
+                )
                 attachment_id = str(uuid.uuid4())
                 byte_count = len(content)
                 checksum = hashlib.sha256(content).hexdigest()
@@ -897,6 +907,11 @@ class WaitingLifecycle:
                     return self._error("expired")
                 if draft_version <= int(call["draft_version"]):
                     return self._error("draft_version_conflict")
+                now = self._clock()
+                conn.execute(
+                    "UPDATE lifecycle_calls SET terminal_last_seen_at=?, terminal_disconnect_deadline=? WHERE call_id=?",
+                    (now, now + self._terminal_disconnect_seconds, call_id),
+                )
                 conn.execute(
                     "UPDATE lifecycle_calls SET draft_content=?, draft_version=? WHERE call_id=?",
                     (content, draft_version, call_id),
