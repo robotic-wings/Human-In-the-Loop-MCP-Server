@@ -104,7 +104,7 @@ def test_lifespan_timer_settles_ring_deadline_without_any_followup_request_or_re
 
         ringing = await post(app, {"request_id": "ring", "payload": {"tool": "text"}, "client_timeout_seconds": 8})
         assert ringing["status"] == "heartbeat"
-        assert notifications == [{"call_id": ringing["call_id"], "ring_deadline": clock() + 60}]
+        assert notifications == [{"call_id": ringing["call_id"], "ring_deadline": clock() + 60, "title": "agent-a", "body": "Human-in-the-Loop request"}]
 
         clock.advance(60)
         await timer.tick()
@@ -125,8 +125,14 @@ def test_lifespan_timer_settles_ring_deadline_without_any_followup_request_or_re
             "needs_continuation": False,
             "interaction_id": ringing["interaction_id"],
             "call_id": ringing["call_id"],
+            "human_action": False,
+            "retryable": True,
+            "retry_after_seconds": 60,
+            "handled_on": None,
+            "terminal_platform": None,
+            "message": "人类未接受通信，60 秒内无人接听，这不是主动拒绝，可以稍后重新呼叫。",
         }
-        assert notifications == [{"call_id": ringing["call_id"], "ring_deadline": 1_700_000_060.0}]
+        assert notifications == [{"call_id": ringing["call_id"], "ring_deadline": 1_700_000_060.0, "title": "agent-a", "body": "Human-in-the-Loop request"}]
         await stop_lifespan(task, incoming, sent)
 
     asyncio.run(exercise())
@@ -144,7 +150,7 @@ def test_repeated_ticks_and_restart_do_not_duplicate_expiry_or_rering_and_busy_i
         await asyncio.sleep(0)
         await timer.tick()
         await asyncio.sleep(0)
-        assert first_notifications == [{"call_id": ringing["call_id"], "ring_deadline": 1_700_000_060.0}]
+        assert first_notifications == [{"call_id": ringing["call_id"], "ring_deadline": 1_700_000_060.0, "title": "agent-a", "body": "Human-in-the-Loop request"}]
         await stop_lifespan(task, incoming, sent)
 
         restarted_notifications: list[dict[str, object]] = []
@@ -155,7 +161,7 @@ def test_repeated_ticks_and_restart_do_not_duplicate_expiry_or_rering_and_busy_i
         assert restarted.lifecycle.continue_call("agent-a", "after-restart", ringing["interaction_id"], ringing["call_id"], 0)["event_seq"] == 1
         next_call = await post(restarted, {"request_id": "next", "payload": {"tool": "confirm"}, "client_timeout_seconds": 8}, "token-b")
         assert next_call["status"] == "heartbeat"
-        assert restarted_notifications == [{"call_id": next_call["call_id"], "ring_deadline": clock() + 60}]
+        assert restarted_notifications == [{"call_id": next_call["call_id"], "ring_deadline": clock() + 60, "title": "agent-b", "body": "Human-in-the-Loop request"}]
         await stop_lifespan(restarted_task, restarted_incoming, restarted_sent)
 
     asyncio.run(exercise())
@@ -175,6 +181,6 @@ def test_lifespan_shutdown_cleans_up_runner_without_altering_request_path_deadli
         clock.advance(60)
         terminal = app.lifecycle.accept(call_id=ringing["call_id"], device_id="phone", handled_on="iphone_web", terminal_platform="ios")
         assert terminal["status"] == "not_accepted"
-        assert notifications == [{"call_id": ringing["call_id"], "ring_deadline": 1_700_000_060.0}]
+        assert notifications == [{"call_id": ringing["call_id"], "ring_deadline": 1_700_000_060.0, "title": "agent-a", "body": "Human-in-the-Loop request"}]
 
     asyncio.run(exercise())

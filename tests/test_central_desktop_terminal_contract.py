@@ -79,10 +79,12 @@ class FakeListener:
 @dataclass
 class FakeRing:
     started: list[str] = field(default_factory=list)
+    modes: list[str] = field(default_factory=list)
     stopped: list[str] = field(default_factory=list)
 
-    def start(self, call_id: str) -> None:
+    def start(self, call_id: str, mode: str = "long") -> None:
         self.started.append(call_id)
+        self.modes.append(mode)
 
     def stop(self, call_id: str) -> None:
         self.stopped.append(call_id)
@@ -92,12 +94,16 @@ class FakeRing:
 class FakePresenter:
     shown: list[dict[str, object]] = field(default_factory=list)
     closed: list[str] = field(default_factory=list)
+    hints: list[tuple[str, str]] = field(default_factory=list)
 
     def show(self, state: dict[str, object]) -> None:
         self.shown.append(dict(state))
 
     def close(self, call_id: str) -> None:
         self.closed.append(call_id)
+
+    def show_handled_hint(self, call_id: str, hint: str) -> None:
+        self.hints.append((call_id, hint))
 
 
 def _client(
@@ -312,6 +318,54 @@ def test_sync_wake_and_remote_acceptance_close_stale_desktop_alert_without_takeo
     assert client.accept(call_id="call-1", operation_id="late") == {"success": False, "status": "session_not_found"}
 
 
+def test_remote_acceptance_shows_handled_on_phone_hint_not_silent_close() -> None:
+    central = FakeCentral(states={"call-1": _ringing("call-1")})
+    client = _client(central=central)
+    client.start()
+    client.receive_notification({"call_id": "call-1", "version": 1}, callback_credential="central-callback-secret")
+
+    central.states["call-1"] = {
+        "success": True,
+        "call_id": "call-1",
+        "call_state": "accepted",
+        "handled_on": "iphone_web",
+        "terminal_platform": "ios",
+        "can_accept": False,
+        "can_decline": False,
+    }
+    client.receive_notification({"call_id": "call-1", "version": 2}, callback_credential="central-callback-secret")
+
+    assert client.presenter.hints, "remote acceptance must show a handled-on-phone hint"
+    assert client.presenter.hints[0][0] == "call-1"
+    assert client.presenter.closed == ["call-1"]
+
+
+def test_remote_acceptance_with_unreadable_call_uses_event_state_for_handled_hint() -> None:
+    """After mobile accepts, the desktop cannot read the call (session_not_found).
+
+    The callback event itself still carries the authoritative ``call_state`` and
+    ``handled_on``.  The terminal must fall back to the event rather than return
+    ``session_not_found``, so the "handled on phone" hint is shown and the local
+    alert closes.
+    """
+    central = FakeCentral(states={"call-1": _ringing("call-1")})
+    client = _client(central=central)
+    client.start()
+    client.receive_notification(
+        {"call_id": "call-1", "version": 1},
+        callback_credential="central-callback-secret",
+    )
+
+    central.states["call-1"] = {"success": False, "status": "session_not_found"}
+    event = {"call_id": "call-1", "version": 2, "call_state": "accepted", "handled_on": "iphone_web"}
+    client.receive_notification(event, callback_credential="central-callback-secret")
+
+    assert client.presenter.hints, "event-only handled_on must still show the handled-on-phone hint"
+    assert client.presenter.hints[0][0] == "call-1"
+    assert client.presenter.closed == ["call-1"]
+    assert client.ring.stopped == ["call-1"]
+
+
 def test_central_loss_stops_ringing_and_restart_reauthenticates_before_resync() -> None:
     central = FakeCentral(states={"call-1": _ringing("call-1")})
     client = _client(central=central)
@@ -340,3 +394,37 @@ def test_desktop_public_semantics_are_platform_neutral_and_client_never_exposes_
     assert not hasattr(client, "create_mcp_app")
     assert not hasattr(client, "serve_mcp")
     assert not hasattr(client, "proxy_mcp")
+
+
+def test_desktop_config_has_short_ringtone_path_defaulting_empty() -> None:
+    config = _module().DesktopTerminalConfig.from_mapping({
+        "central_url": "https://10.0.0.1:8443",
+        "terminal_credential": "desktop-secret",
+        "callback_credential": "callback-secret",
+        "listener_host": "10.0.0.61",
+        "listener_port": 9100,
+    })
+    assert getattr(config, "short_ringtone_path", None) == ""
+
+
+def test_short_quiet_mode_rings_short_and_still_presents() -> None:
+    central = FakeCentral(states={"call-1": _ringing("call-1")})
+    client = _client(central=central)
+    client.start()
+    event = {"call_id": "call-1", "version": 1, "call_state": "ringing", "quiet_mode": "short"}
+    result = client.receive_notification(event, callback_credential="central-callback-secret")
+    assert result["status"] == "presented"
+    assert client.ring.modes == ["short"]
+    assert client.ring.started == ["call-1"]
+    assert client.presenter.shown
+
+
+def test_silent_quiet_mode_presents_without_ringing() -> None:
+    central = FakeCentral(states={"call-1": _ringing("call-1")})
+    client = _client(central=central)
+    client.start()
+    event = {"call_id": "call-1", "version": 1, "call_state": "ringing", "quiet_mode": "silent"}
+    result = client.receive_notification(event, callback_credential="central-callback-secret")
+    assert result["status"] == "presented"
+    assert client.ring.started == []
+    assert client.presenter.shown

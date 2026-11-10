@@ -89,6 +89,10 @@ def expected_cancelled(call: dict[str, object], event_seq: int) -> dict[str, obj
         "interaction_id": call["interaction_id"],
         "call_id": call["call_id"],
         "event_seq": event_seq,
+        "retryable": False,
+        "handled_on": None,
+        "terminal_platform": None,
+        "message": "调用方已取消本次通信。",
     }
 
 
@@ -181,5 +185,11 @@ def test_deadline_is_settled_before_late_agent_cancellation(tmp_path: Path) -> N
         "needs_continuation": False,
         "interaction_id": ringing["interaction_id"],
         "call_id": ringing["call_id"],
+        "human_action": False,
+        "retryable": True,
+        "retry_after_seconds": 60,
+        "handled_on": None,
+        "terminal_platform": None,
+        "message": "人类未接受通信，60 秒内无人接听，这不是主动拒绝，可以稍后重新呼叫。",
     }
     assert len(notifications) == 1

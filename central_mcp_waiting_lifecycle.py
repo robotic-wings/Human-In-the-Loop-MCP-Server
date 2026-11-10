@@ -8,6 +8,8 @@ boundaries.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import hmac
 import html
 import json
@@ -26,25 +28,113 @@ Notifier = Callable[[dict[str, object]], None]
 RouteAdmission = Callable[[], Mapping[str, object]]
 
 
+class _RpcError(Exception):
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(message)
+        self.code, self.message = code, message
+
+
+_MCP_TOOLS = (
+    {"name": "get_user_input", "kind": "interaction",
+     "description": "Request a single text or numeric answer from the operator.",
+     "inputSchema": {"type": "object", "properties": {
+         "prompt": {"type": "string"}, "required": {"type": "boolean"},
+         "interaction_id": {"type": "string"}, "call_id": {"type": "string"},
+         "after_event_seq": {"type": "integer"}, "max_result_bytes": {"type": "integer"}}}},
+    {"name": "get_number_input", "kind": "interaction",
+     "description": "Request a numeric answer from the operator.",
+     "inputSchema": {"type": "object", "properties": {
+         "prompt": {"type": "string"}, "required": {"type": "boolean"},
+         "interaction_id": {"type": "string"}, "call_id": {"type": "string"},
+         "after_event_seq": {"type": "integer"}, "max_result_bytes": {"type": "integer"}}}},
+    {"name": "get_user_choice", "kind": "interaction",
+     "description": "Ask the operator to choose one or more options.",
+     "inputSchema": {"type": "object", "properties": {
+         "choices": {"type": "array"}, "prompt": {"type": "string"},
+         "multiple": {"type": "boolean"}, "interaction_id": {"type": "string"},
+         "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}, "max_result_bytes": {"type": "integer"}}}},
+    {"name": "get_multiline_input", "kind": "interaction",
+     "description": "Request a free-form multi-line answer from the operator.",
+     "inputSchema": {"type": "object", "properties": {
+         "prompt": {"type": "string"}, "interaction_id": {"type": "string"},
+         "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}, "max_result_bytes": {"type": "integer"}}}},
+    {"name": "show_confirmation_dialog", "kind": "interaction",
+     "description": "Ask the operator to confirm or deny a proposal.",
+     "inputSchema": {"type": "object", "properties": {
+         "prompt": {"type": "string"}, "interaction_id": {"type": "string"},
+         "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}, "max_result_bytes": {"type": "integer"}}}},
+    {"name": "show_info_message", "kind": "interaction",
+     "description": "Present information and require the operator to acknowledge it.",
+     "inputSchema": {"type": "object", "properties": {
+         "message": {"type": "string"}, "interaction_id": {"type": "string"},
+         "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}, "max_result_bytes": {"type": "integer"}}}},
+    {"name": "get_feedback_from_user", "kind": "interaction",
+     "description": "Request unstructured feedback from the operator.",
+     "inputSchema": {"type": "object", "properties": {
+         "prompt": {"type": "string"}, "interaction_id": {"type": "string"},
+         "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}, "max_result_bytes": {"type": "integer"}}}},
+    {"name": "assign_task_to_human", "kind": "interaction",
+     "description": "Assign a task for the operator to perform and report on.",
+     "inputSchema": {"type": "object", "properties": {
+         "task_description": {"type": "string"}, "interaction_id": {"type": "string"},
+         "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}, "max_result_bytes": {"type": "integer"}}}},
+    {"name": "read_interaction_result", "kind": "read",
+     "description": "Read the full body and attachment list of a saved result.",
+     "inputSchema": {"type": "object", "properties": {
+         "interaction_id": {"type": "string"}, "result_id": {"type": "string"},
+         "cursor": {"type": "string"}, "max_result_bytes": {"type": "integer"}}}},
+    {"name": "read_interaction_attachment", "kind": "read",
+     "description": "Read a byte chunk of a saved attachment.",
+     "inputSchema": {"type": "object", "properties": {
+         "interaction_id": {"type": "string"}, "attachment_id": {"type": "string"},
+         "offset_bytes": {"type": "integer"}, "max_result_bytes": {"type": "integer"}}}},
+    {"name": "get_operator_profile", "kind": "readonly",
+     "description": "Read the operator profile without requesting human action.",
+     "inputSchema": {"type": "object"}},
+    {"name": "health_check", "kind": "readonly",
+     "description": "Report central service health without requesting human action.",
+     "inputSchema": {"type": "object"}},
+    {"name": "get_human_loop_prompt", "kind": "readonly",
+     "description": "Return the human-in-the-loop protocol guidance.",
+     "inputSchema": {"type": "object"}},
+    {"name": "cancel_interaction", "kind": "control",
+     "description": "Cancel an existing call round.",
+     "inputSchema": {"type": "object", "properties": {
+         "interaction_id": {"type": "string"}, "call_id": {"type": "string"}}}},
+)
+
+
 class WaitingLifecycle:
     def __init__(self, path: str | Path, clock: Clock, notify: Notifier, ring_timeout: float,
                  agent_reconnect_seconds: float, terminal_disconnect_seconds: float = 180,
-                 operator_id: str = "only-operator") -> None:
+                 operator_id: str = "only-operator",
+                 max_attachment_bytes: int = 20 * 1024 * 1024,
+                 max_submission_bytes: int = 50 * 1024 * 1024,
+                 max_storage_bytes: int = 1024 * 1024 * 1024) -> None:
         self._path, self._clock, self._notify = str(path), clock, notify
         self._ring_timeout, self._agent_reconnect_seconds = ring_timeout, agent_reconnect_seconds
         self._terminal_disconnect_seconds = terminal_disconnect_seconds
         self._operator_id = operator_id
+        self._max_attachment_bytes = max_attachment_bytes
+        self._max_submission_bytes = max_submission_bytes
+        self._max_storage_bytes = max_storage_bytes
+        self._clock_high_water: float | None = None
+        self._attachments_dir = Path(self._path).parent / "attachments"
         Path(self._path).parent.mkdir(parents=True, exist_ok=True)
+        self._attachments_dir.mkdir(parents=True, exist_ok=True)
         with self._connection() as conn:
             conn.executescript("""
               CREATE TABLE IF NOT EXISTS lifecycle_calls (
                 call_id TEXT PRIMARY KEY, interaction_id TEXT NOT NULL, caller_id TEXT NOT NULL,
                 call_state TEXT NOT NULL, ring_deadline REAL NOT NULL, reason TEXT,
+                payload_json TEXT NOT NULL DEFAULT '{}',
                 owner_device_id TEXT, owner_session_id TEXT, handled_on TEXT,
                 terminal_platform TEXT, invited_desktop_id TEXT,
                 mobile_eligible INTEGER NOT NULL DEFAULT 0,
                 terminal_last_seen_at REAL, terminal_disconnect_deadline REAL,
-                version INTEGER NOT NULL DEFAULT 1
+                version INTEGER NOT NULL DEFAULT 1,
+                draft_content TEXT, draft_version INTEGER NOT NULL DEFAULT 0,
+                created_at REAL, task_version INTEGER NOT NULL DEFAULT 1
               );
               CREATE TABLE IF NOT EXISTS lifecycle_requests (
                 caller_id TEXT NOT NULL, request_id TEXT NOT NULL, payload_json TEXT NOT NULL,
@@ -59,6 +149,27 @@ class WaitingLifecycle:
                 call_id TEXT NOT NULL, submission_id TEXT NOT NULL, actor TEXT NOT NULL,
                 payload_json TEXT NOT NULL, outcome_json TEXT NOT NULL,
                 PRIMARY KEY (call_id, submission_id)
+              );
+              CREATE TABLE IF NOT EXISTS lifecycle_revisions (
+                caller_id TEXT NOT NULL, interaction_id TEXT NOT NULL, revision_id TEXT NOT NULL,
+                call_id TEXT NOT NULL, payload_json TEXT NOT NULL,
+                PRIMARY KEY (caller_id, interaction_id, revision_id)
+              );
+              CREATE TABLE IF NOT EXISTS lifecycle_attachments (
+                attachment_id TEXT PRIMARY KEY, call_id TEXT NOT NULL,
+                filename TEXT NOT NULL, media_type TEXT NOT NULL,
+                byte_count INTEGER NOT NULL, checksum TEXT NOT NULL, stored_path TEXT NOT NULL
+              );
+              CREATE TABLE IF NOT EXISTS lifecycle_dnd (
+                operator_id TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                message TEXT NOT NULL DEFAULT ''
+              );
+              CREATE TABLE IF NOT EXISTS lifecycle_quiet_window (
+                operator_id TEXT PRIMARY KEY,
+                quiet_window_seconds INTEGER NOT NULL DEFAULT 300,
+                quiet_mode TEXT NOT NULL DEFAULT 'short',
+                last_accept_at REAL
               );
             """)
             self._migrate_schema(conn)
@@ -79,12 +190,15 @@ class WaitingLifecycle:
         if "agent_reconnect_deadline" not in columns:
             conn.execute("ALTER TABLE lifecycle_calls ADD COLUMN agent_reconnect_deadline REAL")
         for column, definition in (
+            ("payload_json", "TEXT NOT NULL DEFAULT '{}'"),
             ("owner_device_id", "TEXT"), ("owner_session_id", "TEXT"),
             ("handled_on", "TEXT"), ("terminal_platform", "TEXT"),
             ("invited_desktop_id", "TEXT"),
             ("mobile_eligible", "INTEGER NOT NULL DEFAULT 0"),
             ("terminal_last_seen_at", "REAL"), ("terminal_disconnect_deadline", "REAL"),
             ("version", "INTEGER NOT NULL DEFAULT 1"),
+            ("draft_content", "TEXT"), ("draft_version", "INTEGER NOT NULL DEFAULT 0"),
+            ("created_at", "REAL"), ("task_version", "INTEGER NOT NULL DEFAULT 1"),
         ):
             if column not in columns:
                 conn.execute(f"ALTER TABLE lifecycle_calls ADD COLUMN {column} {definition}")
@@ -105,20 +219,48 @@ class WaitingLifecycle:
                         return self._error("request_conflict")
                     return self._load(existing["outcome_json"])
                 self._settle_due(conn)
+                dnd = self._dnd_state(conn)
+                if dnd["enabled"]:
+                    outcome = {
+                        "success": True, "status": "declined", "reason": "do_not_disturb",
+                        "message": dnd["message"], "human_action": False, "needs_continuation": False,
+                    }
+                    conn.execute("INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?, 'create')", (caller_id, request_id, encoded, self._dump(outcome)))
+                    conn.commit()
+                    return outcome
+                quiet = self._quiet_window_state(conn)
+                last_accept_at = quiet.get("last_accept_at")
+                degraded = last_accept_at is not None and (self._clock() - last_accept_at) < quiet["quiet_window_seconds"]
                 active = conn.execute("SELECT call_id FROM lifecycle_calls WHERE call_state IN ('ringing', 'accepted', 'in_progress') LIMIT 1").fetchone()
                 if active is not None:
-                    outcome = {"success": True, "status": "busy", "call_state": None, "call_id": None, "needs_continuation": False}
+                    outcome = {
+                        "success": True, "status": "busy", "call_state": None, "call_id": None,
+                        "reason": None, "interaction_id": None, "human_action": False,
+                        "handled_on": None, "terminal_platform": None, "event_seq": None,
+                        "needs_continuation": False, "retryable": True, "retry_after_seconds": 30,
+                    }
                 else:
                     call_id, interaction_id = str(uuid.uuid4()), str(uuid.uuid4())
                     deadline = self._clock() + self._ring_timeout
                     conn.execute(
                         "INSERT INTO lifecycle_calls "
-                        "(call_id, interaction_id, caller_id, call_state, ring_deadline, reason, agent_reconnect_deadline, invited_desktop_id, mobile_eligible) "
-                        "VALUES (?, ?, ?, 'ringing', ?, NULL, NULL, ?, ?)",
-                        (call_id, interaction_id, caller_id, deadline, invited_desktop_id, int(mobile_eligible)),
+                        "(call_id, interaction_id, caller_id, call_state, ring_deadline, reason, payload_json, agent_reconnect_deadline, invited_desktop_id, mobile_eligible, created_at) "
+                        "VALUES (?, ?, ?, 'ringing', ?, NULL, ?, NULL, ?, ?, ?)",
+                        (call_id, interaction_id, caller_id, deadline, encoded, invited_desktop_id, int(mobile_eligible), self._clock()),
                     )
                     outcome = self._heartbeat(interaction_id, call_id, "ringing")
-                    notification = {"call_id": call_id, "ring_deadline": deadline}
+                    short_title = next(
+                        (str(payload.get(key)) for key in ("title", "task_description", "prompt", "message")
+                         if isinstance(payload.get(key), str) and payload.get(key).strip()),
+                        "Human-in-the-Loop request",
+                    )
+                    notification = {
+                        "call_id": call_id, "ring_deadline": deadline,
+                        "title": caller_id, "body": " ".join(short_title.split())[:200],
+                    }
+                    if degraded:
+                        notification["degraded"] = True
+                        notification["quiet_mode"] = quiet["quiet_mode"]
                 conn.execute("INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?, 'create')", (caller_id, request_id, encoded, self._dump(outcome)))
                 conn.commit()
             except BaseException:
@@ -127,6 +269,82 @@ class WaitingLifecycle:
         if notification is not None:
             self._notify(notification)
         return outcome
+
+    def set_dnd(self, enabled: bool, message: str) -> dict[str, object]:
+        """Persist the operator-level do-not-disturb state and auto-reply."""
+        message = message if isinstance(message, str) else ""
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "INSERT INTO lifecycle_dnd (operator_id, enabled, message) VALUES (?, ?, ?) "
+                    "ON CONFLICT(operator_id) DO UPDATE SET enabled=excluded.enabled, message=excluded.message",
+                    (self._operator_id, int(enabled), message),
+                )
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        return {"success": True, "enabled": bool(enabled), "message": message}
+
+    def get_dnd(self) -> dict[str, object]:
+        with self._connection() as conn:
+            state = self._dnd_state(conn)
+        return {"success": True, **state}
+
+    def _dnd_state(self, conn: sqlite3.Connection) -> dict[str, object]:
+        row = conn.execute(
+            "SELECT enabled, message FROM lifecycle_dnd WHERE operator_id=?", (self._operator_id,)
+        ).fetchone()
+        if row is None:
+            return {"enabled": False, "message": ""}
+        return {"enabled": bool(row["enabled"]), "message": str(row["message"])}
+
+    def get_quiet_window(self) -> dict[str, object]:
+        with self._connection() as conn:
+            state = self._quiet_window_state(conn)
+        return {"success": True, **state}
+
+    def set_quiet_window(self, quiet_window_seconds: int, quiet_mode: str) -> dict[str, object]:
+        if isinstance(quiet_window_seconds, bool) or not isinstance(quiet_window_seconds, int) or quiet_window_seconds < 0:
+            return self._error("invalid_request")
+        if quiet_mode not in {"short", "silent"}:
+            return self._error("invalid_request")
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "INSERT INTO lifecycle_quiet_window (operator_id, quiet_window_seconds, quiet_mode, last_accept_at) "
+                    "VALUES (?, ?, ?, NULL) "
+                    "ON CONFLICT(operator_id) DO UPDATE SET quiet_window_seconds=excluded.quiet_window_seconds, quiet_mode=excluded.quiet_mode",
+                    (self._operator_id, quiet_window_seconds, quiet_mode),
+                )
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        return {"success": True, "quiet_window_seconds": quiet_window_seconds, "quiet_mode": quiet_mode}
+
+    def _quiet_window_state(self, conn: sqlite3.Connection) -> dict[str, object]:
+        row = conn.execute(
+            "SELECT quiet_window_seconds, quiet_mode, last_accept_at FROM lifecycle_quiet_window WHERE operator_id=?",
+            (self._operator_id,),
+        ).fetchone()
+        if row is None:
+            return {"quiet_window_seconds": 300, "quiet_mode": "short", "last_accept_at": None}
+        return {
+            "quiet_window_seconds": int(row["quiet_window_seconds"]),
+            "quiet_mode": str(row["quiet_mode"]),
+            "last_accept_at": row["last_accept_at"],
+        }
+
+    def _record_accept(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "INSERT INTO lifecycle_quiet_window (operator_id, quiet_window_seconds, quiet_mode, last_accept_at) "
+            "VALUES (?, 300, 'short', ?) "
+            "ON CONFLICT(operator_id) DO UPDATE SET last_accept_at=excluded.last_accept_at",
+            (self._operator_id, self._clock()),
+        )
 
     def has_request(self, caller_id: str, request_id: str) -> bool:
         with self._connection() as conn:
@@ -160,6 +378,7 @@ class WaitingLifecycle:
                 event = conn.execute("SELECT body_json FROM lifecycle_events WHERE call_id=? AND event_seq>? ORDER BY event_seq LIMIT 1", (call_id, after)).fetchone()
                 if event is not None:
                     outcome = self._load(event["body_json"])
+                    outcome = self._apply_result_budget(outcome, call["payload_json"])
                 elif call["call_state"] in {"ringing", "accepted", "in_progress"}:
                     outcome = self._heartbeat(interaction_id, call_id, call["call_state"])
                 else:
@@ -244,6 +463,13 @@ class WaitingLifecycle:
     def response_delivered(self, caller_id: str, response: Mapping[str, object]) -> None:
         """Persist grace only after a newly executed resumable response is sent."""
         status, state = response.get("status"), response.get("call_state")
+        # A ringing heartbeat is the normal end of an HTTP wait leg.  It is
+        # not evidence that the caller has disconnected: the same agent may
+        # immediately continue with this interaction/call pair, and the
+        # absolute ring deadline already governs an unanswered invitation.
+        # Never arm agent-disconnect expiry for this state.
+        if state == "ringing":
+            return
         if state not in {"ringing", "accepted", "in_progress"}:
             return
         if status != "heartbeat" and not (status == "opened" and state == "accepted") and not (
@@ -361,12 +587,24 @@ class WaitingLifecycle:
                     outcome = self._load(event["body_json"]) if event else self._error("expired")
                 else:
                     state, status, reason = ("accepted", "opened", None) if action == "accept" else ("declined", "declined", "human_declined")
-                    conn.execute(
-                        "UPDATE lifecycle_calls SET call_state=?, reason=?, owner_device_id=?, owner_session_id=?, handled_on='desktop', terminal_platform=?, terminal_last_seen_at=?, terminal_disconnect_deadline=?, agent_reconnect_deadline=?, version=version+1 WHERE call_id=?",
-                        (state, reason, device_id, session_id, terminal_platform, self._clock(),
-                         self._clock() + self._terminal_disconnect_seconds if action == "accept" else None,
-                         None, call_id),
-                    )
+                    if action == "accept":
+                        conn.execute(
+                            "UPDATE lifecycle_calls SET call_state=?, reason=?, owner_device_id=?, owner_session_id=?, handled_on='desktop', terminal_platform=?, terminal_last_seen_at=?, terminal_disconnect_deadline=?, agent_reconnect_deadline=?, version=version+1 WHERE call_id=?",
+                            (state, reason, device_id, session_id, terminal_platform, self._clock(),
+                             self._clock() + self._terminal_disconnect_seconds, None, call_id),
+                        )
+                        self._record_accept(conn)
+                    else:
+                        # A decline ends the invitation without assigning a
+                        # processing owner.  Keep its audit endpoint separate
+                        # from handled_on / terminal_platform.  The internal
+                        # device/session association remains so the declining
+                        # desktop receives the terminal state on its next
+                        # synchronization and can close its old alert.
+                        conn.execute(
+                            "UPDATE lifecycle_calls SET call_state=?, reason=?, owner_device_id=?, owner_session_id=?, handled_on=NULL, terminal_platform=NULL, terminal_last_seen_at=NULL, terminal_disconnect_deadline=NULL, agent_reconnect_deadline=NULL, version=version+1 WHERE call_id=?",
+                            (state, reason, device_id, session_id, call_id),
+                        )
                     seq = int(conn.execute("SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call_id,)).fetchone()["n"])
                     outcome: dict[str, object] = {
                         "success": True, "status": status, "call_state": state, "human_action": True,
@@ -377,7 +615,8 @@ class WaitingLifecycle:
                         outcome.update(owner_device_id=device_id, owner_session_id=session_id,
                                        handled_on="desktop", terminal_platform=terminal_platform)
                     else:
-                        outcome["reason"] = reason
+                        outcome.update(reason=reason, acted_on="desktop", handled_on=None,
+                                       terminal_platform=None, retryable=False)
                     conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call_id, seq, self._dump(outcome)))
                 conn.execute("INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?, ?)", (actor, operation_id, encoded, self._dump(outcome), kind))
                 conn.commit()
@@ -434,12 +673,18 @@ class WaitingLifecycle:
                     else ("declined", "declined", "human_declined")
                 )
                 now = self._clock()
-                conn.execute(
-                    "UPDATE lifecycle_calls SET call_state=?, reason=?, owner_device_id=?, owner_session_id=?, handled_on='iphone_web', terminal_platform='ios', terminal_last_seen_at=?, terminal_disconnect_deadline=?, agent_reconnect_deadline=?, version=version+1 WHERE call_id=?",
-                    (state, reason, "iphone_web", session_id, now,
-                     now + self._terminal_disconnect_seconds if action == "accept" else None,
-                     None, call_id),
-                )
+                if action == "accept":
+                    conn.execute(
+                        "UPDATE lifecycle_calls SET call_state=?, reason=?, owner_device_id=?, owner_session_id=?, handled_on='iphone_web', terminal_platform='ios', terminal_last_seen_at=?, terminal_disconnect_deadline=?, agent_reconnect_deadline=?, version=version+1 WHERE call_id=?",
+                        (state, reason, "iphone_web", session_id, now,
+                         now + self._terminal_disconnect_seconds, None, call_id),
+                    )
+                    self._record_accept(conn)
+                else:
+                    conn.execute(
+                        "UPDATE lifecycle_calls SET call_state=?, reason=?, owner_device_id=?, owner_session_id=?, handled_on=NULL, terminal_platform=NULL, terminal_last_seen_at=NULL, terminal_disconnect_deadline=NULL, agent_reconnect_deadline=NULL, version=version+1 WHERE call_id=?",
+                        (state, reason, "iphone_web", session_id, call_id),
+                    )
                 seq = int(conn.execute(
                     "SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call_id,)
                 ).fetchone()["n"])
@@ -452,7 +697,8 @@ class WaitingLifecycle:
                     outcome.update(owner_device_id="iphone_web", owner_session_id=session_id,
                                    handled_on="iphone_web", terminal_platform="ios")
                 else:
-                    outcome["reason"] = reason
+                    outcome.update(reason=reason, acted_on="iphone_web", handled_on=None,
+                                   terminal_platform=None, retryable=False)
                 conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call_id, seq, self._dump(outcome)))
                 conn.execute("INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?, ?)",
                              (actor, operation_id, encoded, self._dump(outcome), kind))
@@ -463,7 +709,8 @@ class WaitingLifecycle:
                 raise
 
     def submit(self, *, call_id: str, device_id: str, session_id: str,
-               submission_id: str, result: Mapping[str, object]) -> dict[str, object]:
+               submission_id: str, result: Mapping[str, object],
+               task_version: int | None = None) -> dict[str, object]:
         """Persist one final answer from the exact session which owns a call."""
         if not submission_id or len(submission_id) > 128:
             return self._error("invalid_request")
@@ -490,19 +737,32 @@ class WaitingLifecycle:
                         (call_id,),
                     ).fetchone()
                     return self._load(event["body_json"]) if event is not None else self._error("expired")
+                if isinstance(task_version, int) and not isinstance(task_version, bool) and task_version != int(call["task_version"]):
+                    return self._error("task_version_conflict")
+                now = self._clock()
                 conn.execute(
-                    "UPDATE lifecycle_calls SET call_state='answered', reason=NULL, version=version+1 WHERE call_id=?",
-                    (call_id,),
+                    "UPDATE lifecycle_calls SET terminal_last_seen_at=?, terminal_disconnect_deadline=? WHERE call_id=?",
+                    (now, now + self._terminal_disconnect_seconds, call_id),
+                )
+                status, state, needs_continuation, extras = self._interpret_submission(result)
+                conn.execute(
+                    "UPDATE lifecycle_calls SET call_state=?, reason=NULL, version=version+1 WHERE call_id=?",
+                    (state, call_id),
                 )
                 seq = int(conn.execute(
                     "SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call_id,)
                 ).fetchone()["n"])
                 outcome: dict[str, object] = {
-                    "success": True, "status": "answered", "call_state": "answered", "human_action": True,
-                    "needs_continuation": False, "interaction_id": call["interaction_id"], "call_id": call_id,
+                    "success": True, "status": status, "call_state": state, "human_action": True,
+                    "needs_continuation": needs_continuation, "interaction_id": call["interaction_id"], "call_id": call_id,
                     "event_seq": seq, "handled_on": call["handled_on"],
                     "terminal_platform": call["terminal_platform"], "result": dict(result),
+                    "result_id": str(uuid.uuid4()),
                 }
+                outcome.update(extras)
+                attachments = dict(result).get("attachments")
+                if isinstance(attachments, list):
+                    outcome["attachments"] = self._resolve_attachments(conn, call_id, attachments)
                 conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call_id, seq, self._dump(outcome)))
                 conn.execute("INSERT INTO lifecycle_submissions VALUES (?, ?, ?, ?, ?)",
                              (call_id, submission_id, actor, encoded, self._dump(outcome)))
@@ -511,6 +771,149 @@ class WaitingLifecycle:
             except BaseException:
                 conn.rollback()
                 raise
+
+    def terminal_cancel(self, *, call_id: str, device_id: str, session_id: str,
+                        operation_id: str) -> dict[str, object]:
+        """Cancel an accepted call from its exact owning terminal session.
+
+        A human cancellation is an immutable terminal event distinct from an
+        Agent cancellation: it records ``reason='human_cancelled'`` with
+        ``human_action=True`` and releases the single busy slot.
+        """
+        actor = f"terminal_cancel:{session_id}"
+        encoded = self._dump({"call_id": call_id})
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = conn.execute(
+                    "SELECT payload_json, outcome_json, operation_kind FROM lifecycle_requests "
+                    "WHERE caller_id=? AND request_id=?",
+                    (actor, operation_id),
+                ).fetchone()
+                if existing is not None:
+                    if existing["operation_kind"] != "terminal_cancel" or existing["payload_json"] != encoded:
+                        return self._error("request_conflict")
+                    return self._load(existing["outcome_json"])
+                self._settle_due(conn)
+                call = conn.execute("SELECT * FROM lifecycle_calls WHERE call_id=?", (call_id,)).fetchone()
+                if call is None or call["owner_device_id"] != device_id or call["owner_session_id"] != session_id:
+                    return self._error("session_not_found")
+                if call["call_state"] not in {"accepted", "in_progress"}:
+                    event = conn.execute(
+                        "SELECT body_json FROM lifecycle_events WHERE call_id=? ORDER BY event_seq DESC LIMIT 1",
+                        (call_id,),
+                    ).fetchone()
+                    outcome = self._load(event["body_json"]) if event is not None else self._error("expired")
+                else:
+                    conn.execute(
+                        "UPDATE lifecycle_calls SET call_state='cancelled', reason='human_cancelled', version=version+1 WHERE call_id=?",
+                        (call_id,),
+                    )
+                    seq = int(conn.execute(
+                        "SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?",
+                        (call_id,),
+                    ).fetchone()["n"])
+                    outcome: dict[str, object] = {
+                        "success": True, "status": "cancelled", "call_state": "cancelled",
+                        "reason": "human_cancelled", "human_action": True, "needs_continuation": False,
+                        "interaction_id": call["interaction_id"], "call_id": call_id, "event_seq": seq,
+                        "handled_on": call["handled_on"], "terminal_platform": call["terminal_platform"],
+                    }
+                    conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call_id, seq, self._dump(outcome)))
+                conn.execute("INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?, ?)",
+                             (actor, operation_id, encoded, self._dump(outcome), "terminal_cancel"))
+                conn.commit()
+                return outcome
+            except BaseException:
+                conn.rollback()
+                raise
+
+    def upload_attachment(self, *, call_id: str, device_id: str, session_id: str,
+                          filename: str, media_type: str, content: bytes) -> dict[str, object]:
+        """Store one file body centrally and return its server-owned metadata.
+
+        The file entity lives in the central data directory, never on the
+        submitting terminal; the returned ``attachment_id`` is the only handle
+        the Agent and later submissions may reference.
+        """
+        if not filename or not isinstance(filename, str):
+            return self._error("invalid_request")
+        if not isinstance(content, bytes) or not content:
+            return self._error("invalid_request")
+        media_type = media_type if isinstance(media_type, str) and media_type else "application/octet-stream"
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._settle_due(conn)
+                call = conn.execute("SELECT * FROM lifecycle_calls WHERE call_id=?", (call_id,)).fetchone()
+                if call is None or call["owner_device_id"] != device_id or call["owner_session_id"] != session_id:
+                    return self._error("session_not_found")
+                if call["call_state"] not in {"accepted", "in_progress"}:
+                    return self._error("expired")
+                if len(content) > self._max_attachment_bytes:
+                    return self._error("attachment_too_large")
+                submission_total = int(conn.execute(
+                    "SELECT COALESCE(SUM(byte_count), 0) FROM lifecycle_attachments WHERE call_id=?",
+                    (call_id,),
+                ).fetchone()[0])
+                if submission_total + len(content) > self._max_submission_bytes:
+                    return self._error("submission_too_large")
+                storage_total = int(conn.execute(
+                    "SELECT COALESCE(SUM(byte_count), 0) FROM lifecycle_attachments",
+                ).fetchone()[0])
+                if storage_total + len(content) > self._max_storage_bytes:
+                    return self._error("storage_full")
+                now = self._clock()
+                conn.execute(
+                    "UPDATE lifecycle_calls SET terminal_last_seen_at=?, terminal_disconnect_deadline=? WHERE call_id=?",
+                    (now, now + self._terminal_disconnect_seconds, call_id),
+                )
+                attachment_id = str(uuid.uuid4())
+                byte_count = len(content)
+                checksum = hashlib.sha256(content).hexdigest()
+                stored_path = self._attachments_dir / f"{attachment_id}.bin"
+                stored_path.write_bytes(content)
+                conn.execute(
+                    "INSERT INTO lifecycle_attachments "
+                    "(attachment_id, call_id, filename, media_type, byte_count, checksum, stored_path) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (attachment_id, call_id, filename, media_type, byte_count, checksum, str(stored_path)),
+                )
+                conn.commit()
+                return {
+                    "success": True, "attachment_id": attachment_id, "filename": filename,
+                    "media_type": media_type, "byte_count": byte_count, "checksum": checksum,
+                }
+            except BaseException:
+                conn.rollback()
+                raise
+
+    def _attachment_metadata(self, conn: sqlite3.Connection, call_id: str,
+                             attachment_id: str) -> dict[str, object] | None:
+        row = conn.execute(
+            "SELECT attachment_id, filename, media_type, byte_count, checksum "
+            "FROM lifecycle_attachments WHERE call_id=? AND attachment_id=?",
+            (call_id, attachment_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "attachment_id": row["attachment_id"], "filename": row["filename"],
+            "media_type": row["media_type"], "byte_count": row["byte_count"], "checksum": row["checksum"],
+        }
+
+    def _resolve_attachments(self, conn: sqlite3.Connection, call_id: str,
+                             attachment_ids: Any) -> list[dict[str, object]]:
+        resolved: list[dict[str, object]] = []
+        if not isinstance(attachment_ids, list):
+            return resolved
+        for attachment_id in attachment_ids:
+            if not isinstance(attachment_id, str):
+                continue
+            metadata = self._attachment_metadata(conn, call_id, attachment_id)
+            if metadata is not None:
+                resolved.append(metadata)
+        return resolved
 
     def terminal_heartbeat(self, *, call_id: str, session_id: str) -> dict[str, object]:
         """Refresh liveness only for the exact session which accepted the call."""
@@ -542,12 +945,332 @@ class WaitingLifecycle:
                 raise
 
     def terminal_states(self, device_id: str) -> list[dict[str, object]]:
+        now = self._clock()
         with self._connection() as conn:
-            rows = conn.execute(
-                "SELECT call_id, call_state, version FROM lifecycle_calls WHERE owner_device_id=? ORDER BY call_id",
-                (device_id,),
-            ).fetchall()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._settle_due(conn)
+                # A terminal's periodic sync proves it is alive: refresh the
+                # liveness timestamp of every in-flight call it owns so an
+                # actively-connected terminal never has its call disconnected
+                # underneath it while the human is still filling a form.
+                conn.execute(
+                    "UPDATE lifecycle_calls SET terminal_last_seen_at=?, terminal_disconnect_deadline=? "
+                    "WHERE owner_device_id=? AND call_state IN ('accepted','in_progress')",
+                    (now, now + self._terminal_disconnect_seconds, device_id),
+                )
+                rows = conn.execute(
+                    "SELECT call_id, call_state, version FROM lifecycle_calls WHERE owner_device_id=? ORDER BY call_id",
+                    (device_id,),
+                ).fetchall()
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
         return [{"call_id": row["call_id"], "call_state": row["call_state"], "version": row["version"]} for row in rows]
+
+    def save_draft(self, *, call_id: str, device_id: str, session_id: str,
+                   draft_version: int, content: str) -> dict[str, object]:
+        """Persist a partial answer draft without changing the call state."""
+        if isinstance(draft_version, bool) or not isinstance(draft_version, int) or draft_version < 0:
+            return self._error("invalid_request")
+        if not isinstance(content, str):
+            return self._error("invalid_request")
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._settle_due(conn)
+                call = conn.execute("SELECT * FROM lifecycle_calls WHERE call_id=?", (call_id,)).fetchone()
+                if call is None or call["owner_device_id"] != device_id or call["owner_session_id"] != session_id:
+                    return self._error("session_not_found")
+                if call["call_state"] not in {"accepted", "in_progress"}:
+                    return self._error("expired")
+                if draft_version <= int(call["draft_version"]):
+                    return self._error("draft_version_conflict")
+                now = self._clock()
+                conn.execute(
+                    "UPDATE lifecycle_calls SET terminal_last_seen_at=?, terminal_disconnect_deadline=? WHERE call_id=?",
+                    (now, now + self._terminal_disconnect_seconds, call_id),
+                )
+                conn.execute(
+                    "UPDATE lifecycle_calls SET draft_content=?, draft_version=? WHERE call_id=?",
+                    (content, draft_version, call_id),
+                )
+                conn.commit()
+                return {"success": True, "status": "draft_saved", "draft_version": draft_version}
+            except BaseException:
+                conn.rollback()
+                raise
+
+    def resubmit(self, caller_id: str, request_id: str, interaction_id: str, call_id: str,
+                 revision_id: str, payload: Mapping[str, object],
+                 invited_desktop_id: str | None = None, mobile_eligible: bool = False) -> dict[str, object]:
+        """Open a new call round for a completed/failed task under a revision."""
+        if not isinstance(revision_id, str) or not revision_id or len(revision_id) > 128:
+            return self._error("invalid_request")
+        if not isinstance(payload, Mapping):
+            return self._error("invalid_request")
+        encoded = self._dump(payload)
+        request_encoded = self._dump({
+            "interaction_id": interaction_id, "call_id": call_id,
+            "revision_id": revision_id, "payload": dict(payload),
+        })
+        notification: dict[str, object] | None = None
+        busy = {
+            "success": True, "status": "busy", "call_state": None, "call_id": None,
+            "reason": None, "interaction_id": None, "human_action": False,
+            "handled_on": None, "terminal_platform": None, "event_seq": None,
+            "needs_continuation": False, "retryable": True, "retry_after_seconds": 30,
+        }
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = conn.execute(
+                    "SELECT payload_json, outcome_json, operation_kind FROM lifecycle_requests "
+                    "WHERE caller_id=? AND request_id=?",
+                    (caller_id, request_id),
+                ).fetchone()
+                if existing is not None:
+                    if existing["operation_kind"] != "resubmit" or existing["payload_json"] != request_encoded:
+                        return self._error("request_conflict")
+                    return self._load(existing["outcome_json"])
+                self._settle_due(conn)
+                revision = conn.execute(
+                    "SELECT call_id, payload_json FROM lifecycle_revisions "
+                    "WHERE caller_id=? AND interaction_id=? AND revision_id=?",
+                    (caller_id, interaction_id, revision_id),
+                ).fetchone()
+                if revision is not None:
+                    if revision["payload_json"] != encoded:
+                        return self._error("revision_conflict")
+                    outcome = self._heartbeat(interaction_id, revision["call_id"], "ringing")
+                    conn.execute("INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?, 'resubmit')",
+                                 (caller_id, request_id, request_encoded, self._dump(outcome)))
+                    conn.commit()
+                    return outcome
+                parent = conn.execute(
+                    "SELECT * FROM lifecycle_calls WHERE call_id=? AND interaction_id=? AND caller_id=?",
+                    (call_id, interaction_id, caller_id),
+                ).fetchone()
+                if parent is None:
+                    return self._error("session_not_found")
+                if parent["call_state"] not in {"completed", "failed"}:
+                    return self._error("invalid_request")
+                active = conn.execute(
+                    "SELECT call_id FROM lifecycle_calls WHERE call_state IN ('ringing', 'accepted', 'in_progress') LIMIT 1"
+                ).fetchone()
+                if active is not None:
+                    conn.execute("INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?, 'resubmit')",
+                                 (caller_id, request_id, request_encoded, self._dump(busy)))
+                    conn.commit()
+                    return busy
+                new_call_id = str(uuid.uuid4())
+                deadline = self._clock() + self._ring_timeout
+                conn.execute(
+                    "INSERT INTO lifecycle_calls "
+                    "(call_id, interaction_id, caller_id, call_state, ring_deadline, reason, payload_json, agent_reconnect_deadline, invited_desktop_id, mobile_eligible, created_at) "
+                    "VALUES (?, ?, ?, 'ringing', ?, NULL, ?, NULL, ?, ?, ?)",
+                    (new_call_id, interaction_id, caller_id, deadline, encoded,
+                     invited_desktop_id, int(mobile_eligible), self._clock()),
+                )
+                conn.execute(
+                    "INSERT INTO lifecycle_revisions VALUES (?, ?, ?, ?, ?)",
+                    (caller_id, interaction_id, revision_id, new_call_id, encoded),
+                )
+                outcome = self._heartbeat(interaction_id, new_call_id, "ringing")
+                short_title = next(
+                    (str(payload.get(key)) for key in ("title", "task_description", "prompt", "message")
+                     if isinstance(payload.get(key), str) and payload.get(key).strip()),
+                    "Human-in-the-Loop request",
+                )
+                notification = {
+                    "call_id": new_call_id, "ring_deadline": deadline,
+                    "title": caller_id, "body": " ".join(short_title.split())[:200],
+                }
+                conn.execute("INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?, 'resubmit')",
+                             (caller_id, request_id, request_encoded, self._dump(outcome)))
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        if notification is not None:
+            self._notify(notification)
+        return outcome
+
+    def update_task_description(self, caller_id: str, request_id: str, interaction_id: str, call_id: str,
+                                expected_task_version: int, task_description: str | None = None,
+                                context_note: str | None = None) -> dict[str, object]:
+        """Update an in-progress task's description/context without re-ringing."""
+        if isinstance(expected_task_version, bool) or not isinstance(expected_task_version, int) or expected_task_version < 0:
+            return self._error("invalid_request")
+        request_encoded = self._dump({
+            "interaction_id": interaction_id, "call_id": call_id,
+            "expected_task_version": expected_task_version,
+            "task_description": task_description, "context_note": context_note,
+        })
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = conn.execute(
+                    "SELECT payload_json, outcome_json, operation_kind FROM lifecycle_requests "
+                    "WHERE caller_id=? AND request_id=?",
+                    (caller_id, request_id),
+                ).fetchone()
+                if existing is not None:
+                    if existing["operation_kind"] != "task_update" or existing["payload_json"] != request_encoded:
+                        return self._error("request_conflict")
+                    return self._load(existing["outcome_json"])
+                self._settle_due(conn)
+                call = conn.execute(
+                    "SELECT * FROM lifecycle_calls WHERE call_id=? AND interaction_id=? AND caller_id=?",
+                    (call_id, interaction_id, caller_id),
+                ).fetchone()
+                if call is None:
+                    return self._error("session_not_found")
+                if call["call_state"] != "in_progress":
+                    return self._error("invalid_request")
+                if expected_task_version != int(call["task_version"]):
+                    return self._error("task_version_conflict")
+                try:
+                    payload = self._load(call["payload_json"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    payload = {}
+                if not isinstance(payload, dict):
+                    payload = {}
+                if task_description is not None:
+                    payload["task_description"] = task_description
+                if context_note is not None:
+                    payload["context_note"] = context_note
+                conn.execute(
+                    "UPDATE lifecycle_calls SET payload_json=?, task_version=task_version+1, version=version+1 WHERE call_id=?",
+                    (self._dump(payload), call_id),
+                )
+                outcome = {"success": True, "status": "task_updated", "task_version": int(call["task_version"]) + 1}
+                conn.execute("INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?, 'task_update')",
+                             (caller_id, request_id, request_encoded, self._dump(outcome)))
+                conn.commit()
+                return outcome
+            except BaseException:
+                conn.rollback()
+                raise
+
+    def call_version(self, call_id: str) -> int:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT version FROM lifecycle_calls WHERE call_id=?", (call_id,)
+            ).fetchone()
+        return int(row["version"]) if row is not None else 0
+
+    def read_interaction_result(self, caller_id: str, interaction_id: str,
+                                result_id: object = None, cursor: object = None,
+                                max_result_bytes: object = None) -> dict[str, object]:
+        offset = 0
+        if isinstance(cursor, str):
+            try:
+                parsed = int(cursor)
+            except ValueError:
+                parsed = 0
+            if parsed >= 0:
+                offset = parsed
+        with self._connection() as conn:
+            call = conn.execute(
+                "SELECT call_id FROM lifecycle_calls WHERE interaction_id=? AND caller_id=? LIMIT 1",
+                (interaction_id, caller_id),
+            ).fetchone()
+            if call is None:
+                return {"success": False, "status": "session_not_found"}
+            call_id = call["call_id"]
+            body: object = None
+            if isinstance(result_id, str) and result_id:
+                found = False
+                for row in conn.execute(
+                    "SELECT outcome_json FROM lifecycle_submissions WHERE call_id=?",
+                    (call_id,),
+                ).fetchall():
+                    try:
+                        outcome = self._load(row["outcome_json"])
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    if outcome.get("result_id") == result_id:
+                        body = outcome.get("result")
+                        found = True
+                        break
+                if not found:
+                    return {"success": False, "status": "not_found"}
+            else:
+                submission = conn.execute(
+                    "SELECT outcome_json FROM lifecycle_submissions WHERE call_id=? ORDER BY rowid DESC LIMIT 1",
+                    (call_id,),
+                ).fetchone()
+                if submission is not None:
+                    try:
+                        body = self._load(submission["outcome_json"]).get("result")
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        body = None
+            attachments = [
+                {"attachment_id": row["attachment_id"], "filename": row["filename"], "media_type": row["media_type"],
+                 "byte_count": row["byte_count"], "checksum": row["checksum"]}
+                for row in conn.execute(
+                    "SELECT attachment_id, filename, media_type, byte_count, checksum FROM lifecycle_attachments WHERE call_id=?",
+                    (call_id,),
+                ).fetchall()
+            ]
+        result: dict[str, object] = {
+            "success": True, "interaction_id": interaction_id, "call_id": call_id,
+            "result": body, "attachments": attachments,
+        }
+        if isinstance(max_result_bytes, int) and not isinstance(max_result_bytes, bool) and max_result_bytes > 0:
+            if isinstance(body, Mapping):
+                string_lengths = [len(value) for value in body.values() if isinstance(value, str)]
+                total_length = max(string_lengths) if string_lengths else 0
+                if len(json.dumps(body, separators=(",", ":"))) > max_result_bytes:
+                    sliced = {
+                        key: (value[offset:offset + max_result_bytes] if isinstance(value, str) else value)
+                        for key, value in dict(body).items()
+                    }
+                    result["result"] = sliced
+                    has_more = offset + max_result_bytes < total_length
+                    if has_more:
+                        result["has_more"] = True
+                        result["next_cursor"] = str(offset + max_result_bytes)
+                    else:
+                        result["has_more"] = False
+        return result
+
+    def read_interaction_attachment(self, caller_id: str, interaction_id: str, attachment_id: str,
+                                    offset_bytes: object = 0, max_result_bytes: object = None) -> dict[str, object]:
+        with self._connection() as conn:
+            call = conn.execute(
+                "SELECT call_id FROM lifecycle_calls WHERE interaction_id=? AND caller_id=? LIMIT 1",
+                (interaction_id, caller_id),
+            ).fetchone()
+            if call is None:
+                return {"success": False, "status": "session_not_found"}
+            attachment = conn.execute(
+                "SELECT stored_path, byte_count, checksum FROM lifecycle_attachments "
+                "WHERE call_id=? AND attachment_id=?",
+                (call["call_id"], attachment_id),
+            ).fetchone()
+        if attachment is None:
+            return {"success": False, "status": "session_not_found"}
+        try:
+            data = Path(attachment["stored_path"]).read_bytes()
+        except OSError:
+            return {"success": False, "status": "session_not_found"}
+        offset = offset_bytes if isinstance(offset_bytes, int) and not isinstance(offset_bytes, bool) and offset_bytes >= 0 else 0
+        limit = max_result_bytes if isinstance(max_result_bytes, int) and not isinstance(max_result_bytes, bool) and max_result_bytes > 0 else None
+        chunk = data[offset:]
+        if limit is not None:
+            chunk = chunk[:limit]
+        next_offset = offset + len(chunk)
+        return {
+            "success": True,
+            "data": base64.b64encode(chunk).decode("ascii"),
+            "checksum": attachment["checksum"],
+            "byte_count": int(attachment["byte_count"]),
+            "next_offset_bytes": next_offset,
+            "has_more": next_offset < int(attachment["byte_count"]),
+        }
 
     def accept(self, *, call_id: str, device_id: str, handled_on: str,
                terminal_platform: str) -> dict[str, object]:
@@ -597,6 +1320,13 @@ class WaitingLifecycle:
 
     def _settle_due(self, conn: sqlite3.Connection) -> None:
         now = self._clock()
+        if self._clock_high_water is not None and (
+            now < self._clock_high_water or now - self._clock_high_water > 3600
+        ):
+            self._settle_clock_anomaly(conn)
+            self._clock_high_water = now
+            return
+        self._clock_high_water = now
         rows = conn.execute("SELECT * FROM lifecycle_calls WHERE call_state='ringing' AND ring_deadline<=?", (now,)).fetchall()
         for call in rows:
             conn.execute("UPDATE lifecycle_calls SET call_state='not_accepted', reason='ring_timeout' WHERE call_id=?", (call["call_id"],))
@@ -605,40 +1335,120 @@ class WaitingLifecycle:
             conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call["call_id"], seq, self._dump(body)))
         rows = conn.execute(
             "SELECT * FROM lifecycle_calls WHERE call_state IN ('accepted', 'in_progress') "
-            "AND terminal_disconnect_deadline IS NOT NULL AND terminal_disconnect_deadline<=?",
-            (now,),
+            "AND ((terminal_disconnect_deadline IS NOT NULL AND terminal_disconnect_deadline<=?) "
+            "OR (agent_reconnect_deadline IS NOT NULL AND agent_reconnect_deadline<=?))",
+            (now, now),
         ).fetchall()
         for call in rows:
+            terminal_deadline = call["terminal_disconnect_deadline"]
+            agent_deadline = call["agent_reconnect_deadline"]
+            terminal_due = terminal_deadline is not None and terminal_deadline <= now
+            agent_due = agent_deadline is not None and agent_deadline <= now
+            if agent_due and (not terminal_due or agent_deadline < terminal_deadline):
+                reason = "agent_disconnected"
+            else:
+                reason = "terminal_disconnected"
             conn.execute(
-                "UPDATE lifecycle_calls SET call_state='disconnected', reason='terminal_disconnected', version=version+1 WHERE call_id=?",
+                "UPDATE lifecycle_calls SET call_state='disconnected', reason=?, version=version+1 WHERE call_id=?",
+                (reason, call["call_id"]),
+            )
+            seq = int(conn.execute("SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call["call_id"],)).fetchone()["n"])
+            body = self._terminal(call["interaction_id"], call["call_id"], "disconnected", reason, seq)
+            body["human_action"] = False
+            conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call["call_id"], seq, self._dump(body)))
+
+    def _settle_clock_anomaly(self, conn: sqlite3.Connection) -> None:
+        """Terminate every affected call with an explicit clock-anomaly reason."""
+        for call in conn.execute("SELECT * FROM lifecycle_calls WHERE call_state='ringing'").fetchall():
+            conn.execute(
+                "UPDATE lifecycle_calls SET call_state='not_accepted', reason='clock_anomaly' WHERE call_id=?",
                 (call["call_id"],),
             )
             seq = int(conn.execute("SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call["call_id"],)).fetchone()["n"])
-            body = self._terminal(call["interaction_id"], call["call_id"], "disconnected", "terminal_disconnected", seq)
+            body = self._terminal(call["interaction_id"], call["call_id"], "not_accepted", "clock_anomaly", seq)
             body["human_action"] = False
             conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call["call_id"], seq, self._dump(body)))
-        rows = conn.execute(
-            "SELECT * FROM lifecycle_calls WHERE call_state IN ('ringing', 'accepted', 'in_progress') "
-            "AND agent_reconnect_deadline IS NOT NULL AND agent_reconnect_deadline<=?",
-            (now,),
-        ).fetchall()
-        for call in rows:
+        for call in conn.execute("SELECT * FROM lifecycle_calls WHERE call_state IN ('accepted', 'in_progress')").fetchall():
             conn.execute(
-                "UPDATE lifecycle_calls SET call_state='disconnected', reason='agent_disconnected' WHERE call_id=?",
+                "UPDATE lifecycle_calls SET call_state='disconnected', reason='clock_anomaly', version=version+1 WHERE call_id=?",
                 (call["call_id"],),
             )
             seq = int(conn.execute("SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call["call_id"],)).fetchone()["n"])
-            body = self._terminal(call["interaction_id"], call["call_id"], "disconnected", "agent_disconnected", seq)
+            body = self._terminal(call["interaction_id"], call["call_id"], "disconnected", "clock_anomaly", seq)
             body["human_action"] = False
             conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call["call_id"], seq, self._dump(body)))
+
+    @staticmethod
+    def _interpret_submission(result: Mapping[str, object]) -> tuple[str, str, bool, dict[str, object]]:
+        """Map a task-family result onto its top-level status, state and flags.
+
+        A task report carries its own ``status``; a progress report holds the
+        round in ``in_progress`` with ``needs_continuation``.  Any other result
+        keeps the established single-answer ``answered`` behaviour.
+        """
+        status = result.get("status")
+        if status == "completed":
+            extras: dict[str, object] = {"report": result.get("report"), "resubmittable": True}
+            if result.get("feedback_requested") is True:
+                extras["feedback_requested"] = True
+            return "completed", "completed", False, extras
+        if status == "failed":
+            extras = {"report": result.get("report"), "resubmittable": True}
+            if result.get("feedback_requested") is True:
+                extras["feedback_requested"] = True
+            return "failed", "failed", False, extras
+        if status == "in_progress":
+            return "in_progress", "in_progress", True, {"progress": result.get("progress")}
+        return "answered", "answered", False, {}
 
     @staticmethod
     def _heartbeat(interaction_id: str, call_id: str, state: str) -> dict[str, object]:
         return {"success": True, "status": "heartbeat", "call_state": state, "interaction_id": interaction_id, "call_id": call_id, "needs_continuation": True}
 
     @staticmethod
+    def _apply_result_budget(outcome: dict[str, object], payload_json: str) -> dict[str, object]:
+        """Omit oversized result bodies only on the Agent read path."""
+        result = outcome.get("result")
+        if not isinstance(result, Mapping):
+            return outcome
+        try:
+            payload = json.loads(payload_json)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        max_result_bytes = payload.get("max_result_bytes") if isinstance(payload, dict) else None
+        if not isinstance(max_result_bytes, int) or isinstance(max_result_bytes, bool) or max_result_bytes < 16384:
+            max_result_bytes = 1_000_000
+        if len(json.dumps(result, separators=(",", ":"))) <= max_result_bytes:
+            return outcome
+        omitted = dict(outcome)
+        omitted["body_omitted_for_size"] = True
+        omitted_result = dict(result)
+        for key, value in list(omitted_result.items()):
+            if isinstance(value, str):
+                omitted_result[key] = None
+        omitted["result"] = omitted_result
+        return omitted
+
+    @staticmethod
     def _terminal(interaction_id: str, call_id: str, state: str, reason: str | None, seq: int) -> dict[str, object]:
-        return {"success": True, "status": state, "call_state": state, "reason": reason, "event_seq": seq, "needs_continuation": False, "interaction_id": interaction_id, "call_id": call_id}
+        retryable = reason in {"ring_timeout", "terminal_disconnected", "agent_disconnected"}
+        retry_after = 60 if reason == "ring_timeout" else (30 if retryable else None)
+        messages = {
+            "ring_timeout": "人类未接受通信，60 秒内无人接听，这不是主动拒绝，可以稍后重新呼叫。",
+            "terminal_disconnected": "接听端已失联，通信已结束。",
+            "agent_disconnected": "调用方已失联，通信已结束。",
+            "no_available_channel": "所有启用的通知渠道均不可用。",
+            "agent_cancelled": "调用方已取消本次通信。",
+        }
+        result: dict[str, object] = {
+            "success": True, "status": state, "call_state": state, "reason": reason,
+            "event_seq": seq, "needs_continuation": False, "interaction_id": interaction_id, "call_id": call_id,
+            "human_action": False, "retryable": retryable, "handled_on": None, "terminal_platform": None,
+            "message": messages.get(reason, ""),
+        }
+        if retry_after is not None:
+            result["retry_after_seconds"] = retry_after
+        return result
 
     @staticmethod
     def _error(status: str) -> dict[str, object]:
@@ -673,6 +1483,8 @@ class Application:
         self._mobile_html_renderer = mobile_html_renderer
         self._trusted_browser_origin = trusted_browser_origin
         self._browser_entries: dict[str, str] = {}
+        self._logged_out: set[str] = set()
+        self._write_claims: set[tuple[str, str]] = set()
         if notification_router is not None:
             sink_setter = getattr(notification_router, "set_delivery_decision_sink", None)
             if callable(sink_setter):
@@ -718,6 +1530,9 @@ class Application:
         if path == "/operator/login":
             await self._browser_login_api(method, scope.get("headers", []), receive, send)
             return
+        if path == "/operator/logout":
+            await self._browser_logout_api(method, scope.get("headers", []), receive, send)
+            return
         if method != "POST" or path != "/mcp":
             await self._send(send, 404, self._error("not_found")); return
         caller = self._caller(scope.get("headers", []))
@@ -726,6 +1541,8 @@ class Application:
         body = await self._body(receive)
         if body is None:
             await self._send(send, 400, self._error("invalid_request")); return
+        if "jsonrpc" in body or "method" in body or "id" in body:
+            await self._send(send, 200, self._rpc(caller, body)); return
         timeout = body.get("client_timeout_seconds")
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 2:
             await self._send(send, 400, self._error("invalid_client_timeout")); return
@@ -753,7 +1570,7 @@ class Application:
                 await self._send(send, 400, self._error("invalid_request")); return
             response = service.register(credential=credential, endpoint=endpoint, gui_ready=gui_ready)
             await self._send(send, 201 if response.get("success") else 401, response); return
-        if path not in {"/api/terminals/heartbeat", "/api/terminals/state"}:
+        if path not in {"/api/terminals/heartbeat", "/api/terminals/state", "/api/terminals/dnd", "/api/terminals/quiet"}:
             await self._send(send, 404, self._error("not_found")); return
         session = self._terminal_session(headers)
         if session is None:
@@ -779,15 +1596,62 @@ class Application:
                     }
                     merged.update({str(item["call_id"]): item for item in central_states})
                     response = {**response, "states": [merged[key] for key in sorted(merged)]}
+        elif method == "POST" and path == "/api/terminals/dnd":
+            body = await self._body(receive)
+            dnd = body.get("dnd") if body is not None else None
+            message = body.get("message") if body is not None else ""
+            if not isinstance(dnd, bool):
+                await self._send(send, 400, self._error("invalid_request")); return
+            if not isinstance(message, str):
+                message = ""
+            response = self.lifecycle.set_dnd(dnd, message)
+        elif method == "GET" and path == "/api/terminals/dnd":
+            response = self.lifecycle.get_dnd()
+        elif method == "POST" and path == "/api/terminals/quiet":
+            body = await self._body(receive)
+            quiet_window_seconds = body.get("quiet_window_seconds") if body is not None else None
+            quiet_mode = body.get("quiet_mode") if body is not None else None
+            if isinstance(quiet_window_seconds, bool) or not isinstance(quiet_window_seconds, int) or quiet_window_seconds < 0:
+                await self._send(send, 400, self._error("invalid_request")); return
+            if quiet_mode not in {"short", "silent"}:
+                await self._send(send, 400, self._error("invalid_request")); return
+            response = self.lifecycle.set_quiet_window(quiet_window_seconds, quiet_mode)
+        elif method == "GET" and path == "/api/terminals/quiet":
+            response = self.lifecycle.get_quiet_window()
         else:
             await self._send(send, 404, self._error("not_found")); return
         await self._send(send, self._action_status(response), response)
 
     async def _terminal_action_api(self, method: object, path: object, headers: object, receive: Any, send: Any) -> None:
-        if method != "POST" or not isinstance(path, str):
+        if not isinstance(path, str):
             await self._send(send, 404, self._error("not_found")); return
         parts = path.split("/")
-        if len(parts) != 5 or parts[:3] != ["", "api", "calls"] or parts[4] not in {"accept", "decline", "heartbeat", "submissions"}:
+        if method == "GET" and len(parts) == 4 and parts[:3] == ["", "api", "calls"]:
+            session = self._terminal_session(headers)
+            context = self._terminal_context(session) if session is not None else None
+            if context is None:
+                await self._send(send, 401, self._terminal_error("session_not_found")); return
+            response = self._terminal_call_view(parts[3], context[0])
+            await self._send(send, self._action_status(response), response); return
+        if method == "PUT" and len(parts) == 5 and parts[:3] == ["", "api", "calls"] and parts[4] == "draft":
+            session = self._terminal_session(headers)
+            context = self._terminal_context(session) if session is not None else None
+            if context is None:
+                await self._send(send, 401, self._terminal_error("session_not_found")); return
+            device_id, _platform = context
+            body = await self._body(receive)
+            draft_version = body.get("draft_version") if body is not None else None
+            content = body.get("content") if body is not None else None
+            if isinstance(draft_version, bool) or not isinstance(draft_version, int) or not isinstance(content, str):
+                await self._send(send, 400, self._error("invalid_request")); return
+            response = self.lifecycle.save_draft(
+                call_id=parts[3], device_id=device_id, session_id=session,
+                draft_version=draft_version, content=content,
+            )
+            await self._send(send, self._action_status(response), response); return
+        if method != "POST":
+            await self._send(send, 404, self._error("not_found")); return
+        if len(parts) != 5 or parts[:3] != ["", "api", "calls"] or parts[4] not in {"accept", "decline", "heartbeat", "submissions", "cancel", "attachments"}:
             await self._send(send, 404, self._error("not_found")); return
         session = self._terminal_session(headers)
         context = self._terminal_context(session) if session is not None else None
@@ -803,9 +1667,29 @@ class Application:
             result = body.get("result") if body is not None else None
             if not isinstance(submission_id, str) or not isinstance(result, Mapping):
                 await self._send(send, 400, self._error("invalid_request")); return
+            task_version = body.get("task_version") if body is not None else None
             response = self.lifecycle.submit(
                 call_id=parts[3], device_id=device_id, session_id=session,
-                submission_id=submission_id, result=result,
+                submission_id=submission_id, result=result, task_version=task_version,
+            )
+        elif parts[4] == "cancel":
+            body = await self._body(receive)
+            operation_id = body.get("operation_id") if body is not None else None
+            if not isinstance(operation_id, str) or not operation_id:
+                await self._send(send, 400, self._error("invalid_request")); return
+            response = self.lifecycle.terminal_cancel(
+                call_id=parts[3], device_id=device_id, session_id=session,
+                operation_id=operation_id,
+            )
+        elif parts[4] == "attachments":
+            body = await self._body(receive)
+            upload = self._attachment_upload(body)
+            if isinstance(upload, str):
+                await self._send(send, 400, self._error(upload)); return
+            filename, media_type, content = upload
+            response = self.lifecycle.upload_attachment(
+                call_id=parts[3], device_id=device_id, session_id=session,
+                filename=filename, media_type=media_type, content=content,
             )
         else:
             body = await self._body(receive)
@@ -817,6 +1701,37 @@ class Application:
                 operation_id=operation_id, action=parts[4],
             )
         await self._send(send, self._action_status(response), response)
+
+    def _terminal_call_view(self, call_id: str, device_id: str) -> dict[str, object]:
+        """Return the immutable presentation data only to its invited terminal."""
+        with self.lifecycle._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self.lifecycle._settle_due(conn)
+                call = conn.execute("SELECT * FROM lifecycle_calls WHERE call_id=?", (call_id,)).fetchone()
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        if call is None:
+            return self._terminal_error("session_not_found")
+        state = str(call["call_state"])
+        invited = call["invited_desktop_id"] == device_id
+        owned = call["owner_device_id"] == device_id
+        if not ((state == "ringing" and invited) or owned):
+            return self._terminal_error("session_not_found")
+        try:
+            payload = self.lifecycle._load(call["payload_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        return {
+            "success": True, "call_id": call_id, "call_state": state,
+            "version": call["version"], "handled_on": call["handled_on"],
+            "terminal_platform": call["terminal_platform"],
+            "can_accept": state == "ringing" and invited,
+            "can_decline": state == "ringing" and invited,
+            "payload": payload if isinstance(payload, Mapping) else {},
+        }
 
     async def _browser_call_api(self, method: object, path: object, headers: object, receive: Any, send: Any) -> None:
         if not isinstance(path, str):
@@ -840,10 +1755,16 @@ class Application:
         call_id = parts[2]
         if len(parts) == 3 and method == "GET":
             response = self._browser_call_view(call_id, operator_id, browser_session_id)
+            if response.get("success") and response.get("can_submit"):
+                key = (browser_session_id, call_id)
+                if key in self._write_claims:
+                    response["can_submit"] = False
+                else:
+                    self._write_claims.add(key)
             if response.get("success") and cookie_mode:
                 await self._send_html(send, 200, self._render_browser_page(response, csrf_token)); return
             await self._send(send, self._action_status(response), response); return
-        if len(parts) != 4 or method != "POST" or parts[3] not in {"accept", "decline", "submissions"}:
+        if len(parts) != 4 or method != "POST" or parts[3] not in {"accept", "decline", "submissions", "attachments"}:
             await self._send(send, 404, self._error("not_found")); return
         if cookie_mode:
             if not self._browser_write_is_trusted(headers):
@@ -870,6 +1791,18 @@ class Application:
             if cookie_mode:
                 await self._send_html(send, self._action_status(response), self._render_browser_page(response, csrf_token, response)); return
             await self._send(send, self._action_status(response), response); return
+        if parts[3] == "attachments":
+            upload = self._attachment_upload(body)
+            if isinstance(upload, str):
+                await self._send(send, 400, self._error(upload)); return
+            filename, media_type, content = upload
+            response = self.lifecycle.upload_attachment(
+                call_id=call_id, device_id="iphone_web", session_id=browser_session_id,
+                filename=filename, media_type=media_type, content=content,
+            ) if operator_id == self.lifecycle._operator_id else self._terminal_error("session_not_found")
+            if cookie_mode:
+                await self._send_html(send, self._action_status(response), self._render_browser_page(response, csrf_token, response)); return
+            await self._send(send, self._action_status(response), response); return
         operation_id = body.get("operation_id") if body is not None else None
         if not isinstance(operation_id, str) or not operation_id:
             await self._send(send, 400, self._error("invalid_request")); return
@@ -877,6 +1810,12 @@ class Application:
             call_id=call_id, operator_id=operator_id, session_id=browser_session_id,
             operation_id=operation_id, action=parts[3],
         )
+        if parts[3] == "accept" and response.get("success") and response.get("call_state") == "accepted":
+            router = self._notification_router
+            if router is not None:
+                dispatch = getattr(router, "dispatch_desktop_state_change", None)
+                if callable(dispatch):
+                    await dispatch(call_id, "accepted", self.lifecycle.call_version(call_id), "iphone_web")
         if cookie_mode:
             view = self._browser_call_view(call_id, operator_id, browser_session_id)
             await self._send_html(send, self._action_status(response), self._render_browser_page(view, csrf_token, response))
@@ -906,6 +1845,15 @@ class Application:
     def _browser_login_is_configured(self) -> bool:
         return callable(getattr(self._browser_cookie_authenticator, "authenticate_login", None))
 
+    async def _browser_logout_api(self, method: object, headers: object, receive: Any, send: Any) -> None:
+        if method != "POST":
+            await self._send(send, 404, self._error("not_found")); return
+        await self._body(receive)
+        cookie = self._cookie(headers, "operator_session")
+        if cookie is not None:
+            self._logged_out.add(cookie)
+        await self._send_redirect(send, "/")
+
     @staticmethod
     def _browser_entry_cookie(value: str) -> str:
         return f"browser_entry={value}; Path=/; Secure; HttpOnly; SameSite=Lax"
@@ -916,9 +1864,18 @@ class Application:
 
     @staticmethod
     def _render_login_entry() -> str:
-        return ("<html><body><form method=\"post\" action=\"/operator/login\">"
-                "<input type=\"password\" name=\"credential\">"
-                "<button>login</button></form></body></html>")
+        return ("<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+                "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+                "<title>登录</title>"
+                "<link href=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css\" rel=\"stylesheet\">"
+                "<style>body{background:#f5f6f8;padding:16px 0}.card{max-width:400px;width:calc(100% - 32px);margin:60px auto;border:0;border-radius:16px;box-shadow:0 2px 12px rgba(0,0,0,.08)}</style>"
+                "</head><body><div class=\"card\"><div class=\"card-body\">"
+                "<h5 class=\"mb-3 text-center\">操作者登录</h5>"
+                "<form method=\"post\" action=\"/operator/login\">"
+                "<div class=\"mb-3\"><label class=\"form-label\" for=\"operator-credential\">登录凭证</label>"
+                "<input class=\"form-control\" id=\"operator-credential\" type=\"password\" name=\"credential\" required></div>"
+                "<button type=\"submit\" class=\"btn btn-primary w-100\">登录</button>"
+                "</form></div></div></body></html>")
 
     def _browser_call_view(self, call_id: str, operator_id: str,
                            browser_session_id: str | None = None) -> dict[str, object]:
@@ -946,6 +1903,14 @@ class Application:
                 and call["owner_session_id"] == browser_session_id
             ),
         }
+        try:
+            payload = self.lifecycle._load(call["payload_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        # The stored creation payload is presentation data only.  Submission
+        # remains centrally authorized and validated; a browser never gets to
+        # choose a different call or alter the persisted request.
+        view["payload"] = payload if isinstance(payload, Mapping) else {}
         if state in {"accepted", "in_progress"} and call["handled_on"] == "desktop":
             view["display_state"] = "handled_on_desktop_processing"
         elif state in {"answered", "completed", "failed"} and call["handled_on"] == "desktop":
@@ -1015,15 +1980,216 @@ class Application:
             await self._notification_scheduler_sleep(self._notification_dispatch_tick_seconds)
             await self.dispatch_notification_delivery()
 
+    def _rpc(self, caller: str, body: Mapping[str, object]) -> dict[str, object]:
+        rid = body.get("id")
+        jsonrpc = body.get("jsonrpc")
+        method = body.get("method")
+        if jsonrpc != "2.0":
+            return self._rpc_error(rid, -32600, "Invalid Request")
+        if not isinstance(method, str) or not method:
+            return self._rpc_error(rid, -32600, "Invalid Request")
+        try:
+            if method == "initialize":
+                result = self._rpc_initialize()
+            elif method == "tools/list":
+                result = {"tools": self._tool_catalog()}
+            elif method == "tools/call":
+                result = self._rpc_tools_call(caller, body.get("params"), rid)
+            else:
+                return self._rpc_error(rid, -32601, "Method not found")
+        except _RpcError as error:
+            return self._rpc_error(rid, error.code, error.message)
+        return {"jsonrpc": "2.0", "id": rid, "result": result}
+
+    @staticmethod
+    def _rpc_initialize() -> dict[str, object]:
+        return {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "hitl-central-mcp", "version": "1.0.0"},
+        }
+
+    @staticmethod
+    def _tool_catalog() -> list[dict[str, object]]:
+        return [
+            {"name": tool["name"], "description": tool["description"], "inputSchema": tool["inputSchema"]}
+            for tool in _MCP_TOOLS
+        ]
+
+    @staticmethod
+    def _tool_by_name(name: str) -> dict[str, object] | None:
+        for tool in _MCP_TOOLS:
+            if tool["name"] == name:
+                return tool
+        return None
+
+    def _rpc_tools_call(self, caller: str, params: object, rid: object) -> dict[str, object]:
+        if not isinstance(params, Mapping):
+            raise _RpcError(-32602, "Invalid params")
+        name = params.get("name")
+        if not isinstance(name, str) or not name:
+            raise _RpcError(-32602, "Invalid params")
+        tool = self._tool_by_name(name)
+        if tool is None:
+            raise _RpcError(-32602, "Invalid params")
+        arguments = params.get("arguments")
+        if not isinstance(arguments, Mapping):
+            arguments = {}
+        kind = tool["kind"]
+        if kind == "interaction":
+            structured = self._rpc_interaction(caller, name, arguments, rid)
+        elif kind == "control":
+            structured = self._rpc_cancel(caller, arguments, rid)
+        elif kind == "read":
+            structured = self._rpc_read_tool(caller, name, arguments)
+        else:
+            structured = self._rpc_readonly(name)
+        return {
+            "content": [{"type": "text", "text": self._rpc_summary(name, structured)}],
+            "isError": False,
+            "structuredContent": structured,
+        }
+
+    def _rpc_interaction(self, caller: str, name: str, arguments: Mapping[str, object], rid: object) -> dict[str, object]:
+        request_id = f"rpc-{rid}"
+        interaction_id = arguments.get("interaction_id")
+        call_id = arguments.get("call_id")
+        interaction_present = isinstance(interaction_id, str) and bool(interaction_id)
+        call_present = isinstance(call_id, str) and bool(call_id)
+        if interaction_present != call_present:
+            return {"success": False, "status": "missing_call_id", "needs_continuation": False}
+        if interaction_present:
+            after = arguments.get("after_event_seq", 0)
+            if isinstance(after, bool) or not isinstance(after, int):
+                raise _RpcError(-32602, "Invalid params")
+            result = self.lifecycle.continue_call(caller, request_id, interaction_id, call_id, after)
+        else:
+            max_result_bytes = arguments.get("max_result_bytes")
+            if max_result_bytes is not None and (
+                isinstance(max_result_bytes, bool) or not isinstance(max_result_bytes, int)
+                or max_result_bytes < 16384
+            ):
+                return {"success": False, "status": "invalid_result_budget", "needs_continuation": False}
+            payload = {"tool": name, **dict(arguments)}
+            result = self.lifecycle.create(
+                caller, request_id, payload, self._invited_desktop_id(), self._mobile_eligible(),
+            )
+        if result is None:
+            result = {"success": False, "status": "session_not_found", "needs_continuation": False}
+        return dict(result)
+
+    def _rpc_cancel(self, caller: str, arguments: Mapping[str, object], rid: object) -> dict[str, object]:
+        interaction_id = arguments.get("interaction_id")
+        call_id = arguments.get("call_id")
+        if not isinstance(interaction_id, str) or not interaction_id or not isinstance(call_id, str) or not call_id:
+            raise _RpcError(-32602, "Invalid params")
+        return dict(self.lifecycle.cancel(caller, f"rpc-{rid}", interaction_id, call_id))
+
+    def _rpc_read_tool(self, caller: str, name: str, arguments: Mapping[str, object]) -> dict[str, object]:
+        if name == "read_interaction_result":
+            interaction_id = arguments.get("interaction_id")
+            if not isinstance(interaction_id, str) or not interaction_id:
+                raise _RpcError(-32602, "Invalid params")
+            return self.lifecycle.read_interaction_result(
+                caller, interaction_id,
+                result_id=arguments.get("result_id"),
+                cursor=arguments.get("cursor"),
+                max_result_bytes=arguments.get("max_result_bytes"),
+            )
+        if name == "read_interaction_attachment":
+            interaction_id = arguments.get("interaction_id")
+            attachment_id = arguments.get("attachment_id")
+            if not isinstance(interaction_id, str) or not interaction_id or not isinstance(attachment_id, str) or not attachment_id:
+                raise _RpcError(-32602, "Invalid params")
+            return self.lifecycle.read_interaction_attachment(
+                caller, interaction_id, attachment_id,
+                offset_bytes=arguments.get("offset_bytes", 0),
+                max_result_bytes=arguments.get("max_result_bytes"),
+            )
+        raise _RpcError(-32602, "Invalid params")
+
+    def _rpc_readonly(self, name: str) -> dict[str, object]:
+        if name == "get_operator_profile":
+            return {"success": True, "status": "ok", "operator_id": self.lifecycle._operator_id}
+        if name == "health_check":
+            router = self._notification_router
+            desktop_online = False
+            bark_configured = False
+            recent_outcome = None
+            if router is not None:
+                online = getattr(router, "desktop_online", None)
+                desktop_online = bool(online()) if callable(online) else False
+                configured = getattr(router, "bark_configured", None)
+                bark_configured = bool(configured()) if callable(configured) else False
+                recent = getattr(router, "recent_bark_delivery", None)
+                recent_outcome = recent() if callable(recent) else None
+            return {
+                "success": True, "status": "healthy", "storage": "sqlite", "scheduler": "ready",
+                "desktop_online": desktop_online,
+                "bark": {"configured": bark_configured, "recent_outcome": recent_outcome},
+            }
+        if name == "get_human_loop_prompt":
+            return {
+                "success": True, "status": "ok",
+                "prompt": (
+                    "Human-in-the-Loop 协议指南：Agent 通过 tools/call 请求人参与。"
+                    "每个工具调用须携带 request_id 用于幂等重试（相同 request_id 与相同参数重放同一结果）。"
+                    "首次调用返回 interaction_id 与 call_id，后续续接必须同时携带 interaction_id、call_id 与 after_event_seq "
+                    "以按序读取事件（心跳不产生新事件）。返回体中的 needs_continuation 为 true 表示仍需用同一 interaction_id/call_id 续接等待，"
+                    "为 false 表示本轮已终结（answered/completed/failed/declined/not_accepted/busy/cancelled/disconnected 等）。"
+                    "可用 max_result_bytes 限制返回结果预算；超预算时结果以 body_omitted_for_size 与 result_id 返回，"
+                    "并可用 read_interaction_result/read_interaction_attachment 分页读取完整正文与附件。"
+                    "错误码如 invalid_request/method_not_found/invalid_params/missing_call_id/session_not_found 等与业务结果分开。"
+                ),
+            }
+        raise _RpcError(-32602, "Invalid params")
+
+    @staticmethod
+    def _rpc_summary(name: str, structured: Mapping[str, object]) -> str:
+        status = structured.get("status", structured.get("call_state", "ok"))
+        return f"{name}: {status}"
+
+    @staticmethod
+    def _rpc_error(rid: object, code: int, message: str) -> dict[str, object]:
+        return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}
+
     def _dispatch(self, caller: str, body: Mapping[str, object]) -> tuple[dict[str, object], bool]:
         request_id = body.get("request_id")
         if not isinstance(request_id, str) or not request_id:
+            return self._error("invalid_request"), False
+        if len(request_id) > 128 or not request_id.isascii():
             return self._error("invalid_request"), False
         interaction, call_id = body.get("interaction_id"), body.get("call_id")
         if body.get("operation") == "cancel_interaction":
             if not isinstance(interaction, str) or not isinstance(call_id, str):
                 return self._error("session_not_found"), False
             return self.lifecycle.cancel(caller, request_id, interaction, call_id), False
+        revision_id = body.get("revision_id")
+        if revision_id is not None:
+            payload = body.get("payload")
+            if not isinstance(interaction, str) or not isinstance(call_id, str) or not isinstance(revision_id, str) or not isinstance(payload, Mapping):
+                return self._error("invalid_request"), False
+            replay = self.lifecycle.has_request(caller, request_id)
+            invited_desktop_id = self._invited_desktop_id() if not replay else None
+            mobile_eligible = self._mobile_eligible() if not replay else False
+            return self.lifecycle.resubmit(
+                caller, request_id, interaction, call_id, revision_id, payload,
+                invited_desktop_id, mobile_eligible,
+            ), not replay
+        expected_task_version = body.get("expected_task_version")
+        if expected_task_version is not None:
+            task_description = body.get("task_description")
+            context_note = body.get("context_note")
+            if not isinstance(interaction, str) or not isinstance(call_id, str) or isinstance(expected_task_version, bool) or not isinstance(expected_task_version, int):
+                return self._error("invalid_request"), False
+            if task_description is not None and not isinstance(task_description, str):
+                return self._error("invalid_request"), False
+            if context_note is not None and not isinstance(context_note, str):
+                return self._error("invalid_request"), False
+            return self.lifecycle.update_task_description(
+                caller, request_id, interaction, call_id, expected_task_version,
+                task_description, context_note,
+            ), False
         if interaction is not None or call_id is not None:
             after = body.get("after_event_seq", 0)
             if not isinstance(interaction, str) or not isinstance(call_id, str) or isinstance(after, bool) or not isinstance(after, int):
@@ -1081,8 +2247,10 @@ class Application:
 
     def _browser_session(self, headers: object) -> tuple[str, str, str] | None:
         """Authenticate the browser cookie; never treat a call link as a credential."""
-        authenticator = self._browser_cookie_authenticator
         cookie = self._cookie(headers, "operator_session")
+        if cookie in self._logged_out:
+            return None
+        authenticator = self._browser_cookie_authenticator
         authenticate = getattr(authenticator, "authenticate_cookie", None)
         result = authenticate(cookie) if callable(authenticate) else None
         if isinstance(result, Mapping):
@@ -1121,7 +2289,17 @@ class Application:
             expected_host = expected.split("://", 1)[1]
         except IndexError:
             return False
-        return hmac.compare_digest(origin or "", expected) and hmac.compare_digest(host or "", expected_host)
+        # The Host header is always present and anchors the request to the
+        # configured central origin.  ``Origin`` is an optional second signal:
+        # in-app iPhone browsers may omit it on same-origin form posts, and the
+        # synchronizer token (login entry cookie / per-form CSRF value) is the
+        # durable cross-site defence.  Reject a mismatched Origin only when one
+        # is actually supplied.
+        if not hmac.compare_digest(host or "", expected_host):
+            return False
+        if origin is not None and not hmac.compare_digest(origin, expected):
+            return False
+        return True
 
     def _render_browser_page(self, view: Mapping[str, object], csrf_token: str,
                              action_response: Mapping[str, object] | None = None) -> str:
@@ -1138,10 +2316,10 @@ class Application:
             return "<html><body>已在电脑端处理</body></html>"
         if view.get("success") and view.get("can_accept"):
             return (f"<html><body><form method=\"post\" action=\"/calls/{call_id}/accept\">"
-                    f"<input name=\"csrf_token\" value=\"{csrf}\"><input name=\"operation_id\" value=\"accept\">"
+                    f"<input name=\"csrf_token\" value=\"{csrf}\"><input name=\"operation_id\" value=\"{html.escape(str(uuid.uuid4()), quote=True)}\">"
                     "<button>accept</button></form><form method=\"post\" action=\"/calls/"
                     f"{call_id}/decline\"><input name=\"csrf_token\" value=\"{csrf}\">"
-                    "<input name=\"operation_id\" value=\"decline\"><button>decline</button></form></body></html>")
+                    f"<input name=\"operation_id\" value=\"{html.escape(str(uuid.uuid4()), quote=True)}\"><button>decline</button></form></body></html>")
         if view.get("success") and view.get("can_submit"):
             submission_id = html.escape(str(uuid.uuid4()), quote=True)
             return (f"<html><body data-handled-on=\"iphone_web\"><form method=\"post\" action=\"/calls/{call_id}/submissions\">"
@@ -1172,6 +2350,36 @@ class Application:
         return value if isinstance(value, dict) else None
 
     @staticmethod
+    def _attachment_upload(body: Mapping[str, object] | None) -> tuple[str, str, bytes] | str:
+        """Validate and decode an attachment upload body.
+
+        Returns ``(filename, media_type, content)`` on success, or an error
+        status string.  A local filesystem path is never an accepted source:
+        only inline base64 content is honoured, so a path-only body yields the
+        distinct ``local_path_not_accepted`` rejection.
+        """
+        if body is None:
+            return "invalid_request"
+        filename = body.get("filename")
+        media_type = body.get("media_type")
+        content = body.get("content")
+        path = body.get("path")
+        has_path = isinstance(path, str) and bool(path)
+        if not isinstance(filename, str) or not filename:
+            return "invalid_request"
+        if not isinstance(media_type, str) or not media_type:
+            media_type = "application/octet-stream"
+        if not isinstance(content, str) or not content:
+            return "local_path_not_accepted" if has_path else "invalid_request"
+        try:
+            decoded = base64.b64decode(content, validate=True)
+        except ValueError:
+            return "invalid_request"
+        if not decoded:
+            return "local_path_not_accepted" if has_path else "invalid_request"
+        return filename, media_type, decoded
+
+    @staticmethod
     async def _form_body(receive: Any) -> dict[str, object] | None:
         event = await receive()
         if event.get("type") != "http.request":
@@ -1190,7 +2398,10 @@ class Application:
     def _action_status(response: Mapping[str, object]) -> int:
         if response.get("success"):
             return 200
-        return 400 if response.get("status") == "request_conflict" else 404
+        status = response.get("status")
+        if status in {"attachment_too_large", "submission_too_large", "storage_full"}:
+            return 200
+        return 400 if status == "request_conflict" else 404
 
     @staticmethod
     def _terminal_error(status: str) -> dict[str, object]:
@@ -1227,12 +2438,16 @@ def create_app(*, database_path: str | Path, credentials: Mapping[str, str], clo
                browser_cookie_authenticator: Any | None = None,
                mobile_html_renderer: Any | None = None,
                trusted_browser_origin: str | None = None,
-               operator_id: str = "only-operator") -> Application:
+               operator_id: str = "only-operator",
+               max_attachment_bytes: int = 20 * 1024 * 1024,
+               max_submission_bytes: int = 50 * 1024 * 1024,
+               max_storage_bytes: int = 1024 * 1024 * 1024) -> Application:
     if deadline_tick_seconds <= 0 or notification_dispatch_tick_seconds <= 0 or terminal_disconnect_seconds <= 0:
         raise ValueError("scheduler tick seconds must be positive")
     return Application(
         WaitingLifecycle(database_path, clock, notify, ring_timeout_seconds, agent_reconnect_seconds,
-                         terminal_disconnect_seconds, operator_id),
+                         terminal_disconnect_seconds, operator_id,
+                         max_attachment_bytes, max_submission_bytes, max_storage_bytes),
         credentials,
         wait,
         deadline_tick_seconds,

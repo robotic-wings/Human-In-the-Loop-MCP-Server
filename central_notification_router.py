@@ -88,8 +88,13 @@ class TerminalRegistry:
         return self._state(row)
 
     def ready_desktop(self) -> dict[str, object] | None:
+        fresh_cutoff = self._clock() - 30
         with self._store.connection() as conn:
-            row = conn.execute("SELECT * FROM desktop_terminals ORDER BY device_id LIMIT 1").fetchone()
+            row = conn.execute(
+                "SELECT * FROM desktop_terminals WHERE gui_ready=1 AND last_seen>=? "
+                "ORDER BY device_id LIMIT 1",
+                (fresh_cutoff,),
+            ).fetchone()
         return self._state(row)
 
     def _state(self, row: sqlite3.Row | None) -> dict[str, object] | None:
@@ -119,6 +124,23 @@ class NotificationRouter:
     def set_delivery_decision_sink(self, sink: DecisionSink | None) -> None:
         """Install the central lifecycle consumer for dispatch decisions."""
         self._decision_sink = sink
+
+    def desktop_online(self) -> bool:
+        """Whether a fresh, GUI-ready desktop terminal is currently registered."""
+        return self._registry.ready_desktop() is not None
+
+    def bark_configured(self) -> bool:
+        """Whether a valid Bark web base URL is configured."""
+        return self._web_base_url is not None
+
+    def recent_bark_delivery(self) -> str | None:
+        """Return the most recent Bark delivery outcome, or ``None``."""
+        with self._store.connection() as conn:
+            row = conn.execute(
+                "SELECT delivery_outcome FROM notification_outbox "
+                "WHERE channel='bark' ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+        return None if row is None else row["delivery_outcome"]
 
     @staticmethod
     def _normalize_web_base_url(value: str | None) -> tuple[str | None, bool]:
@@ -158,16 +180,31 @@ class NotificationRouter:
                 payload = None
                 if channel == "bark" and self._web_base_url:
                     call_id = str(event["call_id"])
-                    payload = json.dumps({"call_id": call_id, "url": f"{self._web_base_url}/calls/{call_id}"},
-                                         separators=(",", ":"))
+                    bark_payload: dict[str, object] = {
+                        "call_id": call_id, "url": f"{self._web_base_url}/calls/{call_id}",
+                    }
+                    if not event.get("degraded"):
+                        bark_payload["call"] = "1"
+                    for key in ("title", "body"):
+                        value = event.get(key)
+                        if isinstance(value, str) and value:
+                            bark_payload[key] = value
+                    payload = json.dumps(bark_payload, separators=(",", ":"))
                 elif channel == "desktop":
                     # Preserve the lifecycle-owned event verbatim in the
                     # outbox.  Registry attributes are added only when the
                     # callback is delivered, so they retain their management
                     # ownership while call state/version survive restarts.
-                    desktop_event = dict(event)
-                    desktop_event.setdefault("call_state", "ringing")
-                    desktop_event.setdefault("version", 1)
+                    desktop_event = {
+                        "call_id": event["call_id"],
+                        "ring_deadline": event["ring_deadline"],
+                        "call_state": event.get("call_state", "ringing"),
+                        "version": event.get("version", 1),
+                    }
+                    if event.get("degraded"):
+                        desktop_event["degraded"] = True
+                    if event.get("quiet_mode") is not None:
+                        desktop_event["quiet_mode"] = event.get("quiet_mode")
                     payload = json.dumps(desktop_event, separators=(",", ":"))
                 conn.execute(
                     "INSERT OR IGNORE INTO notification_outbox "
@@ -217,6 +254,31 @@ class NotificationRouter:
         if self._decision_sink is not None:
             self._decision_sink(decisions)
         return {"call_decisions": decisions}
+
+    async def dispatch_desktop_state_change(self, call_id: str, call_state: str, version: int,
+                                            handled_on: str | None = None) -> None:
+        """Push an authoritative call-state change to the ready desktop terminal.
+
+        This mirrors the desktop branch of ``_dispatch_row`` but is invoked
+        directly after a mobile action changes the call state, so the desktop
+        stops ringing (or shows a handled hint) without waiting for its next
+        polling synchronization.
+        """
+        terminal = self._registry.ready_desktop()
+        if terminal is None:
+            return
+        payload: dict[str, object] = {"call_id": call_id, "call_state": call_state, "version": version}
+        if handled_on is not None:
+            payload["handled_on"] = handled_on
+        payload.update(terminal)
+        try:
+            response = self._desktop_dispatch(payload)
+            if inspect.isawaitable(response):
+                await asyncio.wait_for(response, self._desktop_timeout)
+        except (asyncio.TimeoutError, TimeoutError):
+            pass
+        except Exception:
+            pass
 
     async def _dispatch_row(self, row: dict[str, object]) -> None:
         call_id, channel = str(row["call_id"]), str(row["channel"])

@@ -108,6 +108,11 @@ def expected_disconnected(call: dict[str, object]) -> dict[str, object]:
         "interaction_id": call["interaction_id"],
         "call_id": call["call_id"],
         "event_seq": 3,
+        "retryable": True,
+        "retry_after_seconds": 30,
+        "handled_on": None,
+        "terminal_platform": None,
+        "message": "调用方已失联，通信已结束。",
     }
 
 
@@ -191,4 +196,4 @@ def test_progress_expiry_is_durable_releases_busy_and_late_finalization_replays_
     next_call = create(restarted, "next")
     assert next_call["status"] == "heartbeat"
     assert len(notifications) == 1
-    assert restarted_notifications == [{"call_id": next_call["call_id"], "ring_deadline": clock() + 600}]
+    assert restarted_notifications == [{"call_id": next_call["call_id"], "ring_deadline": clock() + 600, "title": "agent-a", "body": "Human-in-the-Loop request"}]

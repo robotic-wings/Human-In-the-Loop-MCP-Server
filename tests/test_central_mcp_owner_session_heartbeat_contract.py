@@ -193,6 +193,8 @@ def test_global_or_foreign_activity_cannot_keep_an_accepted_owner_session_alive(
         "success": True, "status": "disconnected", "call_state": "disconnected",
         "reason": "terminal_disconnected", "human_action": False, "needs_continuation": False,
         "interaction_id": call["interaction_id"], "call_id": call["call_id"], "event_seq": 2,
+        "retryable": True, "retry_after_seconds": 30, "handled_on": None, "terminal_platform": None,
+        "message": "接听端已失联，通信已结束。",
     }
     terminal = _call_row(database, str(call["call_id"]))
     assert terminal["version"] == before["version"] + 1

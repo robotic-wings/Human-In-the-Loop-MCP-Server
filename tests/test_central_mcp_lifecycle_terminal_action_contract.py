@@ -155,6 +155,30 @@ def _ringing_call(app: Any, request_id: str = "create-call") -> dict[str, object
     return call
 
 
+def test_desktop_session_reads_its_routed_tool_payload_before_rendering(tmp_path: Path) -> None:
+    """The independent terminal gets presentation data via its own session."""
+    app, _registry, _clock = _components(tmp_path)
+    session = _register(app)
+    response = _request(
+        app, "POST", "/mcp", authorization="Bearer agent-secret",
+        body={
+            "request_id": "desktop-tool-payload", "client_timeout_seconds": 2,
+            "payload": {"tool": "get_user_choice", "prompt": "Pick one", "choices": ["one", "two"]},
+        },
+    )
+    call = response.json()
+
+    view = _request(app, "GET", f"/api/calls/{call['call_id']}", session=session)
+    assert view.status_code == 200
+    assert view.json()["can_accept"] is True
+    assert view.json()["payload"] == {
+        "tool": "get_user_choice", "prompt": "Pick one", "choices": ["one", "two"],
+    }
+
+    foreign = _request(app, "GET", f"/api/calls/{call['call_id']}", session="foreign")
+    assert foreign.status_code in {401, 404}
+
+
 def test_desktop_session_accepts_one_routed_ringing_call_with_durable_lifecycle_ownership(
     tmp_path: Path,
 ) -> None:
@@ -207,6 +231,11 @@ def test_decline_is_terminal_releases_busy_and_authoritative_terminal_state_is_v
     assert declined.json()["reason"] == "human_declined"
     assert declined.json()["human_action"] is True
     assert declined.json()["needs_continuation"] is False
+    assert declined.json()["acted_on"] == "desktop"
+    assert declined.json()["handled_on"] is None
+    assert declined.json()["terminal_platform"] is None
+    assert declined.json()["retryable"] is False
+    assert "resubmittable" not in declined.json()
     state = _request(app, "GET", "/api/terminals/state", session=session)
     assert state.status_code == 200
     assert state.json()["states"] == [{

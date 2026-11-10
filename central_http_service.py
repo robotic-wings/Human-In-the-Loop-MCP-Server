@@ -9,9 +9,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import hashlib
+import html
 import hmac
 import httpx
 import json
+import os
 import sys
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
@@ -29,6 +33,123 @@ from central_notification_router import NotificationRouter, TerminalRegistry
 Clock = Callable[[], float]
 Notification = Callable[[dict[str, object]], None]
 Waiter = Callable[[float], Awaitable[None]]
+
+
+def hash_operator_password(password: str) -> str:
+    """Return a salted PBKDF2 hash of an operator password, never the plaintext."""
+    salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100_000)
+    return base64.b64encode(salt + digest).decode("ascii")
+
+
+def mobile_html_renderer(view: Mapping[str, object], csrf_token: str) -> str:
+    """Render the iPhone response surface with explicit labels and controls.
+
+    The lifecycle supplies authority flags and the original, durable request
+    payload.  This adapter only turns that view into accessible HTML; the
+    submission still uses the lifecycle's existing JSON result path.
+    """
+    def esc(value: object) -> str:
+        return html.escape(str(value), quote=True)
+
+    call_id = esc(view.get("call_id", ""))
+    csrf = esc(csrf_token)
+    payload = view.get("payload")
+    payload = dict(payload) if isinstance(payload, Mapping) else {}
+    tool = str(payload.get("tool") or payload.get("interaction_type") or "text").lower()
+    prompt = esc(payload.get("prompt") or payload.get("message") or payload.get("task_description") or "请完成此请求")
+    title = esc(payload.get("title") or _mobile_tool_title(tool))
+    head = ("<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+            f"<title>{title}</title>"
+            "<link href=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css\" rel=\"stylesheet\">"
+            "<style>body{background:#f5f6f8;padding:16px 0}.card{max-width:640px;width:calc(100% - 32px);margin:16px auto;border:0;border-radius:16px;box-shadow:0 2px 12px rgba(0,0,0,.08)}"
+            ".card-header{background:#fff;border-bottom:1px solid #eef0f2;font-weight:600;padding:14px 20px;border-radius:16px 16px 0 0}"
+            ".card-body{padding:20px}.btn-block{width:100%;margin-bottom:8px;border-radius:10px}</style>"
+            "</head><body>")
+    if view.get("display_state") == "handled_on_desktop_processing":
+        return head + ("<div class=\"card\"><div class=\"card-body text-center py-5\">"
+                       "<div style=\"font-size:40px\" class=\"mb-3\">💻</div>"
+                       "<h4 class=\"mb-2\">已在电脑端接听，处理中</h4>"
+                       "<p class=\"text-muted mb-0\">此呼叫正在电脑端处理，手机端不能再次提交。</p>"
+                       "</div></div></body></html>")
+    if view.get("display_state") == "handled_on_desktop_complete":
+        return head + ("<div class=\"card\"><div class=\"card-body text-center py-5\">"
+                       "<div style=\"font-size:40px\" class=\"mb-3\">✅</div>"
+                       "<h4 class=\"mb-2\">已在电脑端处理</h4>"
+                       "<p class=\"text-muted mb-0\">该呼叫已经完成。</p>"
+                       "</div></div></body></html>")
+    if view.get("can_accept"):
+        return (head + f"<div class=\"card\"><div class=\"card-header\">{title}</div><div class=\"card-body\">"
+                f"<p class=\"lead mb-3\">{prompt}</p>"
+                "<p class=\"text-muted small mb-4\">请明确选择接听或拒绝。</p>"
+                f"<form method=\"post\" action=\"/calls/{call_id}/accept\"><input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\"><input type=\"hidden\" name=\"operation_id\" value=\"{esc(uuid.uuid4())}\"><button type=\"submit\" class=\"btn btn-success btn-lg btn-block\">接听</button></form>"
+                f"<form method=\"post\" action=\"/calls/{call_id}/decline\"><input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\"><input type=\"hidden\" name=\"operation_id\" value=\"{esc(uuid.uuid4())}\"><button type=\"submit\" class=\"btn btn-outline-danger btn-lg btn-block\">拒绝本次呼叫</button></form>"
+                "</div></div></body></html>")
+    if view.get("can_submit"):
+        fields = _mobile_response_fields(tool, payload, esc)
+        submission_id = esc(uuid.uuid4())
+        return (head + f"<div class=\"card\"><div class=\"card-header\">{title}</div><div class=\"card-body\">"
+                f"<p class=\"lead mb-3\">{prompt}</p>"
+                f"<form id=\"response-form\" method=\"post\" action=\"/calls/{call_id}/submissions\">"
+                f"<input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\"><input type=\"hidden\" name=\"submission_id\" value=\"{submission_id}\">"
+                "<input type=\"hidden\" name=\"result\" id=\"result\">" + fields +
+                "<button type=\"submit\" class=\"btn btn-primary btn-lg btn-block mt-3\">提交回答</button></form>"
+                "</div></div>"
+                "<script>document.getElementById('response-form').addEventListener('submit',function(e){var f=e.currentTarget,r={};"
+                "f.querySelectorAll('[data-result-key]').forEach(function(x){var k=x.dataset.resultKey;if(x.type==='checkbox'||x.type==='radio'){(r[k]||(r[k]=[]));if(x.checked)r[k].push(x.value)}else r[k]=x.value});"
+                "['confirmed','acknowledged'].forEach(function(k){var v=r[k];if(typeof v==='string')r[k]=v==='true';else if(Array.isArray(v)&&v.length===1)r[k]=v[0]==='true'});document.getElementById('result').value=JSON.stringify(r)});</script></body></html>")
+    return head + ("<div class=\"card\"><div class=\"card-body text-center py-5\">"
+                   "<div style=\"font-size:40px\" class=\"mb-3\">⏳</div>"
+                   "<h4 class=\"mb-2\">当前呼叫不可处理</h4>"
+                   "<p class=\"text-muted mb-0\">请刷新页面查看最新状态。</p>"
+                   "</div></div></body></html>")
+
+
+def _mobile_tool_title(tool: str) -> str:
+    if "confirm" in tool: return "确认请求"
+    if "info" in tool or "acknowledge" in tool: return "信息确认"
+    if "feedback" in tool: return "反馈"
+    if "task" in tool or "assign" in tool: return "任务报告"
+    if "choice" in tool or "select" in tool: return "选择回答"
+    if "multiline" in tool or "long" in tool: return "多行输入"
+    if "number" in tool: return "数字输入"
+    return "文本输入"
+
+
+def _mobile_response_fields(tool: str, payload: Mapping[str, object], esc: Callable[[object], str]) -> str:
+    """Return labelled controls for the seven shared interaction families."""
+    required = " required" if payload.get("required", True) else ""
+    if "confirm" in tool:
+        return ("<fieldset class=\"mb-3\"><legend class=\"form-label\">请选择确认结果</legend>"
+                "<div class=\"form-check\"><input class=\"form-check-input\" data-result-key=\"confirmed\" type=\"radio\" name=\"confirmed\" value=\"true\" id=\"confirmed-yes\" required><label class=\"form-check-label\" for=\"confirmed-yes\">是，确认</label></div>"
+                "<div class=\"form-check\"><input class=\"form-check-input\" data-result-key=\"confirmed\" type=\"radio\" name=\"confirmed\" value=\"false\" id=\"confirmed-no\"><label class=\"form-check-label\" for=\"confirmed-no\">否，不确认</label></div></fieldset>")
+    if "info" in tool or "acknowledge" in tool:
+        return "<div class=\"form-check mb-3\"><input class=\"form-check-input\" data-result-key=\"acknowledged\" type=\"checkbox\" value=\"true\" id=\"ack\" required><label class=\"form-check-label\" for=\"ack\">我已阅读并确认此信息</label></div>"
+    if "feedback" in tool:
+        return f"<div class=\"mb-3\"><label class=\"form-label\" for=\"feedback\">反馈内容</label><textarea class=\"form-control\" id=\"feedback\" data-result-key=\"feedback\" rows=\"5\"{required}></textarea></div>"
+    if "task" in tool or "assign" in tool:
+        return ("<div class=\"mb-3\"><label class=\"form-label\" for=\"task-status\">任务状态</label><select class=\"form-select\" id=\"task-status\" data-result-key=\"status\"><option value=\"completed\">已完成</option><option value=\"failed\">执行失败</option></select></div>"
+                f"<div class=\"mb-3\"><label class=\"form-label\" for=\"task-report\">任务报告</label><textarea class=\"form-control\" id=\"task-report\" data-result-key=\"report\" rows=\"5\"{required}></textarea></div>")
+    choices = payload.get("choices") or payload.get("options")
+    if ("choice" in tool or "select" in tool or isinstance(choices, list)) and isinstance(choices, list):
+        multiple = bool(payload.get("multiple") or payload.get("allow_multiple"))
+        input_type, key = ("checkbox", "selected_choices") if multiple else ("radio", "selected_choices")
+        rendered = "<fieldset class=\"mb-3\"><legend class=\"form-label\">请选择" + ("一个或多个选项" if multiple else "一个选项") + "</legend>"
+        for index, choice in enumerate(choices):
+            value = choice.get("value", choice.get("label", "")) if isinstance(choice, Mapping) else choice
+            label = choice.get("label", value) if isinstance(choice, Mapping) else choice
+            cid = f"choice-{index}"
+            rendered += (f"<div class=\"form-check\"><input class=\"form-check-input\" data-result-key=\"{key}\" type=\"{input_type}\" name=\"choice\" value=\"{esc(value)}\" id=\"{cid}\"{' required' if index == 0 and not multiple else ''}>"
+                         f"<label class=\"form-check-label\" for=\"{cid}\">{esc(label)}</label></div>")
+        return rendered + "</fieldset>"
+    numeric = "number" in tool or str(payload.get("input_type", "")).lower() == "number"
+    multiline = "multiline" in tool or "long" in tool or bool(payload.get("multiline"))
+    if multiline:
+        return f"<div class=\"mb-3\"><label class=\"form-label\" for=\"user-input\">请输入完整回答</label><textarea class=\"form-control\" id=\"user-input\" data-result-key=\"user_input\" rows=\"5\"{required}></textarea></div>"
+    input_type = "number" if numeric else "text"
+    label = "请输入数字" if numeric else "请输入回答"
+    return f"<div class=\"mb-3\"><label class=\"form-label\" for=\"user-input\">{label}</label><input class=\"form-control\" id=\"user-input\" data-result-key=\"user_input\" type=\"{input_type}\"{required}></div>"
 
 
 @dataclass(frozen=True)
@@ -49,6 +170,8 @@ class CentralServiceConfig:
     bark_credential: str | None = None
     operator_sessions: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
     operator_login_credentials: Mapping[str, str] = field(default_factory=dict)
+    operator_id: str = "only-operator"
+    ring_timeout_seconds: float = 60
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, object]) -> "CentralServiceConfig":
@@ -84,6 +207,11 @@ class CentralServiceConfig:
 
         tls_cert_file = required_text("tls_cert_file")
         tls_key_file = required_text("tls_key_file")
+
+        raw_ring_timeout = mapping.get("ring_timeout_seconds", 60)
+        if isinstance(raw_ring_timeout, bool) or not isinstance(raw_ring_timeout, (int, float)) or raw_ring_timeout <= 0:
+            raise ValueError("ring_timeout_seconds must be a positive number")
+        ring_timeout_seconds = float(raw_ring_timeout)
 
         # The legacy ingress remains constructible for its isolated contract;
         # lifecycle composition validates routes only when that factory is
@@ -152,6 +280,20 @@ class CentralServiceConfig:
                 raise ValueError("operator_login_credentials must map credentials to configured sessions")
             operator_login_credentials[credential] = session_cookie
 
+        # The lifecycle runs one operator.  Its identity is the single operator
+        # declared by the sessions reachable through the login credentials, not
+        # a hardcoded literal.  Deriving it here keeps the configured operator
+        # id in agreement with both the login verifier and the call view, so a
+        # physical deployment whose operator uses a real identity no longer
+        # degrades into an opaque ``session_not_found`` after a working login.
+        login_operator_ids = {
+            operator_sessions[cookie]["operator_id"]
+            for cookie in operator_login_credentials.values()
+        }
+        if len(login_operator_ids) > 1:
+            raise ValueError("operator_login_credentials must target a single operator")
+        operator_id = next(iter(login_operator_ids), "only-operator")
+
         return cls(
             listen_host=listen_host,
             listen_port=port,
@@ -167,6 +309,8 @@ class CentralServiceConfig:
             bark_credential=bark_credential,
             operator_sessions=operator_sessions,
             operator_login_credentials=operator_login_credentials,
+            operator_id=operator_id,
+            ring_timeout_seconds=ring_timeout_seconds,
         )
 
 
@@ -393,7 +537,7 @@ def create_lifecycle_app(
     desktop_dispatch: Callable[[dict[str, object]], object],
     operator_session_verifier: Any,
     browser_cookie_authenticator: Any | None = None,
-    mobile_html_renderer: Any | None = None,
+    mobile_html_renderer: Any | None = mobile_html_renderer,
     scheduler_sleep: Waiter = asyncio.sleep,
     notification_scheduler_sleep: Waiter = asyncio.sleep,
 ) -> Application:
@@ -411,7 +555,8 @@ def create_lifecycle_app(
         # still inject a cookie-only seam, but cannot accidentally bypass the
         # production entry flow when credentials are configured.
         configured_browser_authenticator = _ConfiguredOperatorSessionVerifier(
-            config.operator_sessions, config.operator_login_credentials
+            config.operator_sessions, config.operator_login_credentials,
+            lifecycle_operator_id=config.operator_id,
         )
     config.data_dir.mkdir(parents=True, exist_ok=True)
     database_path = config.data_dir / "lifecycle.sqlite3"
@@ -469,6 +614,8 @@ def create_lifecycle_app(
         browser_cookie_authenticator=configured_browser_authenticator,
         mobile_html_renderer=mobile_html_renderer,
         trusted_browser_origin=config.web_base_url,
+        operator_id=config.operator_id,
+        ring_timeout_seconds=config.ring_timeout_seconds,
     )
     lifecycle_holder["app"] = app
     return app
@@ -478,9 +625,11 @@ class _ConfiguredOperatorSessionVerifier:
     """Minimal configuration-backed browser-session boundary for the runtime."""
 
     def __init__(self, sessions: Mapping[str, Mapping[str, str]],
-                 login_credentials: Mapping[str, str] | None = None) -> None:
+                 login_credentials: Mapping[str, str] | None = None,
+                 *, lifecycle_operator_id: str = "only-operator") -> None:
         self._sessions = {token: dict(session) for token, session in sessions.items()}
         self._login_credentials = dict(login_credentials or {})
+        self._lifecycle_operator_id = lifecycle_operator_id
 
     def verify(self, token: str | None) -> dict[str, str] | None:
         if not isinstance(token, str):
@@ -500,6 +649,14 @@ class _ConfiguredOperatorSessionVerifier:
             return None
         for expected, session_cookie in self._login_credentials.items():
             if hmac.compare_digest(credential, expected):
+                # Authentication must not mint a browser cookie which the
+                # lifecycle will subsequently reject as another operator.
+                # That used to turn a successful login redirect into an
+                # opaque ``session_not_found`` page for the same call.
+                session = self._sessions.get(session_cookie)
+                if (session is None
+                        or session.get("operator_id") != self._lifecycle_operator_id):
+                    return None
                 return session_cookie
         return None
 
@@ -517,7 +674,7 @@ def _runtime_dependencies(
         if not config.bark_endpoint or not config.bark_credential:
             return {"http_status": 503, "business_success": False}
         body = {**payload, "device_key": config.bark_credential}
-        async with httpx.AsyncClient(timeout=2.5) as client:
+        async with httpx.AsyncClient(timeout=2.5, trust_env=False) as client:
             response = await client.post(config.bark_endpoint, json=body)
         try:
             content = response.json()
@@ -532,12 +689,13 @@ def _runtime_dependencies(
         if not isinstance(endpoint, str) or not endpoint or not isinstance(credential, str) or not credential:
             return {"accepted": False}
         body = {key: value for key, value in payload.items() if key not in {"endpoint", "callback_credential"}}
-        async with httpx.AsyncClient(timeout=2.5) as client:
+        async with httpx.AsyncClient(timeout=2.5, trust_env=False) as client:
             response = await client.post(endpoint, json=body, headers={"x-central-callback": credential})
         return {"accepted": 200 <= response.status_code < 300}
 
     verifier = _ConfiguredOperatorSessionVerifier(
-        config.operator_sessions, config.operator_login_credentials
+        config.operator_sessions, config.operator_login_credentials,
+        lifecycle_operator_id=config.operator_id,
     )
     return bark_dispatch, desktop_dispatch, verifier
 
@@ -582,7 +740,7 @@ def main(argv: list[str] | None = None) -> None:
         desktop_dispatch=desktop_dispatch,
         operator_session_verifier=operator_session_verifier,
         browser_cookie_authenticator=operator_session_verifier,
-        mobile_html_renderer=lambda _view, _csrf_token: None,
+        mobile_html_renderer=mobile_html_renderer,
     )
     uvicorn.run(app, host=config.listen_host, port=config.listen_port, ssl_certfile=config.tls_cert_file, ssl_keyfile=config.tls_key_file)
 

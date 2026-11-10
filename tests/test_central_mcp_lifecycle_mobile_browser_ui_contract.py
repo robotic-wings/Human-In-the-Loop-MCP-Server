@@ -8,12 +8,15 @@ not exercise the old TerminalCallService or CallCoordinator web adapters.
 from __future__ import annotations
 
 import asyncio
+import re
 import sqlite3
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
 import httpx
+import pytest
 
 from central_http_service import CentralServiceConfig, _ConfiguredOperatorSessionVerifier, create_lifecycle_app
 from central_desktop_registration_sync import DesktopRegistrationStateService
@@ -138,7 +141,7 @@ def _create(app: Any, request_id: str = "create") -> dict[str, object]:
     return response.json()
 
 
-def _configured_lifecycle_app(tmp_path: Path) -> Any:
+def _configured_lifecycle_app(tmp_path: Path, *, operator_id: str = "only-operator") -> Any:
     """Exercise the central runtime factory, not a direct lifecycle seam."""
     config = CentralServiceConfig.from_mapping({
         "listen_host": "127.0.0.1",
@@ -153,7 +156,7 @@ def _configured_lifecycle_app(tmp_path: Path) -> Any:
         "bark_credential": "bark-secret",
         "operator_sessions": {
             "operator-cookie": {
-                "operator_id": "only-operator",
+                "operator_id": operator_id,
                 "browser_session_id": "browser-61",
                 "csrf_token": "csrf-61",
             },
@@ -186,6 +189,12 @@ def _configured_lifecycle_app(tmp_path: Path) -> Any:
     )
 
 
+def _strip_operation_ids(text: str) -> str:
+    """Neutralise the fresh-per-render operation_id so an inert read still compares byte-identically."""
+
+    return re.sub(r'name="operation_id" value="[^"]*"', 'name="operation_id" value=""', text)
+
+
 def test_cookie_authenticated_initial_page_is_html_and_inert_while_link_or_foreign_session_is_opaque(tmp_path: Path) -> None:
     app, _state = _components(tmp_path, route_mode="iphone")
     call = _create(app)
@@ -207,6 +216,18 @@ def test_cookie_authenticated_initial_page_is_html_and_inert_while_link_or_forei
         denied = _request(app, "GET", f"/calls/{call['call_id']}", cookie=cookie)
         assert denied.status_code in {401, 404}
         assert call["call_id"] not in denied.text
+
+
+def test_fallback_accept_page_operation_ids_are_unique_uuids(tmp_path: Path) -> None:
+    app, _state = _components(tmp_path, route_mode="iphone")
+    call = _create(app)
+    page = _request(app, "GET", f"/calls/{call['call_id']}", cookie="operator-cookie")
+    assert page.status_code == 200
+    ids = re.findall(r'name="operation_id" value="([^"]+)"', page.text)
+    assert len(ids) == 2
+    for op in ids:
+        uuid.UUID(op)
+    assert ids[0] != ids[1]
 
 
 def test_protected_form_actions_enforce_cookie_csrf_origin_and_host_then_preserve_submission_replay(tmp_path: Path) -> None:
@@ -287,7 +308,7 @@ def test_configured_runtime_composition_uses_cookie_html_not_legacy_header_json(
         headers={"origin": "https://evil.example", "host": "evil.example"},
     )
     assert bad_origin.status_code in {401, 403, 404}
-    assert _request(app, "GET", f"/calls/{call['call_id']}", cookie="operator-cookie").text == page.text
+    assert _strip_operation_ids(_request(app, "GET", f"/calls/{call['call_id']}", cookie="operator-cookie").text) == _strip_operation_ids(page.text)
 
 
 def test_configured_bark_call_link_establishes_authenticated_cookie_without_exposing_credentials(tmp_path: Path) -> None:
@@ -308,6 +329,9 @@ def test_configured_bark_call_link_establishes_authenticated_cookie_without_expo
     assert bark_payload == {
         "call_id": call["call_id"],
         "url": f"https://central.example.test{call_path}",
+        "call": "1",
+        "title": "agent-a",
+        "body": "Approve change?",
     }
     assert "operator-login-secret" not in str(bark_payload)
     assert "operator-cookie" not in str(bark_payload)
@@ -364,8 +388,146 @@ def test_configured_bark_call_link_establishes_authenticated_cookie_without_expo
     assert page.headers["content-type"].startswith("text/html")
     assert "csrf-61" in page.text
     assert "accept" in page.text.lower()
-    assert _request(app, "GET", call_path, cookie=session_token).text == page.text
+    assert _strip_operation_ids(_request(app, "GET", call_path, cookie=session_token).text) == _strip_operation_ids(page.text)
 
     foreign = _request(app, "GET", call_path, cookie="foreign-cookie")
     assert foreign.status_code in {401, 404}
     assert call["call_id"] not in foreign.text
+
+
+def test_login_entry_succeeds_without_origin_header_for_inapp_browser(tmp_path: Path) -> None:
+    """An in-app iPhone browser may omit Origin on a same-origin form post.
+
+    The one-time login-entry cookie plus the always-present Host header are the
+    durable cross-site defences; a missing Origin must not turn a valid login
+    into ``session_not_found``.
+    """
+    app = _configured_lifecycle_app(tmp_path)
+    call = _create(app, request_id="no-origin-login")
+    call_path = f"/calls/{call['call_id']}"
+
+    entry = _request(app, "GET", call_path)
+    entry_token = entry.headers["set-cookie"].split("browser_entry=", 1)[1].split(";", 1)[0]
+
+    established = _request(
+        app, "POST", "/operator/login", raw_cookie=f"browser_entry={entry_token}",
+        form={"credential": "operator-login-secret"},
+        headers={"host": "central.example.test"},
+    )
+    assert established.status_code in {302, 303}
+    assert established.headers["location"] == call_path
+
+
+def test_configured_operator_identity_is_derived_from_login_sessions_not_hardcoded(tmp_path: Path) -> None:
+    """A real operator identity must own its call, not a hardcoded literal.
+
+    The production deployment names one operator.  Deriving that identity from
+    the configured login sessions makes a non-``only-operator`` operator id
+    read its own call instead of turning a successful login into an opaque
+    ``session_not_found`` after the redirect.
+    """
+    app = _configured_lifecycle_app(tmp_path, operator_id="kefan")
+    call = _create(app, request_id="named-operator-call")
+    entry = _request(app, "GET", f"/calls/{call['call_id']}")
+    entry_token = entry.headers["set-cookie"].split("browser_entry=", 1)[1].split(";", 1)[0]
+    login = _request(
+        app, "POST", "/operator/login", raw_cookie=f"browser_entry={entry_token}",
+        form={"credential": "operator-login-secret"},
+        headers={"origin": "https://central.example.test", "host": "central.example.test"},
+    )
+    assert login.status_code in {302, 303}
+    cookie = login.headers["set-cookie"].split("operator_session=", 1)[1].split(";", 1)[0]
+    page = _request(app, "GET", f"/calls/{call['call_id']}", cookie=cookie)
+    assert page.status_code == 200
+    assert page.headers["content-type"].startswith("text/html")
+    assert "accept" in page.text.lower()
+
+
+def test_configured_login_credentials_must_target_a_single_operator(tmp_path: Path) -> None:
+    """Two login credentials naming different operators is a config error."""
+    with pytest.raises(ValueError):
+        CentralServiceConfig.from_mapping({
+            "listen_host": "127.0.0.1",
+            "listen_port": 8443,
+            "web_base_url": "https://central.example.test",
+            "data_dir": str(tmp_path / "multi-operator"),
+            "agent_credentials": {"agent-a": "agent-secret"},
+            "tls_cert_file": "test-cert.pem",
+            "tls_key_file": "test-key.pem",
+            "route_mode": "iphone",
+            "bark_endpoint": "https://bark.example.test/push",
+            "bark_credential": "bark-secret",
+            "operator_sessions": {
+                "operator-cookie": {"operator_id": "operator-a", "browser_session_id": "browser-61", "csrf_token": "csrf-61"},
+                "other-cookie": {"operator_id": "operator-b", "browser_session_id": "browser-62", "csrf_token": "csrf-62"},
+            },
+            "operator_login_credentials": {
+                "login-a": "operator-cookie",
+                "login-b": "other-cookie",
+            },
+        })
+
+
+def test_mobile_accept_dispatches_accepted_callback_to_desktop(tmp_path: Path) -> None:
+    recorded: list[dict[str, object]] = []
+
+    async def record_desktop(payload: Mapping[str, object]) -> Mapping[str, object]:
+        recorded.append(dict(payload))
+        return {"accepted": True}
+
+    async def noop_bark(_payload: Mapping[str, object]) -> Mapping[str, object]:
+        return {"http_status": 200, "business_success": True}
+
+    config = CentralServiceConfig.from_mapping({
+        "listen_host": "127.0.0.1",
+        "listen_port": 8443,
+        "web_base_url": "https://central.example.test",
+        "data_dir": str(tmp_path / "accepted-callback"),
+        "agent_credentials": {"agent-a": "agent-secret"},
+        "tls_cert_file": "test-cert.pem",
+        "tls_key_file": "test-key.pem",
+        "route_mode": "both",
+        "desktop_credentials": {"desktop-secret": {"device_id": "desktop-61", "terminal_platform": "windows"}},
+        "desktop_endpoints": {"desktop-61": {"endpoint": "https://desktop.example.test:9100/terminal/events", "callback_credential": "callback-secret"}},
+        "bark_endpoint": "https://bark.example.test/push",
+        "bark_credential": "bark-secret",
+        "operator_sessions": {
+            "operator-cookie": {"operator_id": "only-operator", "browser_session_id": "browser-61", "csrf_token": "csrf-61"},
+        },
+        "operator_login_credentials": {"operator-login-secret": "operator-cookie"},
+    })
+    verifier = _ConfiguredOperatorSessionVerifier(config.operator_sessions)
+    app = create_lifecycle_app(
+        config, clock=Clock(), wait=_no_wait, bark_dispatch=noop_bark,
+        desktop_dispatch=record_desktop, operator_session_verifier=verifier,
+        browser_cookie_authenticator=verifier,
+        scheduler_sleep=_no_wait, notification_scheduler_sleep=_no_wait,
+    )
+
+    async def register() -> httpx.Response:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://central.example.test") as client:
+            return await client.post("/api/terminals/register", headers={"authorization": "Terminal desktop-secret"}, json={"endpoint": "https://desktop.example.test:9100/terminal/events", "gui_ready": True})
+    assert asyncio.run(register()).status_code == 201
+
+    call = _create(app, request_id="accepted-callback-call")
+
+    asyncio.run(app.dispatch_notification_delivery())
+    assert recorded, "the initial ringing callback must be dispatched to the desktop"
+    initial = recorded[0]
+    assert initial.get("call_state") == "ringing"
+
+    accept = _request(
+        app, "POST", f"/calls/{call['call_id']}/accept", cookie="operator-cookie",
+        form={"operation_id": "mobile-accept-1", "csrf_token": "csrf-61"},
+        headers={"origin": "https://central.example.test", "host": "central.example.test"},
+    )
+    assert accept.status_code == 200
+
+    asyncio.run(app.dispatch_notification_delivery())
+    accepted = [r for r in recorded if r.get("call_state") == "accepted"]
+    assert accepted, "mobile accept must dispatch an accepted callback to the desktop"
+    assert accepted[0].get("version", 0) > initial.get("version", 0)
+    assert accepted[0].get("handled_on") == "iphone_web", (
+        "the accepted desktop callback must carry handled_on so the desktop can "
+        "show the handled hint even when read_call now returns session_not_found"
+    )
