@@ -118,6 +118,7 @@ class WaitingLifecycle:
         self._max_attachment_bytes = max_attachment_bytes
         self._max_submission_bytes = max_submission_bytes
         self._max_storage_bytes = max_storage_bytes
+        self._clock_high_water: float | None = None
         self._attachments_dir = Path(self._path).parent / "attachments"
         Path(self._path).parent.mkdir(parents=True, exist_ok=True)
         self._attachments_dir.mkdir(parents=True, exist_ok=True)
@@ -132,7 +133,8 @@ class WaitingLifecycle:
                 mobile_eligible INTEGER NOT NULL DEFAULT 0,
                 terminal_last_seen_at REAL, terminal_disconnect_deadline REAL,
                 version INTEGER NOT NULL DEFAULT 1,
-                draft_content TEXT, draft_version INTEGER NOT NULL DEFAULT 0
+                draft_content TEXT, draft_version INTEGER NOT NULL DEFAULT 0,
+                created_at REAL
               );
               CREATE TABLE IF NOT EXISTS lifecycle_requests (
                 caller_id TEXT NOT NULL, request_id TEXT NOT NULL, payload_json TEXT NOT NULL,
@@ -190,6 +192,7 @@ class WaitingLifecycle:
             ("terminal_last_seen_at", "REAL"), ("terminal_disconnect_deadline", "REAL"),
             ("version", "INTEGER NOT NULL DEFAULT 1"),
             ("draft_content", "TEXT"), ("draft_version", "INTEGER NOT NULL DEFAULT 0"),
+            ("created_at", "REAL"),
         ):
             if column not in columns:
                 conn.execute(f"ALTER TABLE lifecycle_calls ADD COLUMN {column} {definition}")
@@ -232,9 +235,9 @@ class WaitingLifecycle:
                     deadline = self._clock() + self._ring_timeout
                     conn.execute(
                         "INSERT INTO lifecycle_calls "
-                        "(call_id, interaction_id, caller_id, call_state, ring_deadline, reason, payload_json, agent_reconnect_deadline, invited_desktop_id, mobile_eligible) "
-                        "VALUES (?, ?, ?, 'ringing', ?, NULL, ?, NULL, ?, ?)",
-                        (call_id, interaction_id, caller_id, deadline, encoded, invited_desktop_id, int(mobile_eligible)),
+                        "(call_id, interaction_id, caller_id, call_state, ring_deadline, reason, payload_json, agent_reconnect_deadline, invited_desktop_id, mobile_eligible, created_at) "
+                        "VALUES (?, ?, ?, 'ringing', ?, NULL, ?, NULL, ?, ?, ?)",
+                        (call_id, interaction_id, caller_id, deadline, encoded, invited_desktop_id, int(mobile_eligible), self._clock()),
                     )
                     outcome = self._heartbeat(interaction_id, call_id, "ringing")
                     short_title = next(
@@ -970,10 +973,10 @@ class WaitingLifecycle:
                 deadline = self._clock() + self._ring_timeout
                 conn.execute(
                     "INSERT INTO lifecycle_calls "
-                    "(call_id, interaction_id, caller_id, call_state, ring_deadline, reason, payload_json, agent_reconnect_deadline, invited_desktop_id, mobile_eligible) "
-                    "VALUES (?, ?, ?, 'ringing', ?, NULL, ?, NULL, ?, ?)",
+                    "(call_id, interaction_id, caller_id, call_state, ring_deadline, reason, payload_json, agent_reconnect_deadline, invited_desktop_id, mobile_eligible, created_at) "
+                    "VALUES (?, ?, ?, 'ringing', ?, NULL, ?, NULL, ?, ?, ?)",
                     (new_call_id, interaction_id, caller_id, deadline, encoded,
-                     invited_desktop_id, int(mobile_eligible)),
+                     invited_desktop_id, int(mobile_eligible), self._clock()),
                 )
                 conn.execute(
                     "INSERT INTO lifecycle_revisions VALUES (?, ?, ?, ?, ?)",
@@ -1152,6 +1155,13 @@ class WaitingLifecycle:
 
     def _settle_due(self, conn: sqlite3.Connection) -> None:
         now = self._clock()
+        if self._clock_high_water is not None and (
+            now < self._clock_high_water or now - self._clock_high_water > 3600
+        ):
+            self._settle_clock_anomaly(conn)
+            self._clock_high_water = now
+            return
+        self._clock_high_water = now
         rows = conn.execute("SELECT * FROM lifecycle_calls WHERE call_state='ringing' AND ring_deadline<=?", (now,)).fetchall()
         for call in rows:
             conn.execute("UPDATE lifecycle_calls SET call_state='not_accepted', reason='ring_timeout' WHERE call_id=?", (call["call_id"],))
@@ -1179,6 +1189,27 @@ class WaitingLifecycle:
             )
             seq = int(conn.execute("SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call["call_id"],)).fetchone()["n"])
             body = self._terminal(call["interaction_id"], call["call_id"], "disconnected", reason, seq)
+            body["human_action"] = False
+            conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call["call_id"], seq, self._dump(body)))
+
+    def _settle_clock_anomaly(self, conn: sqlite3.Connection) -> None:
+        """Terminate every affected call with an explicit clock-anomaly reason."""
+        for call in conn.execute("SELECT * FROM lifecycle_calls WHERE call_state='ringing'").fetchall():
+            conn.execute(
+                "UPDATE lifecycle_calls SET call_state='not_accepted', reason='clock_anomaly' WHERE call_id=?",
+                (call["call_id"],),
+            )
+            seq = int(conn.execute("SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call["call_id"],)).fetchone()["n"])
+            body = self._terminal(call["interaction_id"], call["call_id"], "not_accepted", "clock_anomaly", seq)
+            body["human_action"] = False
+            conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call["call_id"], seq, self._dump(body)))
+        for call in conn.execute("SELECT * FROM lifecycle_calls WHERE call_state IN ('accepted', 'in_progress')").fetchall():
+            conn.execute(
+                "UPDATE lifecycle_calls SET call_state='disconnected', reason='clock_anomaly', version=version+1 WHERE call_id=?",
+                (call["call_id"],),
+            )
+            seq = int(conn.execute("SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call["call_id"],)).fetchone()["n"])
+            body = self._terminal(call["interaction_id"], call["call_id"], "disconnected", "clock_anomaly", seq)
             body["human_action"] = False
             conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call["call_id"], seq, self._dump(body)))
 
