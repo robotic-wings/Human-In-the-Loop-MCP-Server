@@ -293,22 +293,30 @@ def build_settings_panel(root: Any, ring: Any, central: Any, ringtones_dir: str,
     message = dnd.get("message") if isinstance(dnd.get("message"), str) else ""
 
     auto_deny_var = tk.BooleanVar(value=enabled)
-    tk.Label(root, text="自动回复消息：").pack(anchor="w", padx=12, pady=6)
-    message_entry = tk.Entry(root)
-    message_entry.pack(anchor="w", padx=12, pady=6)
-    if message:
-        insert = getattr(message_entry, "insert", None)
-        if callable(insert):
-            insert(0, message)
-        else:
-            setter = getattr(message_entry, "set_text", None)
-            if callable(setter):
-                setter(message)
+    message_var = tk.StringVar(value=message)
+    dnd_status = tk.StringVar(value="")
+
+    tk.Checkbutton(root, text="勿扰模式（来电自动拒绝）", variable=auto_deny_var).pack(anchor="w", padx=12, pady=6)
+    tk.Label(root, text="自动回复消息：").pack(anchor="w", padx=12, pady=(0, 0))
+    message_entry = tk.Entry(root, textvariable=message_var, state="normal" if enabled else "disabled")
+    message_entry.pack(anchor="w", padx=12, pady=(0, 6))
+    tk.Label(root, textvariable=dnd_status, fg="gray").pack(anchor="w", padx=12, pady=(0, 6))
+
+    def sync_dnd() -> None:
+        result = central.set_dnd(bool(auto_deny_var.get()), message_var.get())
+        dnd_status.set("已同步" if result.get("success") else "同步失败，请重试")
 
     def on_auto_deny_change(*_args: object) -> None:
-        central.set_dnd(bool(auto_deny_var.get()), message_entry.get())
+        enabled_now = bool(auto_deny_var.get())
+        message_entry.config(state="normal" if enabled_now else "disabled")
+        sync_dnd()
+
+    def on_message_focus_out(_event: object = None) -> None:
+        if bool(auto_deny_var.get()):
+            sync_dnd()
+
     auto_deny_var.trace_add("write", on_auto_deny_change)
-    tk.Checkbutton(root, text="勿扰模式（来电自动拒绝）", variable=auto_deny_var).pack(anchor="w", padx=12, pady=6)
+    message_entry.bind("<FocusOut>", on_message_focus_out)
 
 
 class CentralHttpDesktopClient:
@@ -419,6 +427,7 @@ class TkPresentation:
     def __init__(self, root: Any, client_ref: Callable[[], DesktopTerminalClient]) -> None:
         self._root, self._client_ref, self._windows = root, client_ref, {}
         self._calls: dict[str, dict[str, object]] = {}
+        self._buttons: dict[str, tuple[Any, Any]] = {}
 
     def show(self, state: dict[str, object]) -> None:
         call_id = state.get("call_id")
@@ -432,8 +441,11 @@ class TkPresentation:
         payload = dict(payload) if isinstance(payload, Mapping) else {}
         prompt = payload.get("prompt") or payload.get("message") or payload.get("task_description") or "Human input requested"
         tk.Label(window, text=str(prompt), wraplength=520, justify="left").pack(padx=16, pady=12)
-        tk.Button(window, text="Accept", command=lambda: self._accept(call_id)).pack(side="left", padx=16, pady=12)
-        tk.Button(window, text="Decline", command=lambda: self._decline(call_id)).pack(side="right", padx=16, pady=12)
+        accept_btn = tk.Button(window, text="Accept", command=lambda: self._accept(call_id))
+        accept_btn.pack(side="left", padx=16, pady=12)
+        decline_btn = tk.Button(window, text="Decline", command=lambda: self._decline(call_id))
+        decline_btn.pack(side="right", padx=16, pady=12)
+        self._buttons[call_id] = (accept_btn, decline_btn)
         self._windows[call_id] = window
         self._calls[call_id] = {**state, "payload": payload}
         window.bell()
@@ -448,6 +460,10 @@ class TkPresentation:
         window = self._windows.pop(call_id, None)
         if window is None:
             return
+        buttons = self._buttons.pop(call_id, None)
+        if buttons:
+            for btn in buttons:
+                btn.config(state="disabled")
         import tkinter as tk
         tk.Label(window, text=str(hint)).pack(padx=16, pady=12)
         after = getattr(window, "after", None)
