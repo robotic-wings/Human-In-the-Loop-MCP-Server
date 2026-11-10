@@ -85,6 +85,31 @@ def test_central_client_get_dnd_reads_dnd(monkeypatch: Any) -> None:
     assert request["url"] == "https://central.test/api/terminals/dnd"
 
 
+def test_central_client_set_quiet_window_posts_quiet(monkeypatch: Any) -> None:
+    central = CentralHttpDesktopClient(_config())
+    recorder = _install_fake_http(monkeypatch)
+
+    central.set_quiet_window(120, "silent")
+
+    assert recorder, "set_quiet_window must issue a request"
+    request = recorder[0]
+    assert request["method"] == "POST"
+    assert request["url"] == "https://central.test/api/terminals/quiet"
+    assert request["json"] == {"quiet_window_seconds": 120, "quiet_mode": "silent"}
+
+
+def test_central_client_get_quiet_window_reads_quiet(monkeypatch: Any) -> None:
+    central = CentralHttpDesktopClient(_config())
+    recorder = _install_fake_http(monkeypatch)
+
+    central.get_quiet_window()
+
+    assert recorder, "get_quiet_window must issue a request"
+    request = recorder[0]
+    assert request["method"] == "GET"
+    assert request["url"] == "https://central.test/api/terminals/quiet"
+
+
 def _build() -> Any:
     return getattr(importlib.import_module("central_desktop_terminal"), "build_settings_panel")
 
