@@ -111,6 +111,7 @@ class FakeEntry:
     def __init__(self) -> None:
         self._text = ""
         self.pack_calls: list[dict[str, object]] = []
+        self.state = "normal"
 
     def get(self) -> str:
         return self._text
@@ -120,6 +121,11 @@ class FakeEntry:
 
     def pack(self, **kwargs: object) -> "FakeEntry":
         self.pack_calls.append(dict(kwargs))
+        return self
+
+    def config(self, **kwargs: object) -> "FakeEntry":
+        if "state" in kwargs:
+            self.state = str(kwargs["state"])
         return self
 
 
@@ -184,6 +190,8 @@ class FakeTk:
         if isinstance(text, str):
             self.labels.append(text)
             self.order.append(("label", text))
+        elif kwargs.get("textvariable") is not None:
+            self.order.append(("label", ""))
         return FakeWidget()
 
     def Button(self, _root: object, **kwargs: object) -> FakeButton:

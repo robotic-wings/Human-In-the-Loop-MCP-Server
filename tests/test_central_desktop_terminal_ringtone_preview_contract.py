@@ -110,6 +110,7 @@ class FakeWidget:
 class FakeEntry:
     def __init__(self) -> None:
         self._text = ""
+        self.state = "normal"
 
     def get(self) -> str:
         return self._text
@@ -118,6 +119,11 @@ class FakeEntry:
         self._text = text
 
     def pack(self, **kwargs: object) -> "FakeEntry":
+        return self
+
+    def config(self, **kwargs: object) -> "FakeEntry":
+        if "state" in kwargs:
+            self.state = str(kwargs["state"])
         return self
 
 

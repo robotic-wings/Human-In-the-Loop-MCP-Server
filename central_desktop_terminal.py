@@ -303,20 +303,26 @@ def build_settings_panel(root: Any, ring: Any, central: Any, ringtones_dir: str,
     tk.Label(root, textvariable=dnd_status, fg="gray").pack(anchor="w", padx=12, pady=(0, 6))
 
     def sync_dnd() -> None:
-        result = central.set_dnd(bool(auto_deny_var.get()), message_var.get())
-        dnd_status.set("已同步" if result.get("success") else "同步失败，请重试")
+        result = central.set_dnd(bool(auto_deny_var.get()), message_entry.get())
+        success = isinstance(result, Mapping) and bool(result.get("success"))
+        dnd_status.set("已同步" if success else "同步失败，请重试")
 
     def on_auto_deny_change(*_args: object) -> None:
         enabled_now = bool(auto_deny_var.get())
         message_entry.config(state="normal" if enabled_now else "disabled")
         sync_dnd()
 
-    def on_message_focus_out(_event: object = None) -> None:
-        if bool(auto_deny_var.get()):
+    def on_message_change(*_args: object) -> None:
+        if not bool(auto_deny_var.get()):
+            return
+        after = getattr(root, "after", None)
+        if callable(after):
+            after(400, sync_dnd)
+        else:
             sync_dnd()
 
     auto_deny_var.trace_add("write", on_auto_deny_change)
-    message_entry.bind("<FocusOut>", on_message_focus_out)
+    message_var.trace_add("write", on_message_change)
 
 
 class CentralHttpDesktopClient:
