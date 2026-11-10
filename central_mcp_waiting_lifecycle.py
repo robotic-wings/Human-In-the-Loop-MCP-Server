@@ -78,6 +78,16 @@ _MCP_TOOLS = (
      "inputSchema": {"type": "object", "properties": {
          "task_description": {"type": "string"}, "interaction_id": {"type": "string"},
          "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}, "max_result_bytes": {"type": "integer"}}}},
+    {"name": "read_interaction_result", "kind": "read",
+     "description": "Read the full body and attachment list of a saved result.",
+     "inputSchema": {"type": "object", "properties": {
+         "interaction_id": {"type": "string"}, "result_id": {"type": "string"},
+         "cursor": {"type": "string"}, "max_result_bytes": {"type": "integer"}}}},
+    {"name": "read_interaction_attachment", "kind": "read",
+     "description": "Read a byte chunk of a saved attachment.",
+     "inputSchema": {"type": "object", "properties": {
+         "interaction_id": {"type": "string"}, "attachment_id": {"type": "string"},
+         "offset_bytes": {"type": "integer"}, "max_result_bytes": {"type": "integer"}}}},
     {"name": "get_operator_profile", "kind": "readonly",
      "description": "Read the operator profile without requesting human action.",
      "inputSchema": {"type": "object"}},
@@ -996,6 +1006,75 @@ class WaitingLifecycle:
             ).fetchone()
         return int(row["version"]) if row is not None else 0
 
+    def read_interaction_result(self, caller_id: str, interaction_id: str,
+                                result_id: object = None, cursor: object = None,
+                                max_result_bytes: object = None) -> dict[str, object]:
+        del result_id, cursor, max_result_bytes
+        with self._connection() as conn:
+            call = conn.execute(
+                "SELECT call_id FROM lifecycle_calls WHERE interaction_id=? AND caller_id=? LIMIT 1",
+                (interaction_id, caller_id),
+            ).fetchone()
+            if call is None:
+                return {"success": False, "status": "session_not_found"}
+            call_id = call["call_id"]
+            submission = conn.execute(
+                "SELECT outcome_json FROM lifecycle_submissions WHERE call_id=? ORDER BY rowid DESC LIMIT 1",
+                (call_id,),
+            ).fetchone()
+            body: object = None
+            if submission is not None:
+                try:
+                    body = self._load(submission["outcome_json"]).get("result")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    body = None
+            attachments = [
+                {"attachment_id": row["attachment_id"], "byte_count": row["byte_count"], "checksum": row["checksum"]}
+                for row in conn.execute(
+                    "SELECT attachment_id, byte_count, checksum FROM lifecycle_attachments WHERE call_id=?",
+                    (call_id,),
+                ).fetchall()
+            ]
+        return {
+            "success": True, "interaction_id": interaction_id, "call_id": call_id,
+            "result": body, "attachments": attachments,
+        }
+
+    def read_interaction_attachment(self, caller_id: str, interaction_id: str, attachment_id: str,
+                                    offset_bytes: object = 0, max_result_bytes: object = None) -> dict[str, object]:
+        with self._connection() as conn:
+            call = conn.execute(
+                "SELECT call_id FROM lifecycle_calls WHERE interaction_id=? AND caller_id=? LIMIT 1",
+                (interaction_id, caller_id),
+            ).fetchone()
+            if call is None:
+                return {"success": False, "status": "session_not_found"}
+            attachment = conn.execute(
+                "SELECT stored_path, byte_count, checksum FROM lifecycle_attachments "
+                "WHERE call_id=? AND attachment_id=?",
+                (call["call_id"], attachment_id),
+            ).fetchone()
+        if attachment is None:
+            return {"success": False, "status": "session_not_found"}
+        try:
+            data = Path(attachment["stored_path"]).read_bytes()
+        except OSError:
+            return {"success": False, "status": "session_not_found"}
+        offset = offset_bytes if isinstance(offset_bytes, int) and not isinstance(offset_bytes, bool) and offset_bytes >= 0 else 0
+        limit = max_result_bytes if isinstance(max_result_bytes, int) and not isinstance(max_result_bytes, bool) and max_result_bytes > 0 else None
+        chunk = data[offset:]
+        if limit is not None:
+            chunk = chunk[:limit]
+        next_offset = offset + len(chunk)
+        return {
+            "success": True,
+            "data": base64.b64encode(chunk).decode("ascii"),
+            "checksum": attachment["checksum"],
+            "byte_count": int(attachment["byte_count"]),
+            "next_offset_bytes": next_offset,
+            "has_more": next_offset < int(attachment["byte_count"]),
+        }
+
     def accept(self, *, call_id: str, device_id: str, handled_on: str,
                terminal_platform: str) -> dict[str, object]:
         """Compatibility helper for existing lifecycle consumers.
@@ -1696,6 +1775,8 @@ class Application:
             structured = self._rpc_interaction(caller, name, arguments, rid)
         elif kind == "control":
             structured = self._rpc_cancel(caller, arguments, rid)
+        elif kind == "read":
+            structured = self._rpc_read_tool(caller, name, arguments)
         else:
             structured = self._rpc_readonly(name)
         return {
@@ -1734,6 +1815,29 @@ class Application:
         if not isinstance(interaction_id, str) or not interaction_id or not isinstance(call_id, str) or not call_id:
             raise _RpcError(-32602, "Invalid params")
         return dict(self.lifecycle.cancel(caller, f"rpc-{rid}", interaction_id, call_id))
+
+    def _rpc_read_tool(self, caller: str, name: str, arguments: Mapping[str, object]) -> dict[str, object]:
+        if name == "read_interaction_result":
+            interaction_id = arguments.get("interaction_id")
+            if not isinstance(interaction_id, str) or not interaction_id:
+                raise _RpcError(-32602, "Invalid params")
+            return self.lifecycle.read_interaction_result(
+                caller, interaction_id,
+                result_id=arguments.get("result_id"),
+                cursor=arguments.get("cursor"),
+                max_result_bytes=arguments.get("max_result_bytes"),
+            )
+        if name == "read_interaction_attachment":
+            interaction_id = arguments.get("interaction_id")
+            attachment_id = arguments.get("attachment_id")
+            if not isinstance(interaction_id, str) or not interaction_id or not isinstance(attachment_id, str) or not attachment_id:
+                raise _RpcError(-32602, "Invalid params")
+            return self.lifecycle.read_interaction_attachment(
+                caller, interaction_id, attachment_id,
+                offset_bytes=arguments.get("offset_bytes", 0),
+                max_result_bytes=arguments.get("max_result_bytes"),
+            )
+        raise _RpcError(-32602, "Invalid params")
 
     def _rpc_readonly(self, name: str) -> dict[str, object]:
         if name == "get_operator_profile":
