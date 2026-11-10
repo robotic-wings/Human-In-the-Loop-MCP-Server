@@ -284,6 +284,24 @@ def scan_ringtones(directory: str) -> list[str]:
     return sorted(entry.name for entry in path.glob("*.mp3") if entry.is_file())
 
 
+def save_short_ringtone(state_file: str, path: str) -> None:
+    """Persist the chosen short ringtone path to a local JSON state file."""
+    state = Path(state_file)
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text(json.dumps({"short_ringtone_path": path}), encoding="utf-8")
+
+
+def load_short_ringtone(state_file: str) -> str:
+    """Read the chosen short ringtone path, or return '' when absent/invalid."""
+    try:
+        data = json.loads(Path(state_file).read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return ""
+    if isinstance(data, dict) and isinstance(data.get("short_ringtone_path"), str):
+        return data["short_ringtone_path"]
+    return ""
+
+
 def build_settings_panel(root: Any, ring: Any, central: Any, ringtones_dir: str,
                          mp3s: list[str], initial_ringtone: str, tk: Any,
                          short_ringtone: str = "") -> None:
@@ -323,6 +341,13 @@ def build_settings_panel(root: Any, ring: Any, central: Any, ringtones_dir: str,
     short_var.trace_add("write", on_short_ringtone_change)
     tk.OptionMenu(notify, short_var, *mp3s).grid(row=1, column=1, sticky="w", padx=(8, 8), pady=2)
 
+    def on_short_preview() -> None:
+        toggle_short = getattr(ring, "toggle_short_preview", None)
+        if callable(toggle_short):
+            toggle_short()
+    short_preview_button = tk.Button(notify, text="试听", command=on_short_preview)
+    short_preview_button.grid(row=1, column=2, sticky="w", pady=2)
+
     dnd = central.get_dnd()
     if not isinstance(dnd, Mapping):
         dnd = {}
@@ -348,7 +373,9 @@ def build_settings_panel(root: Any, ring: Any, central: Any, ringtones_dir: str,
 
     dnd_frame = tk.LabelFrame(root, text="勿扰模式", padx=10, pady=8)
     dnd_frame.pack(fill="x", padx=12, pady=(0, 12))
-    dnd_frame.columnconfigure(1, weight=1)
+    columnconfigure = getattr(dnd_frame, "columnconfigure", None)
+    if callable(columnconfigure):
+        columnconfigure(1, weight=1)
     tk.Checkbutton(dnd_frame, text="来电自动拒绝", variable=auto_deny_var).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
     tk.Label(dnd_frame, text="自动回复消息").grid(row=1, column=0, sticky="w", pady=2)
     message_entry = tk.Entry(dnd_frame, textvariable=message_var, state="normal" if enabled else "disabled")
@@ -357,6 +384,48 @@ def build_settings_panel(root: Any, ring: Any, central: Any, ringtones_dir: str,
     save_button.grid(row=2, column=1, sticky="e", pady=(6, 2))
     tk.Label(dnd_frame, textvariable=dnd_status, fg="gray").grid(row=3, column=0, columnspan=2, sticky="w")
     auto_deny_var.trace_add("write", on_auto_deny_change)
+
+    get_quiet = getattr(central, "get_quiet_window", None)
+    if callable(get_quiet):
+        quiet = get_quiet()
+        if not isinstance(quiet, Mapping):
+            quiet = {}
+        quiet_window_seconds = quiet.get("quiet_window_seconds", 300)
+        quiet_mode = quiet.get("quiet_mode", "short")
+        if isinstance(quiet_window_seconds, bool) or not isinstance(quiet_window_seconds, int):
+            quiet_window_seconds = 300
+        if quiet_mode not in {"short", "silent"}:
+            quiet_mode = "short"
+        minutes = quiet_window_seconds // 60
+        quiet_mode_var = tk.StringVar(value=quiet_mode)
+        quiet_status = tk.StringVar(value="")
+        quiet_minutes_entry = tk.Entry(root)
+        quiet_minutes_entry.grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=2)
+        setter = getattr(quiet_minutes_entry, "set_text", None)
+        if callable(setter):
+            setter(str(minutes))
+        else:
+            insert = getattr(quiet_minutes_entry, "insert", None)
+            if callable(insert):
+                insert(0, str(minutes))
+
+        def sync_quiet() -> None:
+            try:
+                minutes_val = int(quiet_minutes_entry.get())
+            except (ValueError, TypeError):
+                minutes_val = 5
+            set_quiet = getattr(central, "set_quiet_window", None)
+            if callable(set_quiet):
+                set_quiet(minutes_val * 60, quiet_mode_var.get())
+            quiet_status.set("已同步")
+
+        tk.Label(root, text="接听后静音").grid(row=0, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        tk.Radiobutton(root, text="短铃声", variable=quiet_mode_var, value="short").grid(row=1, column=0, sticky="w", pady=2)
+        tk.Radiobutton(root, text="静音", variable=quiet_mode_var, value="silent").grid(row=1, column=1, sticky="w", pady=2)
+        tk.Label(root, text="时长(分钟)").grid(row=2, column=0, sticky="w", pady=2)
+        quiet_save = tk.Button(root, text="保存", command=sync_quiet)
+        quiet_save.grid(row=3, column=1, sticky="e", pady=(6, 2))
+        tk.Label(root, textvariable=quiet_status, fg="gray").grid(row=4, column=0, columnspan=2, sticky="w")
 
 
 class CentralHttpDesktopClient:
@@ -454,6 +523,14 @@ class CentralHttpDesktopClient:
 
     def get_dnd(self) -> dict[str, object]:
         return self._request("GET", "/api/terminals/dnd")
+
+    def set_quiet_window(self, quiet_window_seconds: int, quiet_mode: str) -> dict[str, object]:
+        return self._request("POST", "/api/terminals/quiet", json_body={
+            "quiet_window_seconds": quiet_window_seconds, "quiet_mode": quiet_mode,
+        })
+
+    def get_quiet_window(self) -> dict[str, object]:
+        return self._request("GET", "/api/terminals/quiet")
 
 
 class _TerminalListener:
@@ -707,14 +784,15 @@ class RingtonePlayer:
     """Loop a configured ringtone file and fall back to the window bell."""
 
     def __init__(self, ringtone_path: str, ringtone_alt_path: str | None = None,
-                 player: Any = None, bell: Any = None) -> None:
+                 player: Any = None, bell: Any = None, short_ringtone_path: str = "") -> None:
         self._ringtone_path = ringtone_path
         self._ringtone_alt_path = ringtone_alt_path
-        self._short_ringtone_path = ""
+        self._short_ringtone_path = short_ringtone_path
         self._player = player if player is not None else _PlatformPlayer()
         self._bell = bell
         self._handles: dict[str, object] = {}
         self._preview_handle: object | None = None
+        self._short_preview_handle: object | None = None
 
     def start(self, call_id: str, mode: str = "long") -> None:
         if mode == "silent":
@@ -745,6 +823,7 @@ class RingtonePlayer:
         self._short_ringtone_path = path
 
     def toggle_preview(self) -> bool:
+        self.stop_short_preview()
         if self._preview_handle is not None:
             self.stop_preview()
             return False
@@ -764,6 +843,28 @@ class RingtonePlayer:
     def stop_preview(self) -> None:
         handle = self._preview_handle
         self._preview_handle = None
+        if handle is not None:
+            self._player.stop(handle)
+
+    def toggle_short_preview(self) -> bool:
+        self.stop_preview()
+        if self._short_preview_handle is not None:
+            self.stop_short_preview()
+            return False
+        short_path = self._short_ringtone_path
+        if not (short_path and Path(short_path).is_file()):
+            if self._bell is not None:
+                self._bell()
+            return False
+        handle = self._player.play(short_path, loop=False)
+        if handle is not None:
+            self._short_preview_handle = handle
+            return True
+        return False
+
+    def stop_short_preview(self) -> None:
+        handle = self._short_preview_handle
+        self._short_preview_handle = None
         if handle is not None:
             self._player.stop(handle)
 
@@ -864,7 +965,7 @@ def main(argv: list[str] | None = None) -> None:
     central = CentralHttpDesktopClient(config)
     holder: dict[str, DesktopTerminalClient] = {}
     presenter = TkPresentation(root, lambda: holder["client"])
-    ring = RingtonePlayer(ringtone_path=config.ringtone_path, ringtone_alt_path=config.ringtone_alt_path, bell=root.bell)
+    ring = RingtonePlayer(ringtone_path=config.ringtone_path, ringtone_alt_path=config.ringtone_alt_path, bell=root.bell, short_ringtone_path=config.short_ringtone_path)
     client = DesktopTerminalClient(config={"terminal_credential": config.terminal_credential, "callback_credential": config.callback_credential}, central=central, listener=_TerminalListener(), gui_capability=lambda: True, ring=ring, presenter=presenter)
     holder["client"] = client
     build_settings_panel(root, ring, central, config.ringtones_dir, scan_ringtones(config.ringtones_dir), config.ringtone_path, tk, config.short_ringtone_path)

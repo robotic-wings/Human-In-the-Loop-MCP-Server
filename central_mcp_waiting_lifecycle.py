@@ -1553,7 +1553,7 @@ class Application:
                 await self._send(send, 400, self._error("invalid_request")); return
             response = service.register(credential=credential, endpoint=endpoint, gui_ready=gui_ready)
             await self._send(send, 201 if response.get("success") else 401, response); return
-        if path not in {"/api/terminals/heartbeat", "/api/terminals/state", "/api/terminals/dnd"}:
+        if path not in {"/api/terminals/heartbeat", "/api/terminals/state", "/api/terminals/dnd", "/api/terminals/quiet"}:
             await self._send(send, 404, self._error("not_found")); return
         session = self._terminal_session(headers)
         if session is None:
@@ -1590,6 +1590,17 @@ class Application:
             response = self.lifecycle.set_dnd(dnd, message)
         elif method == "GET" and path == "/api/terminals/dnd":
             response = self.lifecycle.get_dnd()
+        elif method == "POST" and path == "/api/terminals/quiet":
+            body = await self._body(receive)
+            quiet_window_seconds = body.get("quiet_window_seconds") if body is not None else None
+            quiet_mode = body.get("quiet_mode") if body is not None else None
+            if isinstance(quiet_window_seconds, bool) or not isinstance(quiet_window_seconds, int) or quiet_window_seconds < 0:
+                await self._send(send, 400, self._error("invalid_request")); return
+            if quiet_mode not in {"short", "silent"}:
+                await self._send(send, 400, self._error("invalid_request")); return
+            response = self.lifecycle.set_quiet_window(quiet_window_seconds, quiet_mode)
+        elif method == "GET" and path == "/api/terminals/quiet":
+            response = self.lifecycle.get_quiet_window()
         else:
             await self._send(send, 404, self._error("not_found")); return
         await self._send(send, self._action_status(response), response)
