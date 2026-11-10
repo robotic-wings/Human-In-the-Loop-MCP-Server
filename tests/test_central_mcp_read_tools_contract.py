@@ -198,3 +198,54 @@ def test_foreign_caller_cannot_read_result(tmp_path: Path) -> None:
         "interaction_id": call["interaction_id"], "result_id": "placeholder",
     }, agent="agent-b-secret")
     assert not (isinstance(result, dict) and result.get("success") is True)
+
+
+def test_read_result_attachment_list_includes_filename_and_media_type(tmp_path: Path) -> None:
+    app, _clock = components(tmp_path)
+    owner = terminal_session(app)
+    call = create_task(app)
+    accept_desktop(app, call, owner)
+    uploaded = upload(app, call, owner, b"\x00\x01\x02data")
+    request(app, "POST", f"/api/calls/{call['call_id']}/submissions", terminal=owner, body={
+        "submission_id": "read-filename",
+        "result": {"status": "completed", "report": "done", "attachments": [uploaded["attachment_id"]]},
+    })
+
+    result = rpc_structured(app, "read_interaction_result", {"interaction_id": call["interaction_id"]})
+    assert isinstance(result, dict) and result.get("success") is True
+    attachments = result.get("attachments", [])
+    assert attachments, "read result must list attachments"
+    assert "filename" in attachments[0]
+    assert "media_type" in attachments[0]
+
+
+def test_read_result_with_unknown_result_id_is_not_found(tmp_path: Path) -> None:
+    app, _clock = components(tmp_path)
+    owner = terminal_session(app)
+    call = create_task(app)
+    accept_desktop(app, call, owner)
+    request(app, "POST", f"/api/calls/{call['call_id']}/submissions", terminal=owner, body={
+        "submission_id": "read-unknown", "result": {"status": "completed", "report": "done"},
+    })
+
+    result = rpc_structured(app, "read_interaction_result", {
+        "interaction_id": call["interaction_id"], "result_id": "nonexistent-result-id",
+    })
+    assert isinstance(result, dict) and result.get("success") is False
+
+
+def test_read_result_pagination_returns_has_more_and_next_cursor(tmp_path: Path) -> None:
+    app, _clock = components(tmp_path)
+    owner = terminal_session(app)
+    call = create_task(app)
+    accept_desktop(app, call, owner)
+    request(app, "POST", f"/api/calls/{call['call_id']}/submissions", terminal=owner, body={
+        "submission_id": "read-page", "result": {"user_input": "x" * 10000},
+    })
+
+    result = rpc_structured(app, "read_interaction_result", {
+        "interaction_id": call["interaction_id"], "max_result_bytes": 100,
+    })
+    assert isinstance(result, dict) and result.get("success") is True
+    assert "has_more" in result
+    assert "next_cursor" in result
