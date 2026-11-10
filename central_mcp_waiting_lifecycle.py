@@ -1069,7 +1069,14 @@ class WaitingLifecycle:
     def read_interaction_result(self, caller_id: str, interaction_id: str,
                                 result_id: object = None, cursor: object = None,
                                 max_result_bytes: object = None) -> dict[str, object]:
-        del cursor
+        offset = 0
+        if isinstance(cursor, str):
+            try:
+                parsed = int(cursor)
+            except ValueError:
+                parsed = 0
+            if parsed >= 0:
+                offset = parsed
         with self._connection() as conn:
             call = conn.execute(
                 "SELECT call_id FROM lifecycle_calls WHERE interaction_id=? AND caller_id=? LIMIT 1",
@@ -1119,14 +1126,20 @@ class WaitingLifecycle:
         }
         if isinstance(max_result_bytes, int) and not isinstance(max_result_bytes, bool) and max_result_bytes > 0:
             if isinstance(body, Mapping):
+                string_lengths = [len(value) for value in body.values() if isinstance(value, str)]
+                total_length = max(string_lengths) if string_lengths else 0
                 if len(json.dumps(body, separators=(",", ":"))) > max_result_bytes:
-                    truncated = {
-                        key: (value[:max_result_bytes] if isinstance(value, str) else value)
+                    sliced = {
+                        key: (value[offset:offset + max_result_bytes] if isinstance(value, str) else value)
                         for key, value in dict(body).items()
                     }
-                    result["result"] = truncated
-                    result["has_more"] = True
-                    result["next_cursor"] = str(max_result_bytes)
+                    result["result"] = sliced
+                    has_more = offset + max_result_bytes < total_length
+                    if has_more:
+                        result["has_more"] = True
+                        result["next_cursor"] = str(offset + max_result_bytes)
+                    else:
+                        result["has_more"] = False
         return result
 
     def read_interaction_attachment(self, caller_id: str, interaction_id: str, attachment_id: str,

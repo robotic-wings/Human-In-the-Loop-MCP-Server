@@ -747,6 +747,17 @@ def run_heartbeat_tick(central: Any, client: Any, *, callback_credential: str | 
     schedule_ui(int(heartbeat_seconds * 1000), next_tick)
 
 
+def acquire_instance_lock(lock_path: str | Path) -> bool:
+    """Exclusively create a lock file; return False if it already exists."""
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    try:
+        fd = os.open(str(lock_path), flags)
+    except FileExistsError:
+        return False
+    os.close(fd)
+    return True
+
+
 def main(argv: list[str] | None = None) -> None:
     """Run the independent desktop terminal; it never starts an MCP endpoint."""
     parser = argparse.ArgumentParser(prog="hitl-desktop-terminal")
@@ -761,6 +772,9 @@ def main(argv: list[str] | None = None) -> None:
         # Tk raises TclError when there is no graphical session: report this
         # honestly rather than registering a terminal that cannot answer.
         raise SystemExit(f"desktop terminal unavailable: {error}") from error
+    lock_path = Path(tempfile.gettempdir()) / f"hitl-desktop-{hashlib.sha256(config.central_url.encode('utf-8')).hexdigest()}.lock"
+    if not acquire_instance_lock(lock_path):
+        raise SystemExit("desktop terminal unavailable: another instance is already running")
     central = CentralHttpDesktopClient(config)
     holder: dict[str, DesktopTerminalClient] = {}
     presenter = TkPresentation(root, lambda: holder["client"])
