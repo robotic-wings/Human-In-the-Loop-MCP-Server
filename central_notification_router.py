@@ -201,6 +201,10 @@ class NotificationRouter:
                         "call_state": event.get("call_state", "ringing"),
                         "version": event.get("version", 1),
                     }
+                    if event.get("degraded"):
+                        desktop_event["degraded"] = True
+                    if event.get("quiet_mode") is not None:
+                        desktop_event["quiet_mode"] = event.get("quiet_mode")
                     payload = json.dumps(desktop_event, separators=(",", ":"))
                 conn.execute(
                     "INSERT OR IGNORE INTO notification_outbox "

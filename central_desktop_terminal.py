@@ -108,7 +108,11 @@ class DesktopTerminalClient:
             return {"success": True, "status": "synchronized", "call_id": call_id}
         self._shown[call_id] = version
         self.presenter.show(state)
-        self.ring.start(call_id)
+        quiet_mode = event.get("quiet_mode")
+        if quiet_mode == "short":
+            self.ring.start(call_id, "short")
+        elif quiet_mode != "silent":
+            self.ring.start(call_id, "long")
         return {"success": True, "status": "presented", "call_id": call_id}
 
     def accept(self, *, call_id: str, operation_id: str) -> dict[str, object]:
@@ -197,6 +201,7 @@ class DesktopTerminalConfig:
     ringtone_path: str = "ringtone.mp3"
     ringtone_alt_path: str | None = None
     ringtones_dir: str = "ringtones"
+    short_ringtone_path: str = ""
     session_store_path: str | None = None
 
     @property
@@ -239,6 +244,8 @@ class DesktopTerminalConfig:
         ringtones_dir = normalized.get("ringtones_dir", "ringtones")
         if not isinstance(ringtones_dir, str) or not ringtones_dir:
             ringtones_dir = "ringtones"
+        short_ringtone = normalized.get("short_ringtone_path")
+        short_ringtone_path = short_ringtone if isinstance(short_ringtone, str) else ""
         session_store = normalized.get("session_store_path")
         session_store_path = session_store if isinstance(session_store, str) and session_store else None
         return cls(
@@ -250,6 +257,7 @@ class DesktopTerminalConfig:
             heartbeat_seconds=float(interval),
             ringtone_path=ringtone_path, ringtone_alt_path=ringtone_alt_path,
             ringtones_dir=ringtones_dir,
+            short_ringtone_path=short_ringtone_path,
             session_store_path=session_store_path,
         )
 
@@ -263,11 +271,16 @@ def scan_ringtones(directory: str) -> list[str]:
 
 
 def build_settings_panel(root: Any, ring: Any, central: Any, ringtones_dir: str,
-                         mp3s: list[str], initial_ringtone: str, tk: Any) -> None:
+                         mp3s: list[str], initial_ringtone: str, tk: Any,
+                         short_ringtone: str = "") -> None:
     """Build the settings panel as classic framed groups with aligned controls."""
     initial_basename = os.path.basename(initial_ringtone)
     initial_value = initial_basename if initial_basename in mp3s else (mp3s[0] if mp3s else "")
     ringtone_var = tk.StringVar(value=initial_value)
+
+    short_basename = os.path.basename(short_ringtone)
+    short_value = short_basename if short_basename in mp3s else (mp3s[0] if mp3s else "")
+    short_var = tk.StringVar(value=short_value)
 
     def on_preview() -> None:
         if ring.toggle_preview():
@@ -280,6 +293,11 @@ def build_settings_panel(root: Any, ring: Any, central: Any, ringtones_dir: str,
         ring.stop_preview()
         preview_button.config(text="测试播放")
 
+    def on_short_ringtone_change(*_args: object) -> None:
+        set_short = getattr(ring, "set_short_ringtone", None)
+        if callable(set_short):
+            set_short(os.path.join(ringtones_dir, short_var.get()))
+
     notify = tk.LabelFrame(root, text="通知", padx=10, pady=8)
     notify.pack(fill="x", padx=12, pady=(12, 8))
     tk.Label(notify, text="铃声").grid(row=0, column=0, sticky="w", pady=2)
@@ -287,6 +305,9 @@ def build_settings_panel(root: Any, ring: Any, central: Any, ringtones_dir: str,
     tk.OptionMenu(notify, ringtone_var, *mp3s).grid(row=0, column=1, sticky="w", padx=(8, 8), pady=2)
     preview_button = tk.Button(notify, text="测试播放", command=on_preview)
     preview_button.grid(row=0, column=2, sticky="w", pady=2)
+    tk.Label(notify, text="短铃声").grid(row=1, column=0, sticky="w", pady=2)
+    short_var.trace_add("write", on_short_ringtone_change)
+    tk.OptionMenu(notify, short_var, *mp3s).grid(row=1, column=1, sticky="w", padx=(8, 8), pady=2)
 
     dnd = central.get_dnd()
     if not isinstance(dnd, Mapping):
@@ -675,13 +696,24 @@ class RingtonePlayer:
                  player: Any = None, bell: Any = None) -> None:
         self._ringtone_path = ringtone_path
         self._ringtone_alt_path = ringtone_alt_path
+        self._short_ringtone_path = ""
         self._player = player if player is not None else _PlatformPlayer()
         self._bell = bell
         self._handles: dict[str, object] = {}
         self._preview_handle: object | None = None
 
-    def start(self, call_id: str) -> None:
+    def start(self, call_id: str, mode: str = "long") -> None:
+        if mode == "silent":
+            return
         if call_id in self._handles:
+            return
+        if mode == "short":
+            short_path = self._short_ringtone_path
+            if short_path and Path(short_path).is_file():
+                self._player.play(short_path, loop=False)
+                return
+            if self._bell is not None:
+                self._bell()
             return
         path = self._select_ringtone()
         if path is None:
@@ -694,6 +726,9 @@ class RingtonePlayer:
 
     def set_ringtone(self, path: str) -> None:
         self._ringtone_path = path
+
+    def set_short_ringtone(self, path: str) -> None:
+        self._short_ringtone_path = path
 
     def toggle_preview(self) -> bool:
         if self._preview_handle is not None:
@@ -813,7 +848,7 @@ def main(argv: list[str] | None = None) -> None:
     ring = RingtonePlayer(ringtone_path=config.ringtone_path, ringtone_alt_path=config.ringtone_alt_path, bell=root.bell)
     client = DesktopTerminalClient(config={"terminal_credential": config.terminal_credential, "callback_credential": config.callback_credential}, central=central, listener=_TerminalListener(), gui_capability=lambda: True, ring=ring, presenter=presenter)
     holder["client"] = client
-    build_settings_panel(root, ring, central, config.ringtones_dir, scan_ringtones(config.ringtones_dir), config.ringtone_path, tk)
+    build_settings_panel(root, ring, central, config.ringtones_dir, scan_ringtones(config.ringtones_dir), config.ringtone_path, tk, config.short_ringtone_path)
     if config.listener_scheme == "https" and (not config.listener_tls_cert_file or not config.listener_tls_key_file):
         raise SystemExit("desktop terminal unavailable: HTTPS listener requires listener_tls_cert_file and listener_tls_key_file")
     server = uvicorn.Server(uvicorn.Config(
