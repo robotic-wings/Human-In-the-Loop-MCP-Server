@@ -22,6 +22,10 @@ from pathlib import Path
 from typing import Any
 
 
+from central_call_machine import (
+    ACTIVE_STATES, CallEventBus, CallMachine, InvalidTransition,
+)
+
 Clock = Callable[[], float]
 Waiter = Callable[[float], Awaitable[None]]
 Notifier = Callable[[dict[str, object]], None]
@@ -119,6 +123,8 @@ class WaitingLifecycle:
         self._max_submission_bytes = max_submission_bytes
         self._max_storage_bytes = max_storage_bytes
         self._clock_high_water: float | None = None
+        self._bus = CallEventBus()
+        self._machine = CallMachine(self._bus)
         self._attachments_dir = Path(self._path).parent / "attachments"
         Path(self._path).parent.mkdir(parents=True, exist_ok=True)
         self._attachments_dir.mkdir(parents=True, exist_ok=True)
@@ -436,14 +442,9 @@ class WaitingLifecycle:
                     ).fetchone()
                     outcome = self._load(event["body_json"]) if event else self._error("expired")
                 else:
-                    conn.execute(
-                        "UPDATE lifecycle_calls SET call_state='cancelled', reason='agent_cancelled' WHERE call_id=?",
-                        (call_id,),
+                    _, seq = self._machine.transition(
+                        conn, call_id, "agent_cancel", reason="agent_cancelled", bump_version=False,
                     )
-                    seq = int(conn.execute(
-                        "SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?",
-                        (call_id,),
-                    ).fetchone()["n"])
                     outcome = self._terminal(interaction_id, call_id, "cancelled", "agent_cancelled", seq)
                     outcome["human_action"] = False
                     conn.execute(
@@ -535,15 +536,9 @@ class WaitingLifecycle:
                     ).fetchone()
                     if call is None:
                         continue
-                    conn.execute(
-                        "UPDATE lifecycle_calls SET call_state='unreachable', reason='no_available_channel' "
-                        "WHERE call_id=?",
-                        (call_id,),
+                    _, seq = self._machine.transition(
+                        conn, call_id, "unreachable", reason="no_available_channel", bump_version=False,
                     )
-                    seq = int(conn.execute(
-                        "SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?",
-                        (call_id,),
-                    ).fetchone()["n"])
                     body = self._terminal(
                         call["interaction_id"], call_id, "unreachable", "no_available_channel", seq,
                     )
@@ -586,12 +581,18 @@ class WaitingLifecycle:
                     event = conn.execute("SELECT body_json FROM lifecycle_events WHERE call_id=? ORDER BY event_seq DESC LIMIT 1", (call_id,)).fetchone()
                     outcome = self._load(event["body_json"]) if event else self._error("expired")
                 else:
-                    state, status, reason = ("accepted", "opened", None) if action == "accept" else ("declined", "declined", "human_declined")
+                    status = "opened" if action == "accept" else "declined"
+                    now = self._clock()
                     if action == "accept":
-                        conn.execute(
-                            "UPDATE lifecycle_calls SET call_state=?, reason=?, owner_device_id=?, owner_session_id=?, handled_on='desktop', terminal_platform=?, terminal_last_seen_at=?, terminal_disconnect_deadline=?, agent_reconnect_deadline=?, version=version+1 WHERE call_id=?",
-                            (state, reason, device_id, session_id, terminal_platform, self._clock(),
-                             self._clock() + self._terminal_disconnect_seconds, None, call_id),
+                        _, seq = self._machine.transition(
+                            conn, call_id, "accept", reason=None,
+                            columns={
+                                "owner_device_id": device_id, "owner_session_id": session_id,
+                                "handled_on": "desktop", "terminal_platform": terminal_platform,
+                                "terminal_last_seen_at": now,
+                                "terminal_disconnect_deadline": now + self._terminal_disconnect_seconds,
+                                "agent_reconnect_deadline": None,
+                            },
                         )
                         self._record_accept(conn)
                     else:
@@ -601,13 +602,18 @@ class WaitingLifecycle:
                         # device/session association remains so the declining
                         # desktop receives the terminal state on its next
                         # synchronization and can close its old alert.
-                        conn.execute(
-                            "UPDATE lifecycle_calls SET call_state=?, reason=?, owner_device_id=?, owner_session_id=?, handled_on=NULL, terminal_platform=NULL, terminal_last_seen_at=NULL, terminal_disconnect_deadline=NULL, agent_reconnect_deadline=NULL, version=version+1 WHERE call_id=?",
-                            (state, reason, device_id, session_id, call_id),
+                        _, seq = self._machine.transition(
+                            conn, call_id, "decline", reason="human_declined",
+                            columns={
+                                "owner_device_id": device_id, "owner_session_id": session_id,
+                                "handled_on": None, "terminal_platform": None,
+                                "terminal_last_seen_at": None,
+                                "terminal_disconnect_deadline": None,
+                                "agent_reconnect_deadline": None,
+                            },
                         )
-                    seq = int(conn.execute("SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call_id,)).fetchone()["n"])
                     outcome: dict[str, object] = {
-                        "success": True, "status": status, "call_state": state, "human_action": True,
+                        "success": True, "status": status, "call_state": "accepted" if action == "accept" else "declined", "human_action": True,
                         "needs_continuation": action == "accept", "interaction_id": call["interaction_id"],
                         "call_id": call_id, "event_seq": seq,
                     }
@@ -615,7 +621,7 @@ class WaitingLifecycle:
                         outcome.update(owner_device_id=device_id, owner_session_id=session_id,
                                        handled_on="desktop", terminal_platform=terminal_platform)
                     else:
-                        outcome.update(reason=reason, acted_on="desktop", handled_on=None,
+                        outcome.update(reason="human_declined", acted_on="desktop", handled_on=None,
                                        terminal_platform=None, retryable=False)
                     conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call_id, seq, self._dump(outcome)))
                 conn.execute("INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?, ?)", (actor, operation_id, encoded, self._dump(outcome), kind))
@@ -668,28 +674,33 @@ class WaitingLifecycle:
                         ).fetchone()
                         return self._load(event["body_json"]) if event is not None else self._error("expired")
                     return self._error("session_not_found")
-                state, status, reason = (
-                    ("accepted", "opened", None) if action == "accept"
-                    else ("declined", "declined", "human_declined")
-                )
+                status = "opened" if action == "accept" else "declined"
                 now = self._clock()
                 if action == "accept":
-                    conn.execute(
-                        "UPDATE lifecycle_calls SET call_state=?, reason=?, owner_device_id=?, owner_session_id=?, handled_on='iphone_web', terminal_platform='ios', terminal_last_seen_at=?, terminal_disconnect_deadline=?, agent_reconnect_deadline=?, version=version+1 WHERE call_id=?",
-                        (state, reason, "iphone_web", session_id, now,
-                         now + self._terminal_disconnect_seconds, None, call_id),
+                    _, seq = self._machine.transition(
+                        conn, call_id, "accept", reason=None,
+                        columns={
+                            "owner_device_id": "iphone_web", "owner_session_id": session_id,
+                            "handled_on": "iphone_web", "terminal_platform": "ios",
+                            "terminal_last_seen_at": now,
+                            "terminal_disconnect_deadline": now + self._terminal_disconnect_seconds,
+                            "agent_reconnect_deadline": None,
+                        },
                     )
                     self._record_accept(conn)
                 else:
-                    conn.execute(
-                        "UPDATE lifecycle_calls SET call_state=?, reason=?, owner_device_id=?, owner_session_id=?, handled_on=NULL, terminal_platform=NULL, terminal_last_seen_at=NULL, terminal_disconnect_deadline=NULL, agent_reconnect_deadline=NULL, version=version+1 WHERE call_id=?",
-                        (state, reason, "iphone_web", session_id, call_id),
+                    _, seq = self._machine.transition(
+                        conn, call_id, "decline", reason="human_declined",
+                        columns={
+                            "owner_device_id": "iphone_web", "owner_session_id": session_id,
+                            "handled_on": None, "terminal_platform": None,
+                            "terminal_last_seen_at": None,
+                            "terminal_disconnect_deadline": None,
+                            "agent_reconnect_deadline": None,
+                        },
                     )
-                seq = int(conn.execute(
-                    "SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call_id,)
-                ).fetchone()["n"])
                 outcome: dict[str, object] = {
-                    "success": True, "status": status, "call_state": state, "human_action": True,
+                    "success": True, "status": status, "call_state": "accepted" if action == "accept" else "declined", "human_action": True,
                     "needs_continuation": action == "accept", "interaction_id": call["interaction_id"],
                     "call_id": call_id, "event_seq": seq,
                 }
@@ -697,7 +708,7 @@ class WaitingLifecycle:
                     outcome.update(owner_device_id="iphone_web", owner_session_id=session_id,
                                    handled_on="iphone_web", terminal_platform="ios")
                 else:
-                    outcome.update(reason=reason, acted_on="iphone_web", handled_on=None,
+                    outcome.update(reason="human_declined", acted_on="iphone_web", handled_on=None,
                                    terminal_platform=None, retryable=False)
                 conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call_id, seq, self._dump(outcome)))
                 conn.execute("INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?, ?)",
@@ -745,13 +756,7 @@ class WaitingLifecycle:
                     (now, now + self._terminal_disconnect_seconds, call_id),
                 )
                 status, state, needs_continuation, extras = self._interpret_submission(result)
-                conn.execute(
-                    "UPDATE lifecycle_calls SET call_state=?, reason=NULL, version=version+1 WHERE call_id=?",
-                    (state, call_id),
-                )
-                seq = int(conn.execute(
-                    "SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call_id,)
-                ).fetchone()["n"])
+                _, seq = self._machine.transition(conn, call_id, "submit", target=state, reason=None)
                 outcome: dict[str, object] = {
                     "success": True, "status": status, "call_state": state, "human_action": True,
                     "needs_continuation": needs_continuation, "interaction_id": call["interaction_id"], "call_id": call_id,
@@ -805,14 +810,9 @@ class WaitingLifecycle:
                     ).fetchone()
                     outcome = self._load(event["body_json"]) if event is not None else self._error("expired")
                 else:
-                    conn.execute(
-                        "UPDATE lifecycle_calls SET call_state='cancelled', reason='human_cancelled', version=version+1 WHERE call_id=?",
-                        (call_id,),
+                    _, seq = self._machine.transition(
+                        conn, call_id, "human_cancel", reason="human_cancelled",
                     )
-                    seq = int(conn.execute(
-                        "SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?",
-                        (call_id,),
-                    ).fetchone()["n"])
                     outcome: dict[str, object] = {
                         "success": True, "status": "cancelled", "call_state": "cancelled",
                         "reason": "human_cancelled", "human_action": True, "needs_continuation": False,
@@ -1161,6 +1161,91 @@ class WaitingLifecycle:
             ).fetchone()
         return int(row["version"]) if row is not None else 0
 
+    def call_outcome_view(self, caller_id: str, interaction_id: str, call_id: str) -> dict[str, object] | None:
+        """Read-only agent view: settle deadlines, then return the freshest outcome body.
+
+        Active calls yield a heartbeat; terminal calls yield their last
+        immutable event (with the agent-side result budget applied).  This
+        is the single snapshot builder the waiting long-poll re-reads.
+        """
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._settle_due(conn)
+                call = conn.execute(
+                    "SELECT * FROM lifecycle_calls WHERE call_id=? AND caller_id=?",
+                    (call_id, caller_id),
+                ).fetchone()
+                if call is None or call["interaction_id"] != interaction_id:
+                    conn.commit()
+                    return None
+                state = str(call["call_state"])
+                if state in ACTIVE_STATES:
+                    outcome = self._heartbeat(interaction_id, call_id, state)
+                else:
+                    terminal = conn.execute(
+                        "SELECT body_json FROM lifecycle_events WHERE call_id=? ORDER BY event_seq DESC LIMIT 1",
+                        (call_id,),
+                    ).fetchone()
+                    outcome = self._load(terminal["body_json"]) if terminal is not None else self._terminal(
+                        interaction_id, call_id, state, call["reason"], 0,
+                    )
+                    outcome = self._apply_result_budget(outcome, call["payload_json"])
+                conn.commit()
+                return outcome
+            except BaseException:
+                conn.rollback()
+                raise
+
+    async def wait_call_outcome(self, caller_id: str, interaction_id: str, call_id: str,
+                                timeout: float, waiter: Waiter | None = None) -> dict[str, object] | None:
+        """Event-driven long-poll: wait once for a terminal state or the budget.
+
+        Wakes on any transition of the call (human accept/decline/submit,
+        agent or human cancel, deadline settlement) via the state machine's
+        bus — never by re-entering the RPC layer or synthesising request
+        ids.  ``waiter`` is the injected logical sleeper; it races the bus
+        so tests with fake clocks fast-forward the budget.  A waiter round
+        that neither advances logical time nor fires the bus is treated as
+        budget expiry, so no configuration can spin.
+
+        Returns ``None`` when the call is unknown to this caller; otherwise
+        the freshest view, heartbeat included when the budget expires
+        first.
+        """
+        sleep: Waiter = waiter if waiter is not None else asyncio.sleep
+        deadline = self._clock() + max(0.0, float(timeout))
+        while True:
+            outcome = self.call_outcome_view(caller_id, interaction_id, call_id)
+            if outcome is None:
+                return None
+            if outcome.get("needs_continuation") is not True:
+                return outcome
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                return outcome
+            before = self._clock()
+            wait_task = asyncio.ensure_future(self._bus.wait_change(call_id, remaining))
+            sleep_task = asyncio.ensure_future(sleep(remaining))
+            try:
+                await asyncio.wait({wait_task, sleep_task}, return_when=asyncio.FIRST_COMPLETED)
+                bus_fired = (
+                    wait_task.done() and not wait_task.cancelled()
+                    and wait_task.exception() is None
+                )
+            finally:
+                for task in (wait_task, sleep_task):
+                    task.cancel()
+            if bus_fired:
+                continue
+            # The sleeper finished first.  If it advanced logical time by
+            # (nearly) the requested budget, loop once to observe the
+            # expired deadline; an instant fake sleeper advanced almost
+            # nothing, which we also treat as budget spent so no caller
+            # can spin the re-read loop.
+            if self._clock() - before + 1e-6 < remaining:
+                return outcome
+
     def read_interaction_result(self, caller_id: str, interaction_id: str,
                                 result_id: object = None, cursor: object = None,
                                 max_result_bytes: object = None) -> dict[str, object]:
@@ -1306,8 +1391,10 @@ class WaitingLifecycle:
                 # precede every terminal result.
                 if status != "opened" and call["call_state"] not in {"accepted", "in_progress"}:
                     return self._error("not_accepted")
-                conn.execute("UPDATE lifecycle_calls SET call_state=?, reason=? WHERE call_id=?", (state, reason, call_id))
-                seq = int(conn.execute("SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call_id,)).fetchone()["n"])
+                if status == "opened":
+                    _, seq = self._machine.transition(conn, call_id, "accept", reason=reason, bump_version=False)
+                else:
+                    _, seq = self._machine.transition(conn, call_id, "submit", target=state, reason=reason, bump_version=False)
                 body: dict[str, object] = {"success": True, "status": status, "call_state": state, "event_seq": seq,
                                             "needs_continuation": status in {"opened", "in_progress"}, "interaction_id": call["interaction_id"], "call_id": call_id}
                 body.update(extra)
@@ -1329,8 +1416,9 @@ class WaitingLifecycle:
         self._clock_high_water = now
         rows = conn.execute("SELECT * FROM lifecycle_calls WHERE call_state='ringing' AND ring_deadline<=?", (now,)).fetchall()
         for call in rows:
-            conn.execute("UPDATE lifecycle_calls SET call_state='not_accepted', reason='ring_timeout' WHERE call_id=?", (call["call_id"],))
-            seq = int(conn.execute("SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call["call_id"],)).fetchone()["n"])
+            _, seq = self._machine.transition(
+                conn, call["call_id"], "ring_expire", reason="ring_timeout", bump_version=False,
+            )
             body = self._terminal(call["interaction_id"], call["call_id"], "not_accepted", "ring_timeout", seq)
             conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call["call_id"], seq, self._dump(body)))
         rows = conn.execute(
@@ -1348,11 +1436,7 @@ class WaitingLifecycle:
                 reason = "agent_disconnected"
             else:
                 reason = "terminal_disconnected"
-            conn.execute(
-                "UPDATE lifecycle_calls SET call_state='disconnected', reason=?, version=version+1 WHERE call_id=?",
-                (reason, call["call_id"]),
-            )
-            seq = int(conn.execute("SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call["call_id"],)).fetchone()["n"])
+            _, seq = self._machine.transition(conn, call["call_id"], "disconnect", reason=reason)
             body = self._terminal(call["interaction_id"], call["call_id"], "disconnected", reason, seq)
             body["human_action"] = False
             conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call["call_id"], seq, self._dump(body)))
@@ -1360,20 +1444,14 @@ class WaitingLifecycle:
     def _settle_clock_anomaly(self, conn: sqlite3.Connection) -> None:
         """Terminate every affected call with an explicit clock-anomaly reason."""
         for call in conn.execute("SELECT * FROM lifecycle_calls WHERE call_state='ringing'").fetchall():
-            conn.execute(
-                "UPDATE lifecycle_calls SET call_state='not_accepted', reason='clock_anomaly' WHERE call_id=?",
-                (call["call_id"],),
+            _, seq = self._machine.transition(
+                conn, call["call_id"], "clock_expire", reason="clock_anomaly", bump_version=False,
             )
-            seq = int(conn.execute("SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call["call_id"],)).fetchone()["n"])
             body = self._terminal(call["interaction_id"], call["call_id"], "not_accepted", "clock_anomaly", seq)
             body["human_action"] = False
             conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call["call_id"], seq, self._dump(body)))
         for call in conn.execute("SELECT * FROM lifecycle_calls WHERE call_state IN ('accepted', 'in_progress')").fetchall():
-            conn.execute(
-                "UPDATE lifecycle_calls SET call_state='disconnected', reason='clock_anomaly', version=version+1 WHERE call_id=?",
-                (call["call_id"],),
-            )
-            seq = int(conn.execute("SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call["call_id"],)).fetchone()["n"])
+            _, seq = self._machine.transition(conn, call["call_id"], "clock_expire", reason="clock_anomaly")
             body = self._terminal(call["interaction_id"], call["call_id"], "disconnected", "clock_anomaly", seq)
             body["human_action"] = False
             conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call["call_id"], seq, self._dump(body)))
@@ -1543,35 +1621,27 @@ class Application:
             await self._send(send, 400, self._error("invalid_request")); return
         if "jsonrpc" in body or "method" in body or "id" in body:
             result = self._rpc(caller, body)
-            # Long-poll: if heartbeat, wait for the human then re-check once.
+            # Event-driven long-poll: a heartbeat with live call ids means
+            # the call is active.  Park this response on the state machine's
+            # bus until the call reaches a terminal state or the client's
+            # declared budget expires — one wait, no re-entered RPC, no
+            # synthesised continuation requests.
             params = body.get("params") if isinstance(body.get("params"), dict) else {}
             args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
             sc = result.get("result", {}).get("structuredContent", {})
             if (isinstance(sc, dict) and sc.get("needs_continuation")
                     and sc.get("status") == "heartbeat"
-                    and isinstance(sc.get("interaction_id"), str)):
+                    and isinstance(sc.get("interaction_id"), str)
+                    and isinstance(sc.get("call_id"), str)):
                 timeout = args.get("client_timeout_seconds", 30)
                 if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0:
-                    await self._wait(max(1, float(timeout) - min(30, max(1, float(timeout) // 4))))
-                    tool_name = params.get("name", "")
-                    try:
-                        poll_seq = 0
-                        for _ in range(8):
-                            sc2 = self.lifecycle.continue_call(
-                                caller, f"rpc-{body.get('id')}-w{poll_seq}",
-                                sc["interaction_id"], sc["call_id"], poll_seq)
-                            if not isinstance(sc2, dict) or not sc2.get("success"):
-                                break
-                            evt_seq = sc2.get("event_seq")
-                            if isinstance(evt_seq, int):
-                                poll_seq = evt_seq
-                            if sc2.get("status") not in ("heartbeat", "opened"):
-                                break  # terminal state reached
-                    except Exception:
-                        sc2 = None
-                    if isinstance(sc2, dict) and sc2.get("success"):
-                        result["result"]["structuredContent"] = sc2
-                        result["result"]["content"] = [{"type": "text", "text": self._rpc_summary(tool_name, sc2)}]
+                    budget = max(1.0, float(timeout) - min(30.0, max(1.0, float(timeout) / 4.0)))
+                    outcome = await self.lifecycle.wait_call_outcome(
+                        caller, str(sc["interaction_id"]), str(sc["call_id"]), budget, waiter=self._wait,
+                    )
+                    if isinstance(outcome, dict) and outcome.get("status") != "heartbeat":
+                        result["result"]["structuredContent"] = outcome
+                        result["result"]["content"] = [{"type": "text", "text": self._rpc_summary(str(params.get("name", "")), outcome)}]
             await self._send(send, 200, result); return
         timeout = body.get("client_timeout_seconds")
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 2:
@@ -1581,7 +1651,12 @@ class Application:
                     "headers": [(b"content-type", b"application/json")]})
         waited = should_wait and response.get("needs_continuation") and response.get("status") == "heartbeat"
         if waited:
-            await self._wait(max(1, float(timeout) - min(30, max(1, float(timeout) // 4))))
+            budget = max(1.0, float(timeout) - min(30.0, max(1.0, float(timeout) / 4.0)))
+            outcome = await self.lifecycle.wait_call_outcome(
+                caller, str(response.get("interaction_id")), str(response.get("call_id")), budget, waiter=self._wait,
+            )
+            if isinstance(outcome, dict) and outcome.get("status") != "heartbeat":
+                response = outcome
         await send({"type": "http.response.body", "body": json.dumps(response, separators=(",", ":")).encode(), "more_body": False})
         if should_wait:
             self.lifecycle.response_delivered(caller, response)
