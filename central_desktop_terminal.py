@@ -399,8 +399,13 @@ def build_settings_panel(root: Any, ring: Any, central: Any, ringtones_dir: str,
         minutes = quiet_window_seconds // 60
         quiet_mode_var = tk.StringVar(value=quiet_mode)
         quiet_status = tk.StringVar(value="")
-        quiet_minutes_entry = tk.Entry(root)
-        quiet_minutes_entry.grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=2)
+        quiet_frame = tk.LabelFrame(root, text="接听后", padx=10, pady=8)
+        quiet_frame.pack(fill="x", padx=12, pady=(0, 12))
+        qconfigure = getattr(quiet_frame, "columnconfigure", None)
+        if callable(qconfigure):
+            qconfigure(1, weight=1)
+        quiet_minutes_entry = tk.Entry(quiet_frame)
+        quiet_minutes_entry.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=2)
         setter = getattr(quiet_minutes_entry, "set_text", None)
         if callable(setter):
             setter(str(minutes))
@@ -419,13 +424,12 @@ def build_settings_panel(root: Any, ring: Any, central: Any, ringtones_dir: str,
                 set_quiet(minutes_val * 60, quiet_mode_var.get())
             quiet_status.set("已同步")
 
-        tk.Label(root, text="接听后静音").grid(row=0, column=0, columnspan=2, sticky="w", pady=(12, 0))
-        tk.Radiobutton(root, text="短铃声", variable=quiet_mode_var, value="short").grid(row=1, column=0, sticky="w", pady=2)
-        tk.Radiobutton(root, text="静音", variable=quiet_mode_var, value="silent").grid(row=1, column=1, sticky="w", pady=2)
-        tk.Label(root, text="时长(分钟)").grid(row=2, column=0, sticky="w", pady=2)
-        quiet_save = tk.Button(root, text="保存", command=sync_quiet)
-        quiet_save.grid(row=3, column=1, sticky="e", pady=(6, 2))
-        tk.Label(root, textvariable=quiet_status, fg="gray").grid(row=4, column=0, columnspan=2, sticky="w")
+        tk.Radiobutton(quiet_frame, text="短铃声", variable=quiet_mode_var, value="short").grid(row=0, column=0, sticky="w", pady=(0, 4))
+        tk.Radiobutton(quiet_frame, text="静音", variable=quiet_mode_var, value="silent").grid(row=0, column=1, sticky="w", pady=(0, 4))
+        tk.Label(quiet_frame, text="时长(分钟)").grid(row=1, column=0, sticky="w", pady=2)
+        quiet_save = tk.Button(quiet_frame, text="保存", command=sync_quiet)
+        quiet_save.grid(row=2, column=1, sticky="e", pady=(6, 2))
+        tk.Label(quiet_frame, textvariable=quiet_status, fg="gray").grid(row=3, column=0, columnspan=2, sticky="w")
 
 
 class CentralHttpDesktopClient:
