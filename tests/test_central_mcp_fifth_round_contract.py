@@ -67,7 +67,7 @@ def test_human_loop_prompt_covers_protocol_semantics(tmp_path: Path) -> None:
         assert keyword in prompt, f"prompt missing {keyword}"
 
 
-def _config() -> DesktopTerminalConfig:
+def _config(session_store_path: str | None = None) -> DesktopTerminalConfig:
     return DesktopTerminalConfig(
         central_url="https://central.test",
         terminal_credential="desktop-secret",
@@ -75,6 +75,7 @@ def _config() -> DesktopTerminalConfig:
         listener_host="127.0.0.1",
         listener_port=9100,
         verify_tls=True,
+        session_store_path=session_store_path,
     )
 
 
@@ -108,7 +109,7 @@ def _install_fake_http(monkeypatch: Any) -> list[dict[str, object]]:
 
 
 def test_restart_recovers_owner_session_without_registering(tmp_path: Path, monkeypatch: Any) -> None:
-    config = _config()
+    config = _config(session_store_path=str(tmp_path / "session.store"))
     recorder = _install_fake_http(monkeypatch)
 
     client1 = CentralHttpDesktopClient(config)
