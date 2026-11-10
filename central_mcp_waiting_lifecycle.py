@@ -134,7 +134,7 @@ class WaitingLifecycle:
                 terminal_last_seen_at REAL, terminal_disconnect_deadline REAL,
                 version INTEGER NOT NULL DEFAULT 1,
                 draft_content TEXT, draft_version INTEGER NOT NULL DEFAULT 0,
-                created_at REAL
+                created_at REAL, task_version INTEGER NOT NULL DEFAULT 1
               );
               CREATE TABLE IF NOT EXISTS lifecycle_requests (
                 caller_id TEXT NOT NULL, request_id TEXT NOT NULL, payload_json TEXT NOT NULL,
@@ -192,7 +192,7 @@ class WaitingLifecycle:
             ("terminal_last_seen_at", "REAL"), ("terminal_disconnect_deadline", "REAL"),
             ("version", "INTEGER NOT NULL DEFAULT 1"),
             ("draft_content", "TEXT"), ("draft_version", "INTEGER NOT NULL DEFAULT 0"),
-            ("created_at", "REAL"),
+            ("created_at", "REAL"), ("task_version", "INTEGER NOT NULL DEFAULT 1"),
         ):
             if column not in columns:
                 conn.execute(f"ALTER TABLE lifecycle_calls ADD COLUMN {column} {definition}")
@@ -1001,6 +1001,63 @@ class WaitingLifecycle:
         if notification is not None:
             self._notify(notification)
         return outcome
+
+    def update_task_description(self, caller_id: str, request_id: str, interaction_id: str, call_id: str,
+                                expected_task_version: int, task_description: str | None = None,
+                                context_note: str | None = None) -> dict[str, object]:
+        """Update an in-progress task's description/context without re-ringing."""
+        if isinstance(expected_task_version, bool) or not isinstance(expected_task_version, int) or expected_task_version < 0:
+            return self._error("invalid_request")
+        request_encoded = self._dump({
+            "interaction_id": interaction_id, "call_id": call_id,
+            "expected_task_version": expected_task_version,
+            "task_description": task_description, "context_note": context_note,
+        })
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = conn.execute(
+                    "SELECT payload_json, outcome_json, operation_kind FROM lifecycle_requests "
+                    "WHERE caller_id=? AND request_id=?",
+                    (caller_id, request_id),
+                ).fetchone()
+                if existing is not None:
+                    if existing["operation_kind"] != "task_update" or existing["payload_json"] != request_encoded:
+                        return self._error("request_conflict")
+                    return self._load(existing["outcome_json"])
+                self._settle_due(conn)
+                call = conn.execute(
+                    "SELECT * FROM lifecycle_calls WHERE call_id=? AND interaction_id=? AND caller_id=?",
+                    (call_id, interaction_id, caller_id),
+                ).fetchone()
+                if call is None:
+                    return self._error("session_not_found")
+                if call["call_state"] != "in_progress":
+                    return self._error("invalid_request")
+                if expected_task_version != int(call["task_version"]):
+                    return self._error("task_version_conflict")
+                try:
+                    payload = self._load(call["payload_json"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    payload = {}
+                if not isinstance(payload, dict):
+                    payload = {}
+                if task_description is not None:
+                    payload["task_description"] = task_description
+                if context_note is not None:
+                    payload["context_note"] = context_note
+                conn.execute(
+                    "UPDATE lifecycle_calls SET payload_json=?, task_version=task_version+1, version=version+1 WHERE call_id=?",
+                    (self._dump(payload), call_id),
+                )
+                outcome = {"success": True, "status": "task_updated", "task_version": int(call["task_version"]) + 1}
+                conn.execute("INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?, 'task_update')",
+                             (caller_id, request_id, request_encoded, self._dump(outcome)))
+                conn.commit()
+                return outcome
+            except BaseException:
+                conn.rollback()
+                raise
 
     def call_version(self, call_id: str) -> int:
         with self._connection() as conn:
@@ -1973,6 +2030,20 @@ class Application:
                 caller, request_id, interaction, call_id, revision_id, payload,
                 invited_desktop_id, mobile_eligible,
             ), not replay
+        expected_task_version = body.get("expected_task_version")
+        if expected_task_version is not None:
+            task_description = body.get("task_description")
+            context_note = body.get("context_note")
+            if not isinstance(interaction, str) or not isinstance(call_id, str) or isinstance(expected_task_version, bool) or not isinstance(expected_task_version, int):
+                return self._error("invalid_request"), False
+            if task_description is not None and not isinstance(task_description, str):
+                return self._error("invalid_request"), False
+            if context_note is not None and not isinstance(context_note, str):
+                return self._error("invalid_request"), False
+            return self.lifecycle.update_task_description(
+                caller, request_id, interaction, call_id, expected_task_version,
+                task_description, context_note,
+            ), False
         if interaction is not None or call_id is not None:
             after = body.get("after_event_seq", 0)
             if not isinstance(interaction, str) or not isinstance(call_id, str) or isinstance(after, bool) or not isinstance(after, int):

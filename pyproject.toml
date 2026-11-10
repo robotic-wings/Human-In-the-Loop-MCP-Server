@@ -15,7 +15,6 @@ authors = [
 keywords = [
     "mcp", 
     "model-context-protocol", 
-    "fastmcp", 
     "human-in-the-loop", 
     "central-service",
     "http",
@@ -42,7 +41,6 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "fastmcp>=2.8.1",
     "httpx>=0.28.1",
     "pydantic>=2.0.0",
     "uvicorn>=0.30.0",
