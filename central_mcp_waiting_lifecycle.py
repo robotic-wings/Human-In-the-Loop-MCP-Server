@@ -2147,6 +2147,17 @@ class Application:
     @staticmethod
     def _rpc_summary(name: str, structured: Mapping[str, object]) -> str:
         status = structured.get("status", structured.get("call_state", "ok"))
+        iid = structured.get("interaction_id")
+        cid = structured.get("call_id")
+        needs = structured.get("needs_continuation")
+        result = structured.get("result")
+        if needs and iid and cid:
+            summary = f"{name}: {status}. Waiting for human response — call {name} again with interaction_id={iid}, call_id={cid}, after_event_seq=0, client_timeout_seconds=30 to poll."
+            if result is not None:
+                summary += f" Partial result: {json.dumps(result, ensure_ascii=False)}"
+            return summary
+        if result is not None:
+            return f"{name}: {status}. Result: {json.dumps(result, ensure_ascii=False)}"
         return f"{name}: {status}"
 
     @staticmethod
