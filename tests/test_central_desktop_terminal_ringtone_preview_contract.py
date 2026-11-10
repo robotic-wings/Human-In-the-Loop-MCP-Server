@@ -219,8 +219,8 @@ def test_settings_panel_has_label_and_preview_button() -> None:
     build_settings_panel(None, FakeRing(), FakeCentral(), "/sounds", ["a.mp3"], "/sounds/a.mp3", tk)
 
     assert "铃声：" in tk.labels
-    assert len(tk.buttons) == 1
-    assert tk.buttons[0].text == "测试播放"
+    assert any(b.text == "测试播放" for b in tk.buttons)
+    assert any(b.text == "保存" for b in tk.buttons)
 
 
 def test_preview_button_toggles_text() -> None:
