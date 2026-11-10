@@ -2156,7 +2156,7 @@ class Application:
         }
 
     def _rpc_interaction(self, caller: str, name: str, arguments: Mapping[str, object], rid: object) -> dict[str, object]:
-        request_id = f"rpc-{rid}"
+        request_id = self._rpc_request_id(rid, name, arguments)
         interaction_id = arguments.get("interaction_id")
         call_id = arguments.get("call_id")
         interaction_present = isinstance(interaction_id, str) and bool(interaction_id)
@@ -2188,7 +2188,25 @@ class Application:
         call_id = arguments.get("call_id")
         if not isinstance(interaction_id, str) or not interaction_id or not isinstance(call_id, str) or not call_id:
             raise _RpcError(-32602, "Invalid params")
-        return dict(self.lifecycle.cancel(caller, f"rpc-{rid}", interaction_id, call_id))
+        return dict(self.lifecycle.cancel(caller, self._rpc_request_id(rid, "cancel_interaction", arguments), interaction_id, call_id))
+
+    @staticmethod
+    def _rpc_request_id(rid: object, name: str, arguments: Mapping[str, object]) -> str:
+        """Namescope a JSON-RPC id with its payload fingerprint.
+
+        JSON-RPC request ids are unique only within one client session, but
+        the idempotency store keys them forever.  MCP hosts restart their
+        id counter on every reconnect (initialize=1, tools/list=2, ...), so
+        a fresh session inevitably reuses small ids.  Hashing the payload
+        into the request id keeps genuine retries (same id, same payload)
+        replaying the cached outcome while a reused id carrying different
+        arguments executes as the new request it actually is, instead of
+        poisoning the client with ``request_conflict``.
+        """
+        fingerprint = hashlib.sha1(
+            f"{name}|{json.dumps(dict(arguments), sort_keys=True, separators=(',', ':'))}".encode()
+        ).hexdigest()[:8]
+        return f"rpc-{rid}-{fingerprint}"
 
     def _rpc_read_tool(self, caller: str, name: str, arguments: Mapping[str, object]) -> dict[str, object]:
         if name == "read_interaction_result":

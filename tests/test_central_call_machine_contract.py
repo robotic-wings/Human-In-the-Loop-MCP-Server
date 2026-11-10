@@ -221,3 +221,49 @@ def test_wait_call_outcome_budget_expiry_returns_heartbeat(tmp_path: Path) -> No
     assert outcome is not None
     assert outcome["status"] == "heartbeat"
     assert outcome["call_state"] == "ringing"
+
+
+def test_rpc_request_id_namescopes_payload(tmp_path: Path) -> None:
+    """A reused JSON-RPC id with different arguments must not conflict.
+
+    MCP hosts restart their id counter per session; the payload
+    fingerprint keeps genuine retries replaying while reused ids
+    execute as fresh requests.
+    """
+    lifecycle_mod = _lifecycle_module()
+    app = lifecycle_mod.create_app(
+        database_path=tmp_path / "rpcid.sqlite3",
+        credentials={"agent-a": "token-a"},
+        clock=lambda: 1_700_000_000.0,
+        notify=lambda _n: None,
+        wait=_noop_wait(),
+        ring_timeout_seconds=60,
+    )
+
+    def call(rid, arguments):
+        return app._rpc("agent-a", {"jsonrpc": "2.0", "id": rid, "method": "tools/call",
+                                    "params": {"name": "get_user_input", "arguments": arguments}})
+
+    first = call(6, {"prompt": "say the codeword"})
+    assert first["result"]["structuredContent"]["status"] == "heartbeat"
+    # Reused id + different payload while the first call still rings: the
+    # single busy slot answers ``busy`` (actionable), never a conflict.
+    reused = call(6, {"prompt": "a different question"})
+    assert reused["result"]["structuredContent"]["status"] == "busy"
+    # Genuine retry (same id, same payload) replays the original call.
+    retry = call(6, {"prompt": "say the codeword"})
+    assert retry["result"]["structuredContent"]["call_id"] == first["result"]["structuredContent"]["call_id"]
+    # After the round ends, a reused id with new payload runs as a fresh call.
+    app.lifecycle.cancel("agent-a", "test-cancel-1",
+                         first["result"]["structuredContent"]["interaction_id"],
+                         first["result"]["structuredContent"]["call_id"])
+    fresh = call(6, {"prompt": "yet another question"})
+    fresh_sc = fresh["result"]["structuredContent"]
+    assert fresh_sc["status"] == "heartbeat"
+    assert fresh_sc["call_id"] != first["result"]["structuredContent"]["call_id"]
+
+
+def _noop_wait():
+    async def _wait(_seconds: float) -> None:
+        return None
+    return _wait

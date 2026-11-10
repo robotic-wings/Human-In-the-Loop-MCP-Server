@@ -1,0 +1,6 @@
+{
+  "Alpha": {
+    "backend": "opencode-cli",
+    "model": "deepseek/deepseek-v4-pro"
+  }
+}
