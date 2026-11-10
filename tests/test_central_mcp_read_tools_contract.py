@@ -166,7 +166,7 @@ def test_read_interaction_result_returns_full_body_and_attachments(tmp_path: Pat
     })
 
     result = rpc_structured(app, "read_interaction_result", {
-        "interaction_id": call["interaction_id"], "result_id": "placeholder",
+        "interaction_id": call["interaction_id"],
     })
     assert isinstance(result, dict) and result.get("success") is True
 
