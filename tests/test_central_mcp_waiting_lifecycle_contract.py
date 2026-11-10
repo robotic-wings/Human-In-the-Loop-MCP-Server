@@ -246,6 +246,12 @@ def test_ring_timeout_is_absolute_persisted_and_recovered_without_reringing(tmp_
         "needs_continuation": False,
         "interaction_id": ringing["interaction_id"],
         "call_id": ringing["call_id"],
+        "human_action": False,
+        "retryable": True,
+        "retry_after_seconds": 60,
+        "handled_on": None,
+        "terminal_platform": None,
+        "message": "人类未接受通信，60 秒内无人接听，这不是主动拒绝，可以稍后重新呼叫。",
     }
     assert len(notifications) == 1
     assert restarted_notifications == []

@@ -96,6 +96,11 @@ def expected_disconnected(call: dict[str, object]) -> dict[str, object]:
         "interaction_id": call["interaction_id"],
         "call_id": call["call_id"],
         "event_seq": 2,
+        "retryable": True,
+        "retry_after_seconds": 30,
+        "handled_on": None,
+        "terminal_platform": None,
+        "message": "调用方已失联，通信已结束。",
     }
 
 
