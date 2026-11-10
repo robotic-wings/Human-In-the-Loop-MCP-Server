@@ -40,13 +40,13 @@ _MCP_TOOLS = (
      "inputSchema": {"type": "object", "properties": {
          "prompt": {"type": "string"}, "required": {"type": "boolean"},
          "interaction_id": {"type": "string"}, "call_id": {"type": "string"},
-         "after_event_seq": {"type": "integer"}}}},
+         "after_event_seq": {"type": "integer"}, "max_result_bytes": {"type": "integer"}}}},
     {"name": "get_number_input", "kind": "interaction",
      "description": "Request a numeric answer from the operator.",
      "inputSchema": {"type": "object", "properties": {
          "prompt": {"type": "string"}, "required": {"type": "boolean"},
          "interaction_id": {"type": "string"}, "call_id": {"type": "string"},
-         "after_event_seq": {"type": "integer"}}}},
+         "after_event_seq": {"type": "integer"}, "max_result_bytes": {"type": "integer"}}}},
     {"name": "get_user_choice", "kind": "interaction",
      "description": "Ask the operator to choose one or more options.",
      "inputSchema": {"type": "object", "properties": {
@@ -307,6 +307,7 @@ class WaitingLifecycle:
                 event = conn.execute("SELECT body_json FROM lifecycle_events WHERE call_id=? AND event_seq>? ORDER BY event_seq LIMIT 1", (call_id, after)).fetchone()
                 if event is not None:
                     outcome = self._load(event["body_json"])
+                    outcome = self._apply_result_budget(outcome, call["payload_json"])
                 elif call["call_state"] in {"ringing", "accepted", "in_progress"}:
                     outcome = self._heartbeat(interaction_id, call_id, call["call_state"])
                 else:
@@ -675,6 +676,7 @@ class WaitingLifecycle:
                     "needs_continuation": needs_continuation, "interaction_id": call["interaction_id"], "call_id": call_id,
                     "event_seq": seq, "handled_on": call["handled_on"],
                     "terminal_platform": call["terminal_platform"], "result": dict(result),
+                    "result_id": str(uuid.uuid4()),
                 }
                 outcome.update(extras)
                 attachments = dict(result).get("attachments")
@@ -1098,6 +1100,30 @@ class WaitingLifecycle:
     @staticmethod
     def _heartbeat(interaction_id: str, call_id: str, state: str) -> dict[str, object]:
         return {"success": True, "status": "heartbeat", "call_state": state, "interaction_id": interaction_id, "call_id": call_id, "needs_continuation": True}
+
+    @staticmethod
+    def _apply_result_budget(outcome: dict[str, object], payload_json: str) -> dict[str, object]:
+        """Omit oversized result bodies only on the Agent read path."""
+        result = outcome.get("result")
+        if not isinstance(result, Mapping):
+            return outcome
+        try:
+            payload = json.loads(payload_json)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        max_result_bytes = payload.get("max_result_bytes") if isinstance(payload, dict) else None
+        if not isinstance(max_result_bytes, int) or isinstance(max_result_bytes, bool) or max_result_bytes < 16384:
+            max_result_bytes = 1_000_000
+        if len(json.dumps(result, separators=(",", ":"))) <= max_result_bytes:
+            return outcome
+        omitted = dict(outcome)
+        omitted["body_omitted_for_size"] = True
+        omitted_result = dict(result)
+        for key, value in list(omitted_result.items()):
+            if isinstance(value, str):
+                omitted_result[key] = None
+        omitted["result"] = omitted_result
+        return omitted
 
     @staticmethod
     def _terminal(interaction_id: str, call_id: str, state: str, reason: str | None, seq: int) -> dict[str, object]:
@@ -1688,6 +1714,12 @@ class Application:
                 raise _RpcError(-32602, "Invalid params")
             result = self.lifecycle.continue_call(caller, request_id, interaction_id, call_id, after)
         else:
+            max_result_bytes = arguments.get("max_result_bytes")
+            if max_result_bytes is not None and (
+                isinstance(max_result_bytes, bool) or not isinstance(max_result_bytes, int)
+                or max_result_bytes < 16384
+            ):
+                return {"success": False, "status": "invalid_result_budget", "needs_continuation": False}
             payload = {"tool": name, **dict(arguments)}
             result = self.lifecycle.create(
                 caller, request_id, payload, self._invited_desktop_id(), self._mobile_eligible(),
