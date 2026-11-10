@@ -649,7 +649,8 @@ class WaitingLifecycle:
                 raise
 
     def submit(self, *, call_id: str, device_id: str, session_id: str,
-               submission_id: str, result: Mapping[str, object]) -> dict[str, object]:
+               submission_id: str, result: Mapping[str, object],
+               task_version: int | None = None) -> dict[str, object]:
         """Persist one final answer from the exact session which owns a call."""
         if not submission_id or len(submission_id) > 128:
             return self._error("invalid_request")
@@ -676,6 +677,8 @@ class WaitingLifecycle:
                         (call_id,),
                     ).fetchone()
                     return self._load(event["body_json"]) if event is not None else self._error("expired")
+                if isinstance(task_version, int) and not isinstance(task_version, bool) and task_version != int(call["task_version"]):
+                    return self._error("task_version_conflict")
                 now = self._clock()
                 conn.execute(
                     "UPDATE lifecycle_calls SET terminal_last_seen_at=?, terminal_disconnect_deadline=? WHERE call_id=?",
@@ -1576,9 +1579,10 @@ class Application:
             result = body.get("result") if body is not None else None
             if not isinstance(submission_id, str) or not isinstance(result, Mapping):
                 await self._send(send, 400, self._error("invalid_request")); return
+            task_version = body.get("task_version") if body is not None else None
             response = self.lifecycle.submit(
                 call_id=parts[3], device_id=device_id, session_id=session,
-                submission_id=submission_id, result=result,
+                submission_id=submission_id, result=result, task_version=task_version,
             )
         elif parts[4] == "cancel":
             body = await self._body(receive)
