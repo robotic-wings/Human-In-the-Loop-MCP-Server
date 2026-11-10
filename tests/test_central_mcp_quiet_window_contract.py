@@ -136,6 +136,14 @@ def bark_payload(router: NotificationRouter, call_id: str) -> dict[str, object] 
     return None
 
 
+def desktop_payload(router: NotificationRouter, call_id: str) -> dict[str, object] | None:
+    for record in router.outbox_records(call_id):
+        if record["channel"] == "desktop":
+            payload = record["payload"]
+            return payload if isinstance(payload, dict) else None
+    return None
+
+
 def test_quiet_window_defaults_and_persists(tmp_path: Path) -> None:
     app1, _clock1, _router1, _ = components(tmp_path)
     state = app1.lifecycle.get_quiet_window()
@@ -207,3 +215,20 @@ def test_bark_payload_drops_call_on_degraded_call(tmp_path: Path) -> None:
     assert "call" not in payload, (
         "a degraded Bark push must omit call=1 so the phone does not ring loudly"
     )
+
+
+def test_desktop_event_carries_degraded_and_quiet_mode(tmp_path: Path) -> None:
+    app, clock, router, _notifications = components(tmp_path)
+    session = register_terminal(app)
+    call = create_call(app, 1)
+    accept_desktop(app, call, session)
+    submit_answer(app, call, session)
+
+    clock.advance(100)
+    degraded = create_call(app, 2)
+    payload = desktop_payload(router, str(degraded["call_id"]))
+    assert payload is not None
+    assert payload.get("degraded") is True, (
+        "the desktop callback event must carry degraded so the terminal knows to ring short/silent"
+    )
+    assert payload.get("quiet_mode") in {"short", "silent"}

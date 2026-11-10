@@ -108,6 +108,7 @@ class FakeTk:
         self.checkbuttons: list[dict[str, object]] = []
         self.entries: list[FakeEntry] = []
         self.buttons: list[FakeButton] = []
+        self.labels: list[str] = []
     def LabelFrame(self, _root: object, **kwargs: object) -> object:
         return FakeWidget()
 
@@ -137,6 +138,8 @@ class FakeTk:
         return entry
 
     def Label(self, *_args: object, **_kwargs: object) -> FakeWidget:
+        if "text" in _kwargs:
+            self.labels.append(str(_kwargs["text"]))
         return FakeWidget()
 
     def Button(self, _root: object, **kwargs: object) -> FakeButton:
@@ -181,8 +184,10 @@ def test_build_settings_panel_creates_option_menu_and_checkbutton() -> None:
     tk = FakeTk()
     build_settings_panel(None, FakeRing(), FakeCentral(), "/sounds", ["alpha.mp3", "beta.mp3"], "/sounds/beta.mp3", tk)
 
-    assert len(tk.option_menus) == 1
+    assert len(tk.option_menus) == 2
     assert tk.option_menus[0]["options"] == ["alpha.mp3", "beta.mp3"]
+    assert tk.option_menus[1]["options"] == ["alpha.mp3", "beta.mp3"]
+    assert "短铃声" in tk.labels
     assert len(tk.checkbuttons) == 1
     assert tk.checkbuttons[0]["text"] == "来电自动拒绝"
 

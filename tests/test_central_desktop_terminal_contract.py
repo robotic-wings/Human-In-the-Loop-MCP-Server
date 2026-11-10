@@ -79,10 +79,12 @@ class FakeListener:
 @dataclass
 class FakeRing:
     started: list[str] = field(default_factory=list)
+    modes: list[str] = field(default_factory=list)
     stopped: list[str] = field(default_factory=list)
 
-    def start(self, call_id: str) -> None:
+    def start(self, call_id: str, mode: str = "long") -> None:
         self.started.append(call_id)
+        self.modes.append(mode)
 
     def stop(self, call_id: str) -> None:
         self.stopped.append(call_id)
@@ -392,3 +394,37 @@ def test_desktop_public_semantics_are_platform_neutral_and_client_never_exposes_
     assert not hasattr(client, "create_mcp_app")
     assert not hasattr(client, "serve_mcp")
     assert not hasattr(client, "proxy_mcp")
+
+
+def test_desktop_config_has_short_ringtone_path_defaulting_empty() -> None:
+    config = _module().DesktopTerminalConfig.from_mapping({
+        "central_url": "https://10.0.0.1:8443",
+        "terminal_credential": "desktop-secret",
+        "callback_credential": "callback-secret",
+        "listener_host": "10.0.0.61",
+        "listener_port": 9100,
+    })
+    assert getattr(config, "short_ringtone_path", None) == ""
+
+
+def test_short_quiet_mode_rings_short_and_still_presents() -> None:
+    central = FakeCentral(states={"call-1": _ringing("call-1")})
+    client = _client(central=central)
+    client.start()
+    event = {"call_id": "call-1", "version": 1, "call_state": "ringing", "quiet_mode": "short"}
+    result = client.receive_notification(event, callback_credential="central-callback-secret")
+    assert result["status"] == "presented"
+    assert client.ring.modes == ["short"]
+    assert client.ring.started == ["call-1"]
+    assert client.presenter.shown
+
+
+def test_silent_quiet_mode_presents_without_ringing() -> None:
+    central = FakeCentral(states={"call-1": _ringing("call-1")})
+    client = _client(central=central)
+    client.start()
+    event = {"call_id": "call-1", "version": 1, "call_state": "ringing", "quiet_mode": "silent"}
+    result = client.receive_notification(event, callback_credential="central-callback-secret")
+    assert result["status"] == "presented"
+    assert client.ring.started == []
+    assert client.presenter.shown
