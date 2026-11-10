@@ -466,3 +466,64 @@ def test_configured_login_credentials_must_target_a_single_operator(tmp_path: Pa
                 "login-b": "other-cookie",
             },
         })
+
+
+def test_mobile_accept_dispatches_accepted_callback_to_desktop(tmp_path: Path) -> None:
+    recorded: list[dict[str, object]] = []
+
+    async def record_desktop(payload: Mapping[str, object]) -> Mapping[str, object]:
+        recorded.append(dict(payload))
+        return {"accepted": True}
+
+    async def noop_bark(_payload: Mapping[str, object]) -> Mapping[str, object]:
+        return {"http_status": 200, "business_success": True}
+
+    config = CentralServiceConfig.from_mapping({
+        "listen_host": "127.0.0.1",
+        "listen_port": 8443,
+        "web_base_url": "https://central.example.test",
+        "data_dir": str(tmp_path / "accepted-callback"),
+        "agent_credentials": {"agent-a": "agent-secret"},
+        "tls_cert_file": "test-cert.pem",
+        "tls_key_file": "test-key.pem",
+        "route_mode": "both",
+        "desktop_credentials": {"desktop-secret": {"device_id": "desktop-61", "terminal_platform": "windows"}},
+        "desktop_endpoints": {"desktop-61": {"endpoint": "https://desktop.example.test:9100/terminal/events", "callback_credential": "callback-secret"}},
+        "bark_endpoint": "https://bark.example.test/push",
+        "bark_credential": "bark-secret",
+        "operator_sessions": {
+            "operator-cookie": {"operator_id": "only-operator", "browser_session_id": "browser-61", "csrf_token": "csrf-61"},
+        },
+        "operator_login_credentials": {"operator-login-secret": "operator-cookie"},
+    })
+    verifier = _ConfiguredOperatorSessionVerifier(config.operator_sessions)
+    app = create_lifecycle_app(
+        config, clock=Clock(), wait=_no_wait, bark_dispatch=noop_bark,
+        desktop_dispatch=record_desktop, operator_session_verifier=verifier,
+        browser_cookie_authenticator=verifier,
+        scheduler_sleep=_no_wait, notification_scheduler_sleep=_no_wait,
+    )
+
+    async def register() -> httpx.Response:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://central.example.test") as client:
+            return await client.post("/api/terminals/register", headers={"authorization": "Terminal desktop-secret"}, json={"endpoint": "https://desktop.example.test:9100/terminal/events", "gui_ready": True})
+    assert asyncio.run(register()).status_code == 201
+
+    call = _create(app, request_id="accepted-callback-call")
+
+    asyncio.run(app.dispatch_notification_delivery())
+    assert recorded, "the initial ringing callback must be dispatched to the desktop"
+    initial = recorded[0]
+    assert initial.get("call_state") == "ringing"
+
+    accept = _request(
+        app, "POST", f"/calls/{call['call_id']}/accept", cookie="operator-cookie",
+        form={"operation_id": "mobile-accept-1", "csrf_token": "csrf-61"},
+        headers={"origin": "https://central.example.test", "host": "central.example.test"},
+    )
+    assert accept.status_code == 200
+
+    asyncio.run(app.dispatch_notification_delivery())
+    accepted = [r for r in recorded if r.get("call_state") == "accepted"]
+    assert accepted, "mobile accept must dispatch an accepted callback to the desktop"
+    assert accepted[0].get("version", 0) > initial.get("version", 0)

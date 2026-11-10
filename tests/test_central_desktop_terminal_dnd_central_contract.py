@@ -154,6 +154,8 @@ class FakeTk:
         self.checkbuttons: list[dict[str, object]] = []
         self.entries: list[FakeEntry] = []
         self.buttons: list[FakeButton] = []
+        self.labels: list[str] = []
+        self.order: list[tuple[str, str]] = []
 
     def StringVar(self, value: str = "") -> FakeVar:
         return FakeVar(value)
@@ -174,9 +176,14 @@ class FakeTk:
     def Entry(self, *_args: object, **_kwargs: object) -> FakeEntry:
         entry = FakeEntry()
         self.entries.append(entry)
+        self.order.append(("entry",))
         return entry
 
-    def Label(self, *_args: object, **_kwargs: object) -> FakeWidget:
+    def Label(self, *_args: object, **kwargs: object) -> FakeWidget:
+        text = kwargs.get("text")
+        if isinstance(text, str):
+            self.labels.append(text)
+            self.order.append(("label", text))
         return FakeWidget()
 
     def Button(self, _root: object, **kwargs: object) -> FakeButton:
@@ -232,3 +239,14 @@ def test_build_settings_panel_wires_dnd_to_central_with_message_entry() -> None:
     tk.entries[0].set_text("开会中，稍后回复")
     tk.checkbuttons[0]["variable"].set(True)
     assert central.set_dnd_calls == [(True, "开会中，稍后回复")]
+
+
+def test_message_entry_has_auto_reply_label_before_it() -> None:
+    build_settings_panel = _build()
+    tk = FakeTk()
+    build_settings_panel(None, FakeRing(), FakeCentral(), "/sounds", ["a.mp3"], "/sounds/a.mp3", tk)
+
+    assert "自动回复消息：" in tk.labels
+    label_index = tk.order.index(("label", "自动回复消息："))
+    entry_index = next(index for index, event in enumerate(tk.order) if event[0] == "entry")
+    assert label_index < entry_index

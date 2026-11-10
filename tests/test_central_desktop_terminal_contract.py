@@ -92,12 +92,16 @@ class FakeRing:
 class FakePresenter:
     shown: list[dict[str, object]] = field(default_factory=list)
     closed: list[str] = field(default_factory=list)
+    hints: list[tuple[str, str]] = field(default_factory=list)
 
     def show(self, state: dict[str, object]) -> None:
         self.shown.append(dict(state))
 
     def close(self, call_id: str) -> None:
         self.closed.append(call_id)
+
+    def show_handled_hint(self, call_id: str, hint: str) -> None:
+        self.hints.append((call_id, hint))
 
 
 def _client(
@@ -310,6 +314,28 @@ def test_sync_wake_and_remote_acceptance_close_stale_desktop_alert_without_takeo
     assert client.ring.stopped == ["call-1"]
     assert client.presenter.closed == ["call-1"]
     assert client.accept(call_id="call-1", operation_id="late") == {"success": False, "status": "session_not_found"}
+
+
+def test_remote_acceptance_shows_handled_on_phone_hint_not_silent_close() -> None:
+    central = FakeCentral(states={"call-1": _ringing("call-1")})
+    client = _client(central=central)
+    client.start()
+    client.receive_notification({"call_id": "call-1", "version": 1}, callback_credential="central-callback-secret")
+
+    central.states["call-1"] = {
+        "success": True,
+        "call_id": "call-1",
+        "call_state": "accepted",
+        "handled_on": "iphone_web",
+        "terminal_platform": "ios",
+        "can_accept": False,
+        "can_decline": False,
+    }
+    client.receive_notification({"call_id": "call-1", "version": 2}, callback_credential="central-callback-secret")
+
+    assert client.presenter.hints, "remote acceptance must show a handled-on-phone hint"
+    assert client.presenter.hints[0][0] == "call-1"
+    assert client.presenter.closed == ["call-1"]
 
 
 def test_central_loss_stops_ringing_and_restart_reauthenticates_before_resync() -> None:
