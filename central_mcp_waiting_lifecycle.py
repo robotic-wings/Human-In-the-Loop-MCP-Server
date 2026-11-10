@@ -1677,10 +1677,10 @@ class Application:
             return "<html><body>已在电脑端处理</body></html>"
         if view.get("success") and view.get("can_accept"):
             return (f"<html><body><form method=\"post\" action=\"/calls/{call_id}/accept\">"
-                    f"<input name=\"csrf_token\" value=\"{csrf}\"><input name=\"operation_id\" value=\"accept\">"
+                    f"<input name=\"csrf_token\" value=\"{csrf}\"><input name=\"operation_id\" value=\"{html.escape(str(uuid.uuid4()), quote=True)}\">"
                     "<button>accept</button></form><form method=\"post\" action=\"/calls/"
                     f"{call_id}/decline\"><input name=\"csrf_token\" value=\"{csrf}\">"
-                    "<input name=\"operation_id\" value=\"decline\"><button>decline</button></form></body></html>")
+                    f"<input name=\"operation_id\" value=\"{html.escape(str(uuid.uuid4()), quote=True)}\"><button>decline</button></form></body></html>")
         if view.get("success") and view.get("can_submit"):
             submission_id = html.escape(str(uuid.uuid4()), quote=True)
             return (f"<html><body data-handled-on=\"iphone_web\"><form method=\"post\" action=\"/calls/{call_id}/submissions\">"

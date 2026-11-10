@@ -60,8 +60,8 @@ def mobile_html_renderer(view: Mapping[str, object], csrf_token: str) -> str:
         return head + "<h1>已在电脑端处理</h1><p>该呼叫已经完成。</p></body></html>"
     if view.get("can_accept"):
         return (head + f"<h1>{title}</h1><p>{prompt}</p><p class=\"hint\">请明确选择接听或拒绝。</p>"
-                f"<form method=\"post\" action=\"/calls/{call_id}/accept\"><input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\"><input type=\"hidden\" name=\"operation_id\" value=\"accept\"><button type=\"submit\">接听</button></form>"
-                f"<form method=\"post\" action=\"/calls/{call_id}/decline\"><input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\"><input type=\"hidden\" name=\"operation_id\" value=\"decline\"><button type=\"submit\">拒绝本次呼叫</button></form></body></html>")
+                f"<form method=\"post\" action=\"/calls/{call_id}/accept\"><input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\"><input type=\"hidden\" name=\"operation_id\" value=\"{esc(uuid.uuid4())}\"><button type=\"submit\">接听</button></form>"
+                f"<form method=\"post\" action=\"/calls/{call_id}/decline\"><input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\"><input type=\"hidden\" name=\"operation_id\" value=\"{esc(uuid.uuid4())}\"><button type=\"submit\">拒绝本次呼叫</button></form></body></html>")
     if view.get("can_submit"):
         fields = _mobile_response_fields(tool, payload, esc)
         submission_id = esc(uuid.uuid4())
