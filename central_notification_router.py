@@ -125,6 +125,14 @@ class NotificationRouter:
         """Install the central lifecycle consumer for dispatch decisions."""
         self._decision_sink = sink
 
+    def desktop_online(self) -> bool:
+        """Whether a fresh, GUI-ready desktop terminal is currently registered."""
+        return self._registry.ready_desktop() is not None
+
+    def bark_configured(self) -> bool:
+        """Whether a valid Bark web base URL is configured."""
+        return self._web_base_url is not None
+
     @staticmethod
     def _normalize_web_base_url(value: str | None) -> tuple[str | None, bool]:
         if not isinstance(value, str) or not value.strip():

@@ -208,7 +208,7 @@ class WaitingLifecycle:
                         "success": True, "status": "busy", "call_state": None, "call_id": None,
                         "reason": None, "interaction_id": None, "human_action": False,
                         "handled_on": None, "terminal_platform": None, "event_seq": None,
-                        "needs_continuation": False,
+                        "needs_continuation": False, "retryable": True, "retry_after_seconds": 30,
                     }
                 else:
                     call_id, interaction_id = str(uuid.uuid4()), str(uuid.uuid4())
@@ -920,30 +920,25 @@ class WaitingLifecycle:
             conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call["call_id"], seq, self._dump(body)))
         rows = conn.execute(
             "SELECT * FROM lifecycle_calls WHERE call_state IN ('accepted', 'in_progress') "
-            "AND terminal_disconnect_deadline IS NOT NULL AND terminal_disconnect_deadline<=?",
-            (now,),
+            "AND ((terminal_disconnect_deadline IS NOT NULL AND terminal_disconnect_deadline<=?) "
+            "OR (agent_reconnect_deadline IS NOT NULL AND agent_reconnect_deadline<=?))",
+            (now, now),
         ).fetchall()
         for call in rows:
+            terminal_deadline = call["terminal_disconnect_deadline"]
+            agent_deadline = call["agent_reconnect_deadline"]
+            terminal_due = terminal_deadline is not None and terminal_deadline <= now
+            agent_due = agent_deadline is not None and agent_deadline <= now
+            if agent_due and (not terminal_due or agent_deadline < terminal_deadline):
+                reason = "agent_disconnected"
+            else:
+                reason = "terminal_disconnected"
             conn.execute(
-                "UPDATE lifecycle_calls SET call_state='disconnected', reason='terminal_disconnected', version=version+1 WHERE call_id=?",
-                (call["call_id"],),
+                "UPDATE lifecycle_calls SET call_state='disconnected', reason=?, version=version+1 WHERE call_id=?",
+                (reason, call["call_id"]),
             )
             seq = int(conn.execute("SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call["call_id"],)).fetchone()["n"])
-            body = self._terminal(call["interaction_id"], call["call_id"], "disconnected", "terminal_disconnected", seq)
-            body["human_action"] = False
-            conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call["call_id"], seq, self._dump(body)))
-        rows = conn.execute(
-            "SELECT * FROM lifecycle_calls WHERE call_state IN ('accepted', 'in_progress') "
-            "AND agent_reconnect_deadline IS NOT NULL AND agent_reconnect_deadline<=?",
-            (now,),
-        ).fetchall()
-        for call in rows:
-            conn.execute(
-                "UPDATE lifecycle_calls SET call_state='disconnected', reason='agent_disconnected' WHERE call_id=?",
-                (call["call_id"],),
-            )
-            seq = int(conn.execute("SELECT COALESCE(MAX(event_seq), 0) + 1 AS n FROM lifecycle_events WHERE call_id=?", (call["call_id"],)).fetchone()["n"])
-            body = self._terminal(call["interaction_id"], call["call_id"], "disconnected", "agent_disconnected", seq)
+            body = self._terminal(call["interaction_id"], call["call_id"], "disconnected", reason, seq)
             body["human_action"] = False
             conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call["call_id"], seq, self._dump(body)))
 
@@ -970,7 +965,24 @@ class WaitingLifecycle:
 
     @staticmethod
     def _terminal(interaction_id: str, call_id: str, state: str, reason: str | None, seq: int) -> dict[str, object]:
-        return {"success": True, "status": state, "call_state": state, "reason": reason, "event_seq": seq, "needs_continuation": False, "interaction_id": interaction_id, "call_id": call_id}
+        retryable = reason in {"ring_timeout", "terminal_disconnected", "agent_disconnected"}
+        retry_after = 60 if reason == "ring_timeout" else (30 if retryable else None)
+        messages = {
+            "ring_timeout": "人类未接受通信，60 秒内无人接听，这不是主动拒绝，可以稍后重新呼叫。",
+            "terminal_disconnected": "接听端已失联，通信已结束。",
+            "agent_disconnected": "调用方已失联，通信已结束。",
+            "no_available_channel": "所有启用的通知渠道均不可用。",
+            "agent_cancelled": "调用方已取消本次通信。",
+        }
+        result: dict[str, object] = {
+            "success": True, "status": state, "call_state": state, "reason": reason,
+            "event_seq": seq, "needs_continuation": False, "interaction_id": interaction_id, "call_id": call_id,
+            "human_action": False, "retryable": retryable, "handled_on": None, "terminal_platform": None,
+            "message": messages.get(reason, ""),
+        }
+        if retry_after is not None:
+            result["retry_after_seconds"] = retry_after
+        return result
 
     @staticmethod
     def _error(status: str) -> dict[str, object]:
@@ -1543,7 +1555,18 @@ class Application:
         if name == "get_operator_profile":
             return {"success": True, "status": "ok", "operator_id": self.lifecycle._operator_id}
         if name == "health_check":
-            return {"success": True, "status": "healthy", "storage": "sqlite", "scheduler": "ready"}
+            router = self._notification_router
+            desktop_online = False
+            bark_configured = False
+            if router is not None:
+                online = getattr(router, "desktop_online", None)
+                desktop_online = bool(online()) if callable(online) else False
+                configured = getattr(router, "bark_configured", None)
+                bark_configured = bool(configured()) if callable(configured) else False
+            return {
+                "success": True, "status": "healthy", "storage": "sqlite", "scheduler": "ready",
+                "desktop_online": desktop_online, "bark": {"configured": bark_configured},
+            }
         if name == "get_human_loop_prompt":
             return {"success": True, "status": "ok", "prompt": "Use tools/call to request human action; continue with interaction_id and call_id."}
         raise _RpcError(-32602, "Invalid params")
