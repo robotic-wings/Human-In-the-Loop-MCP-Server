@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import sys
+import tempfile
 import threading
 import uuid
 from collections.abc import Callable, Mapping
@@ -188,6 +190,7 @@ class DesktopTerminalConfig:
     ringtone_path: str = "ringtone.mp3"
     ringtone_alt_path: str | None = None
     ringtones_dir: str = "ringtones"
+    session_store_path: str | None = None
 
     @property
     def listener_endpoint(self) -> str:
@@ -229,6 +232,8 @@ class DesktopTerminalConfig:
         ringtones_dir = normalized.get("ringtones_dir", "ringtones")
         if not isinstance(ringtones_dir, str) or not ringtones_dir:
             ringtones_dir = "ringtones"
+        session_store = normalized.get("session_store_path")
+        session_store_path = session_store if isinstance(session_store, str) and session_store else None
         return cls(
             central_url=central_url.rstrip("/"), terminal_credential=str(normalized["terminal_credential"]),
             callback_credential=str(normalized["callback_credential"]), listener_host=str(normalized["listener_host"]),
@@ -238,6 +243,7 @@ class DesktopTerminalConfig:
             heartbeat_seconds=float(interval),
             ringtone_path=ringtone_path, ringtone_alt_path=ringtone_alt_path,
             ringtones_dir=ringtones_dir,
+            session_store_path=session_store_path,
         )
 
 
@@ -322,13 +328,33 @@ class CentralHttpDesktopClient:
     def authenticate_desktop(self, credential: str) -> dict[str, object]:
         if credential != self._config.terminal_credential:
             return {"success": False, "status": "terminal_not_authenticated"}
+        session_file = self._session_file()
+        if session_file.exists():
+            try:
+                recovered = session_file.read_text(encoding="utf-8").strip()
+            except OSError:
+                recovered = ""
+            if recovered:
+                self._session_id = recovered
+                return {"success": True, "session_id": recovered}
         result = self._request("POST", "/api/terminals/register", json_body={
             "endpoint": self._config.listener_endpoint, "gui_ready": True,
         })
         session = result.get("session_id")
         if result.get("success") and isinstance(session, str):
             self._session_id = session
+            try:
+                session_file.parent.mkdir(parents=True, exist_ok=True)
+                session_file.write_text(session, encoding="utf-8")
+            except OSError:
+                pass
         return result
+
+    def _session_file(self) -> Path:
+        if self._config.session_store_path:
+            return Path(self._config.session_store_path)
+        digest = hashlib.sha256(self._config.central_url.encode("utf-8")).hexdigest()
+        return Path(tempfile.gettempdir()) / f"hitl-desktop-{digest}.session"
 
     def heartbeat(self) -> dict[str, object]:
         return self._request("POST", "/api/terminals/heartbeat", json_body={"gui_ready": True})

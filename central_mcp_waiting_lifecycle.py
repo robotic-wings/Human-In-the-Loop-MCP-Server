@@ -1926,7 +1926,11 @@ class Application:
         request_id = f"rpc-{rid}"
         interaction_id = arguments.get("interaction_id")
         call_id = arguments.get("call_id")
-        if isinstance(interaction_id, str) and interaction_id and isinstance(call_id, str) and call_id:
+        interaction_present = isinstance(interaction_id, str) and bool(interaction_id)
+        call_present = isinstance(call_id, str) and bool(call_id)
+        if interaction_present != call_present:
+            return {"success": False, "status": "missing_call_id", "needs_continuation": False}
+        if interaction_present:
             after = arguments.get("after_event_seq", 0)
             if isinstance(after, bool) or not isinstance(after, int):
                 raise _RpcError(-32602, "Invalid params")
@@ -1997,7 +2001,19 @@ class Application:
                 "bark": {"configured": bark_configured, "recent_outcome": recent_outcome},
             }
         if name == "get_human_loop_prompt":
-            return {"success": True, "status": "ok", "prompt": "Use tools/call to request human action; continue with interaction_id and call_id."}
+            return {
+                "success": True, "status": "ok",
+                "prompt": (
+                    "Human-in-the-Loop 协议指南：Agent 通过 tools/call 请求人参与。"
+                    "每个工具调用须携带 request_id 用于幂等重试（相同 request_id 与相同参数重放同一结果）。"
+                    "首次调用返回 interaction_id 与 call_id，后续续接必须同时携带 interaction_id、call_id 与 after_event_seq "
+                    "以按序读取事件（心跳不产生新事件）。返回体中的 needs_continuation 为 true 表示仍需用同一 interaction_id/call_id 续接等待，"
+                    "为 false 表示本轮已终结（answered/completed/failed/declined/not_accepted/busy/cancelled/disconnected 等）。"
+                    "可用 max_result_bytes 限制返回结果预算；超预算时结果以 body_omitted_for_size 与 result_id 返回，"
+                    "并可用 read_interaction_result/read_interaction_attachment 分页读取完整正文与附件。"
+                    "错误码如 invalid_request/method_not_found/invalid_params/missing_call_id/session_not_found 等与业务结果分开。"
+                ),
+            }
         raise _RpcError(-32602, "Invalid params")
 
     @staticmethod
