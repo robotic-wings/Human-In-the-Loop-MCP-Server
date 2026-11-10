@@ -165,6 +165,12 @@ class WaitingLifecycle:
                 enabled INTEGER NOT NULL DEFAULT 0,
                 message TEXT NOT NULL DEFAULT ''
               );
+              CREATE TABLE IF NOT EXISTS lifecycle_quiet_window (
+                operator_id TEXT PRIMARY KEY,
+                quiet_window_seconds INTEGER NOT NULL DEFAULT 300,
+                quiet_mode TEXT NOT NULL DEFAULT 'short',
+                last_accept_at REAL
+              );
             """)
             self._migrate_schema(conn)
             self._settle_due(conn)
@@ -222,6 +228,9 @@ class WaitingLifecycle:
                     conn.execute("INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?, 'create')", (caller_id, request_id, encoded, self._dump(outcome)))
                     conn.commit()
                     return outcome
+                quiet = self._quiet_window_state(conn)
+                last_accept_at = quiet.get("last_accept_at")
+                degraded = last_accept_at is not None and (self._clock() - last_accept_at) < quiet["quiet_window_seconds"]
                 active = conn.execute("SELECT call_id FROM lifecycle_calls WHERE call_state IN ('ringing', 'accepted', 'in_progress') LIMIT 1").fetchone()
                 if active is not None:
                     outcome = {
@@ -249,6 +258,9 @@ class WaitingLifecycle:
                         "call_id": call_id, "ring_deadline": deadline,
                         "title": caller_id, "body": " ".join(short_title.split())[:200],
                     }
+                    if degraded:
+                        notification["degraded"] = True
+                        notification["quiet_mode"] = quiet["quiet_mode"]
                 conn.execute("INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?, 'create')", (caller_id, request_id, encoded, self._dump(outcome)))
                 conn.commit()
             except BaseException:
@@ -287,6 +299,52 @@ class WaitingLifecycle:
         if row is None:
             return {"enabled": False, "message": ""}
         return {"enabled": bool(row["enabled"]), "message": str(row["message"])}
+
+    def get_quiet_window(self) -> dict[str, object]:
+        with self._connection() as conn:
+            state = self._quiet_window_state(conn)
+        return {"success": True, **state}
+
+    def set_quiet_window(self, quiet_window_seconds: int, quiet_mode: str) -> dict[str, object]:
+        if isinstance(quiet_window_seconds, bool) or not isinstance(quiet_window_seconds, int) or quiet_window_seconds < 0:
+            return self._error("invalid_request")
+        if quiet_mode not in {"short", "silent"}:
+            return self._error("invalid_request")
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "INSERT INTO lifecycle_quiet_window (operator_id, quiet_window_seconds, quiet_mode, last_accept_at) "
+                    "VALUES (?, ?, ?, NULL) "
+                    "ON CONFLICT(operator_id) DO UPDATE SET quiet_window_seconds=excluded.quiet_window_seconds, quiet_mode=excluded.quiet_mode",
+                    (self._operator_id, quiet_window_seconds, quiet_mode),
+                )
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        return {"success": True, "quiet_window_seconds": quiet_window_seconds, "quiet_mode": quiet_mode}
+
+    def _quiet_window_state(self, conn: sqlite3.Connection) -> dict[str, object]:
+        row = conn.execute(
+            "SELECT quiet_window_seconds, quiet_mode, last_accept_at FROM lifecycle_quiet_window WHERE operator_id=?",
+            (self._operator_id,),
+        ).fetchone()
+        if row is None:
+            return {"quiet_window_seconds": 300, "quiet_mode": "short", "last_accept_at": None}
+        return {
+            "quiet_window_seconds": int(row["quiet_window_seconds"]),
+            "quiet_mode": str(row["quiet_mode"]),
+            "last_accept_at": row["last_accept_at"],
+        }
+
+    def _record_accept(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "INSERT INTO lifecycle_quiet_window (operator_id, quiet_window_seconds, quiet_mode, last_accept_at) "
+            "VALUES (?, 300, 'short', ?) "
+            "ON CONFLICT(operator_id) DO UPDATE SET last_accept_at=excluded.last_accept_at",
+            (self._operator_id, self._clock()),
+        )
 
     def has_request(self, caller_id: str, request_id: str) -> bool:
         with self._connection() as conn:
@@ -535,6 +593,7 @@ class WaitingLifecycle:
                             (state, reason, device_id, session_id, terminal_platform, self._clock(),
                              self._clock() + self._terminal_disconnect_seconds, None, call_id),
                         )
+                        self._record_accept(conn)
                     else:
                         # A decline ends the invitation without assigning a
                         # processing owner.  Keep its audit endpoint separate
@@ -620,6 +679,7 @@ class WaitingLifecycle:
                         (state, reason, "iphone_web", session_id, now,
                          now + self._terminal_disconnect_seconds, None, call_id),
                     )
+                    self._record_accept(conn)
                 else:
                     conn.execute(
                         "UPDATE lifecycle_calls SET call_state=?, reason=?, owner_device_id=?, owner_session_id=?, handled_on=NULL, terminal_platform=NULL, terminal_last_seen_at=NULL, terminal_disconnect_deadline=NULL, agent_reconnect_deadline=NULL, version=version+1 WHERE call_id=?",

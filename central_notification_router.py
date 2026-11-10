@@ -182,8 +182,9 @@ class NotificationRouter:
                     call_id = str(event["call_id"])
                     bark_payload: dict[str, object] = {
                         "call_id": call_id, "url": f"{self._web_base_url}/calls/{call_id}",
-                        "call": "1",
                     }
+                    if not event.get("degraded"):
+                        bark_payload["call"] = "1"
                     for key in ("title", "body"):
                         value = event.get(key)
                         if isinstance(value, str) and value:
