@@ -52,32 +52,32 @@ _MCP_TOOLS = (
      "inputSchema": {"type": "object", "properties": {
          "choices": {"type": "array"}, "prompt": {"type": "string"},
          "multiple": {"type": "boolean"}, "interaction_id": {"type": "string"},
-         "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}}}},
+         "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}, "max_result_bytes": {"type": "integer"}}}},
     {"name": "get_multiline_input", "kind": "interaction",
      "description": "Request a free-form multi-line answer from the operator.",
      "inputSchema": {"type": "object", "properties": {
          "prompt": {"type": "string"}, "interaction_id": {"type": "string"},
-         "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}}}},
+         "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}, "max_result_bytes": {"type": "integer"}}}},
     {"name": "show_confirmation_dialog", "kind": "interaction",
      "description": "Ask the operator to confirm or deny a proposal.",
      "inputSchema": {"type": "object", "properties": {
          "prompt": {"type": "string"}, "interaction_id": {"type": "string"},
-         "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}}}},
+         "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}, "max_result_bytes": {"type": "integer"}}}},
     {"name": "show_info_message", "kind": "interaction",
      "description": "Present information and require the operator to acknowledge it.",
      "inputSchema": {"type": "object", "properties": {
          "message": {"type": "string"}, "interaction_id": {"type": "string"},
-         "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}}}},
+         "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}, "max_result_bytes": {"type": "integer"}}}},
     {"name": "get_feedback_from_user", "kind": "interaction",
      "description": "Request unstructured feedback from the operator.",
      "inputSchema": {"type": "object", "properties": {
          "prompt": {"type": "string"}, "interaction_id": {"type": "string"},
-         "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}}}},
+         "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}, "max_result_bytes": {"type": "integer"}}}},
     {"name": "assign_task_to_human", "kind": "interaction",
      "description": "Assign a task for the operator to perform and report on.",
      "inputSchema": {"type": "object", "properties": {
          "task_description": {"type": "string"}, "interaction_id": {"type": "string"},
-         "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}}}},
+         "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}, "max_result_bytes": {"type": "integer"}}}},
     {"name": "get_operator_profile", "kind": "readonly",
      "description": "Read the operator profile without requesting human action.",
      "inputSchema": {"type": "object"}},
