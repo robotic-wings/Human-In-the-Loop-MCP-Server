@@ -952,9 +952,15 @@ class WaitingLifecycle:
         """
         status = result.get("status")
         if status == "completed":
-            return "completed", "completed", False, {"report": result.get("report"), "resubmittable": True}
+            extras: dict[str, object] = {"report": result.get("report"), "resubmittable": True}
+            if result.get("feedback_requested") is True:
+                extras["feedback_requested"] = True
+            return "completed", "completed", False, extras
         if status == "failed":
-            return "failed", "failed", False, {"report": result.get("report"), "resubmittable": True}
+            extras = {"report": result.get("report"), "resubmittable": True}
+            if result.get("feedback_requested") is True:
+                extras["feedback_requested"] = True
+            return "failed", "failed", False, extras
         if status == "in_progress":
             return "in_progress", "in_progress", True, {"progress": result.get("progress")}
         return "answered", "answered", False, {}
