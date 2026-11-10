@@ -75,6 +75,13 @@ class FakeButton:
         self.text = text
         self.command = command
 
+    def config(self, **kwargs: object) -> "FakeButton":
+        if "text" in kwargs:
+            self.text = str(kwargs["text"])
+        if "command" in kwargs:
+            self.command = kwargs["command"]
+        return self
+
     def grid(self, *_args: object, **_kwargs: object) -> "FakeButton":
         return self
 

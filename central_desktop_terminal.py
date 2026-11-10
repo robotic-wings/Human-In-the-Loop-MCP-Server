@@ -302,9 +302,49 @@ def load_short_ringtone(state_file: str) -> str:
     return ""
 
 
+class _PreviewControls:
+    """Preview state-machine UI: button labels are a pure function of player state.
+
+    Every toggle or ringtone change funnels through here; ``refresh`` derives
+    each label from the player's actual preview state, so mutual exclusion and
+    channel resets can never drift out of sync.
+    """
+
+    def __init__(self, ring: Any, long_button: Any, short_button: Any) -> None:
+        self._ring = ring
+        self._long_button = long_button
+        self._short_button = short_button
+
+    def toggle_long(self) -> None:
+        self._ring.toggle_preview()
+        self.refresh()
+
+    def toggle_short(self) -> None:
+        toggle = getattr(self._ring, "toggle_short_preview", None)
+        if callable(toggle):
+            toggle()
+        self.refresh()
+
+    def channel_changed(self, channel: str) -> None:
+        """A ringtone selection changed: stop that channel's preview if playing."""
+        if channel == "long":
+            self._ring.stop_preview()
+        else:
+            stop = getattr(self._ring, "stop_short_preview", None)
+            if callable(stop):
+                stop()
+        self.refresh()
+
+    def refresh(self) -> None:
+        long_playing = bool(getattr(self._ring, "previewing_long", False))
+        short_playing = bool(getattr(self._ring, "previewing_short", False))
+        self._long_button.config(text="停止播放" if long_playing else "测试播放")
+        self._short_button.config(text="停止" if short_playing else "试听")
+
+
 def build_settings_panel(root: Any, ring: Any, central: Any, ringtones_dir: str,
                          mp3s: list[str], initial_ringtone: str, tk: Any,
-                         short_ringtone: str = "") -> None:
+                         short_ringtone: str = "", short_state_file: str = "") -> None:
     """Build the settings panel as classic framed groups with aligned controls."""
     initial_basename = os.path.basename(initial_ringtone)
     initial_value = initial_basename if initial_basename in mp3s else (mp3s[0] if mp3s else "")
@@ -314,39 +354,38 @@ def build_settings_panel(root: Any, ring: Any, central: Any, ringtones_dir: str,
     short_value = short_basename if short_basename in mp3s else (mp3s[0] if mp3s else "")
     short_var = tk.StringVar(value=short_value)
 
-    def on_preview() -> None:
-        if ring.toggle_preview():
-            preview_button.config(text="停止播放")
-        else:
-            preview_button.config(text="测试播放")
-
-    def on_ringtone_change(*_args: object) -> None:
-        ring.set_ringtone(os.path.join(ringtones_dir, ringtone_var.get()))
-        ring.stop_preview()
-        preview_button.config(text="测试播放")
-
-    def on_short_ringtone_change(*_args: object) -> None:
-        set_short = getattr(ring, "set_short_ringtone", None)
-        if callable(set_short):
-            set_short(os.path.join(ringtones_dir, short_var.get()))
+    set_short = getattr(ring, "set_short_ringtone", None)
+    if callable(set_short) and short_value:
+        set_short(os.path.join(ringtones_dir, short_value))
 
     notify = tk.LabelFrame(root, text="通知", padx=10, pady=8)
     notify.pack(fill="x", padx=12, pady=(12, 8))
     tk.Label(notify, text="铃声").grid(row=0, column=0, sticky="w", pady=2)
-    ringtone_var.trace_add("write", on_ringtone_change)
     tk.OptionMenu(notify, ringtone_var, *mp3s).grid(row=0, column=1, sticky="w", padx=(8, 8), pady=2)
-    preview_button = tk.Button(notify, text="测试播放", command=on_preview)
+    preview_button = tk.Button(notify, text="测试播放")
     preview_button.grid(row=0, column=2, sticky="w", pady=2)
     tk.Label(notify, text="短铃声").grid(row=1, column=0, sticky="w", pady=2)
-    short_var.trace_add("write", on_short_ringtone_change)
     tk.OptionMenu(notify, short_var, *mp3s).grid(row=1, column=1, sticky="w", padx=(8, 8), pady=2)
-
-    def on_short_preview() -> None:
-        toggle_short = getattr(ring, "toggle_short_preview", None)
-        if callable(toggle_short):
-            toggle_short()
-    short_preview_button = tk.Button(notify, text="试听", command=on_short_preview)
+    short_preview_button = tk.Button(notify, text="试听")
     short_preview_button.grid(row=1, column=2, sticky="w", pady=2)
+
+    previews = _PreviewControls(ring, preview_button, short_preview_button)
+    preview_button.config(command=previews.toggle_long)
+    short_preview_button.config(command=previews.toggle_short)
+
+    def on_ringtone_change(*_args: object) -> None:
+        ring.set_ringtone(os.path.join(ringtones_dir, ringtone_var.get()))
+        previews.channel_changed("long")
+
+    def on_short_ringtone_change(*_args: object) -> None:
+        if callable(set_short):
+            set_short(os.path.join(ringtones_dir, short_var.get()))
+        previews.channel_changed("short")
+        if short_state_file:
+            save_short_ringtone(short_state_file, os.path.join(ringtones_dir, short_var.get()))
+
+    ringtone_var.trace_add("write", on_ringtone_change)
+    short_var.trace_add("write", on_short_ringtone_change)
 
     dnd = central.get_dnd()
     if not isinstance(dnd, Mapping):
@@ -858,8 +897,6 @@ class RingtonePlayer:
             return False
         short_path = self._short_ringtone_path
         if not (short_path and Path(short_path).is_file()):
-            if self._bell is not None:
-                self._bell()
             return False
         handle = self._player.play(short_path, loop=False)
         if handle is not None:
@@ -872,6 +909,14 @@ class RingtonePlayer:
         self._short_preview_handle = None
         if handle is not None:
             self._player.stop(handle)
+
+    @property
+    def previewing_long(self) -> bool:
+        return self._preview_handle is not None
+
+    @property
+    def previewing_short(self) -> bool:
+        return self._short_preview_handle is not None
 
     def stop(self, call_id: str) -> None:
         handle = self._handles.pop(call_id, None)
@@ -970,10 +1015,12 @@ def main(argv: list[str] | None = None) -> None:
     central = CentralHttpDesktopClient(config)
     holder: dict[str, DesktopTerminalClient] = {}
     presenter = TkPresentation(root, lambda: holder["client"])
-    ring = RingtonePlayer(ringtone_path=config.ringtone_path, ringtone_alt_path=config.ringtone_alt_path, bell=root.bell, short_ringtone_path=config.short_ringtone_path)
+    short_state_file = str(Path(args.config).with_name("terminal-state.json"))
+    short_ringtone_path = config.short_ringtone_path or load_short_ringtone(short_state_file)
+    ring = RingtonePlayer(ringtone_path=config.ringtone_path, ringtone_alt_path=config.ringtone_alt_path, bell=root.bell, short_ringtone_path=short_ringtone_path)
     client = DesktopTerminalClient(config={"terminal_credential": config.terminal_credential, "callback_credential": config.callback_credential}, central=central, listener=_TerminalListener(), gui_capability=lambda: True, ring=ring, presenter=presenter)
     holder["client"] = client
-    build_settings_panel(root, ring, central, config.ringtones_dir, scan_ringtones(config.ringtones_dir), config.ringtone_path, tk, config.short_ringtone_path)
+    build_settings_panel(root, ring, central, config.ringtones_dir, scan_ringtones(config.ringtones_dir), config.ringtone_path, tk, short_ringtone_path, short_state_file)
     if config.listener_scheme == "https" and (not config.listener_tls_cert_file or not config.listener_tls_key_file):
         raise SystemExit("desktop terminal unavailable: HTTPS listener requires listener_tls_cert_file and listener_tls_key_file")
     server = uvicorn.Server(uvicorn.Config(

@@ -148,6 +148,8 @@ class FakeButton:
     def config(self, **kwargs: object) -> "FakeButton":
         if "text" in kwargs:
             self.text = str(kwargs["text"])
+        if "command" in kwargs:
+            self.command = kwargs["command"]
         return self
 
     def pack(self, **kwargs: object) -> "FakeButton":
@@ -210,6 +212,7 @@ class FakeRing:
         self.set_ringtone_calls: list[str] = []
         self.stop_preview_calls: int = 0
         self._previewing = False
+        self._short_previewing = False
 
     def set_ringtone(self, path: str) -> None:
         self.set_ringtone_calls.append(path)
@@ -221,6 +224,24 @@ class FakeRing:
     def stop_preview(self) -> None:
         self.stop_preview_calls += 1
         self._previewing = False
+
+    @property
+    def previewing_long(self) -> bool:
+        return self._previewing
+
+    @property
+    def previewing_short(self) -> bool:
+        return self._short_previewing
+
+    def set_short_ringtone(self, _path: str) -> None:
+        pass
+
+    def toggle_short_preview(self) -> bool:
+        self._short_previewing = not self._short_previewing
+        return self._short_previewing
+
+    def stop_short_preview(self) -> None:
+        self._short_previewing = False
 
 
 class FakeCentral:
