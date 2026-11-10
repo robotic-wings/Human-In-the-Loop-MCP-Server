@@ -121,7 +121,8 @@ class WaitingLifecycle:
                 terminal_platform TEXT, invited_desktop_id TEXT,
                 mobile_eligible INTEGER NOT NULL DEFAULT 0,
                 terminal_last_seen_at REAL, terminal_disconnect_deadline REAL,
-                version INTEGER NOT NULL DEFAULT 1
+                version INTEGER NOT NULL DEFAULT 1,
+                draft_content TEXT, draft_version INTEGER NOT NULL DEFAULT 0
               );
               CREATE TABLE IF NOT EXISTS lifecycle_requests (
                 caller_id TEXT NOT NULL, request_id TEXT NOT NULL, payload_json TEXT NOT NULL,
@@ -173,6 +174,7 @@ class WaitingLifecycle:
             ("mobile_eligible", "INTEGER NOT NULL DEFAULT 0"),
             ("terminal_last_seen_at", "REAL"), ("terminal_disconnect_deadline", "REAL"),
             ("version", "INTEGER NOT NULL DEFAULT 1"),
+            ("draft_content", "TEXT"), ("draft_version", "INTEGER NOT NULL DEFAULT 0"),
         ):
             if column not in columns:
                 conn.execute(f"ALTER TABLE lifecycle_calls ADD COLUMN {column} {definition}")
@@ -857,6 +859,34 @@ class WaitingLifecycle:
             ).fetchall()
         return [{"call_id": row["call_id"], "call_state": row["call_state"], "version": row["version"]} for row in rows]
 
+    def save_draft(self, *, call_id: str, device_id: str, session_id: str,
+                   draft_version: int, content: str) -> dict[str, object]:
+        """Persist a partial answer draft without changing the call state."""
+        if isinstance(draft_version, bool) or not isinstance(draft_version, int) or draft_version < 0:
+            return self._error("invalid_request")
+        if not isinstance(content, str):
+            return self._error("invalid_request")
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._settle_due(conn)
+                call = conn.execute("SELECT * FROM lifecycle_calls WHERE call_id=?", (call_id,)).fetchone()
+                if call is None or call["owner_device_id"] != device_id or call["owner_session_id"] != session_id:
+                    return self._error("session_not_found")
+                if call["call_state"] not in {"accepted", "in_progress"}:
+                    return self._error("expired")
+                if draft_version <= int(call["draft_version"]):
+                    return self._error("draft_version_conflict")
+                conn.execute(
+                    "UPDATE lifecycle_calls SET draft_content=?, draft_version=? WHERE call_id=?",
+                    (content, draft_version, call_id),
+                )
+                conn.commit()
+                return {"success": True, "status": "draft_saved", "draft_version": draft_version}
+            except BaseException:
+                conn.rollback()
+                raise
+
     def call_version(self, call_id: str) -> int:
         with self._connection() as conn:
             row = conn.execute(
@@ -1156,6 +1186,22 @@ class Application:
             if context is None:
                 await self._send(send, 401, self._terminal_error("session_not_found")); return
             response = self._terminal_call_view(parts[3], context[0])
+            await self._send(send, self._action_status(response), response); return
+        if method == "PUT" and len(parts) == 5 and parts[:3] == ["", "api", "calls"] and parts[4] == "draft":
+            session = self._terminal_session(headers)
+            context = self._terminal_context(session) if session is not None else None
+            if context is None:
+                await self._send(send, 401, self._terminal_error("session_not_found")); return
+            device_id, _platform = context
+            body = await self._body(receive)
+            draft_version = body.get("draft_version") if body is not None else None
+            content = body.get("content") if body is not None else None
+            if isinstance(draft_version, bool) or not isinstance(draft_version, int) or not isinstance(content, str):
+                await self._send(send, 400, self._error("invalid_request")); return
+            response = self.lifecycle.save_draft(
+                call_id=parts[3], device_id=device_id, session_id=session,
+                draft_version=draft_version, content=content,
+            )
             await self._send(send, self._action_status(response), response); return
         if method != "POST":
             await self._send(send, 404, self._error("not_found")); return
