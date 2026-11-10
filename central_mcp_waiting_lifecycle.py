@@ -945,11 +945,28 @@ class WaitingLifecycle:
                 raise
 
     def terminal_states(self, device_id: str) -> list[dict[str, object]]:
+        now = self._clock()
         with self._connection() as conn:
-            rows = conn.execute(
-                "SELECT call_id, call_state, version FROM lifecycle_calls WHERE owner_device_id=? ORDER BY call_id",
-                (device_id,),
-            ).fetchall()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._settle_due(conn)
+                # A terminal's periodic sync proves it is alive: refresh the
+                # liveness timestamp of every in-flight call it owns so an
+                # actively-connected terminal never has its call disconnected
+                # underneath it while the human is still filling a form.
+                conn.execute(
+                    "UPDATE lifecycle_calls SET terminal_last_seen_at=?, terminal_disconnect_deadline=? "
+                    "WHERE owner_device_id=? AND call_state IN ('accepted','in_progress')",
+                    (now, now + self._terminal_disconnect_seconds, device_id),
+                )
+                rows = conn.execute(
+                    "SELECT call_id, call_state, version FROM lifecycle_calls WHERE owner_device_id=? ORDER BY call_id",
+                    (device_id,),
+                ).fetchall()
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
         return [{"call_id": row["call_id"], "call_state": row["call_state"], "version": row["version"]} for row in rows]
 
     def save_draft(self, *, call_id: str, device_id: str, session_id: str,
