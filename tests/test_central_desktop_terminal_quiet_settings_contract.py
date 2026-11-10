@@ -167,7 +167,7 @@ def test_settings_panel_has_quiet_window_group() -> None:
 
     build_settings_panel(None, FakeRing(), central, "/sounds", ["a.mp3"], "/sounds/a.mp3", tk)
 
-    assert "接听后静音" in tk.labels
+    assert "接听一次来电后" in "".join(tk.labels)
     assert central.get_quiet_window_calls == 1
     assert sorted(str(rb["value"]) for rb in tk.radiobuttons) == ["short", "silent"]
     assert any(e.get() == "5" for e in tk.entries)
