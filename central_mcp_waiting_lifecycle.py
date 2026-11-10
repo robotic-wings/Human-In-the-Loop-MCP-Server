@@ -1776,10 +1776,18 @@ class Application:
 
     @staticmethod
     def _render_login_entry() -> str:
-        return ("<html><body><form method=\"post\" action=\"/operator/login\">"
-                "<label for=\"operator-credential\">操作者登录凭证"
-                "<input id=\"operator-credential\" type=\"password\" name=\"credential\" required>"
-                "</label><button type=\"submit\">登录</button></form></body></html>")
+        return ("<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
+                "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+                "<title>登录</title>"
+                "<link href=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css\" rel=\"stylesheet\">"
+                "<style>body{background:#f5f6f8}.card{max-width:400px;margin:60px auto;border:0;border-radius:16px;box-shadow:0 2px 12px rgba(0,0,0,.08)}</style>"
+                "</head><body><div class=\"card\"><div class=\"card-body\">"
+                "<h5 class=\"mb-3 text-center\">操作者登录</h5>"
+                "<form method=\"post\" action=\"/operator/login\">"
+                "<div class=\"mb-3\"><label class=\"form-label\" for=\"operator-credential\">登录凭证</label>"
+                "<input class=\"form-control\" id=\"operator-credential\" type=\"password\" name=\"credential\" required></div>"
+                "<button type=\"submit\" class=\"btn btn-primary w-100\">登录</button>"
+                "</form></div></div></body></html>")
 
     def _browser_call_view(self, call_id: str, operator_id: str,
                            browser_session_id: str | None = None) -> dict[str, object]:

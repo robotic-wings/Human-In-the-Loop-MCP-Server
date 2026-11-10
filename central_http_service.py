@@ -61,29 +61,49 @@ def mobile_html_renderer(view: Mapping[str, object], csrf_token: str) -> str:
     title = esc(payload.get("title") or _mobile_tool_title(tool))
     head = ("<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-            f"<title>{title}</title><style>body{{font:17px -apple-system,BlinkMacSystemFont,sans-serif;margin:20px;line-height:1.45}}"
-            "label,fieldset{display:block;margin:16px 0}input,textarea,select,button{font:inherit;padding:9px;max-width:100%;box-sizing:border-box}"
-            "textarea{width:100%;min-height:8em}button{margin:8px 8px 0 0}.hint{color:#555}</style></head><body>")
+            f"<title>{title}</title>"
+            "<link href=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css\" rel=\"stylesheet\">"
+            "<style>body{background:#f5f6f8}.card{max-width:640px;margin:16px auto;border:0;border-radius:16px;box-shadow:0 2px 12px rgba(0,0,0,.08)}"
+            ".card-header{background:#fff;border-bottom:1px solid #eef0f2;font-weight:600;padding:14px 20px;border-radius:16px 16px 0 0}"
+            ".card-body{padding:20px}.btn-block{width:100%;margin-bottom:8px;border-radius:10px}</style>"
+            "</head><body>")
     if view.get("display_state") == "handled_on_desktop_processing":
-        return head + "<h1>已在电脑端接听，处理中</h1><p>此呼叫正在电脑端处理，手机端不能再次提交。</p></body></html>"
+        return head + ("<div class=\"card\"><div class=\"card-body text-center py-5\">"
+                       "<div style=\"font-size:40px\" class=\"mb-3\">💻</div>"
+                       "<h4 class=\"mb-2\">已在电脑端接听，处理中</h4>"
+                       "<p class=\"text-muted mb-0\">此呼叫正在电脑端处理，手机端不能再次提交。</p>"
+                       "</div></div></body></html>")
     if view.get("display_state") == "handled_on_desktop_complete":
-        return head + "<h1>已在电脑端处理</h1><p>该呼叫已经完成。</p></body></html>"
+        return head + ("<div class=\"card\"><div class=\"card-body text-center py-5\">"
+                       "<div style=\"font-size:40px\" class=\"mb-3\">✅</div>"
+                       "<h4 class=\"mb-2\">已在电脑端处理</h4>"
+                       "<p class=\"text-muted mb-0\">该呼叫已经完成。</p>"
+                       "</div></div></body></html>")
     if view.get("can_accept"):
-        return (head + f"<h1>{title}</h1><p>{prompt}</p><p class=\"hint\">请明确选择接听或拒绝。</p>"
-                f"<form method=\"post\" action=\"/calls/{call_id}/accept\"><input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\"><input type=\"hidden\" name=\"operation_id\" value=\"{esc(uuid.uuid4())}\"><button type=\"submit\">接听</button></form>"
-                f"<form method=\"post\" action=\"/calls/{call_id}/decline\"><input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\"><input type=\"hidden\" name=\"operation_id\" value=\"{esc(uuid.uuid4())}\"><button type=\"submit\">拒绝本次呼叫</button></form></body></html>")
+        return (head + f"<div class=\"card\"><div class=\"card-header\">{title}</div><div class=\"card-body\">"
+                f"<p class=\"lead mb-3\">{prompt}</p>"
+                "<p class=\"text-muted small mb-4\">请明确选择接听或拒绝。</p>"
+                f"<form method=\"post\" action=\"/calls/{call_id}/accept\"><input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\"><input type=\"hidden\" name=\"operation_id\" value=\"{esc(uuid.uuid4())}\"><button type=\"submit\" class=\"btn btn-success btn-lg btn-block\">接听</button></form>"
+                f"<form method=\"post\" action=\"/calls/{call_id}/decline\"><input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\"><input type=\"hidden\" name=\"operation_id\" value=\"{esc(uuid.uuid4())}\"><button type=\"submit\" class=\"btn btn-outline-danger btn-block\">拒绝本次呼叫</button></form>"
+                "</div></div></body></html>")
     if view.get("can_submit"):
         fields = _mobile_response_fields(tool, payload, esc)
         submission_id = esc(uuid.uuid4())
-        return (head + f"<h1>{title}</h1><p>{prompt}</p>"
+        return (head + f"<div class=\"card\"><div class=\"card-header\">{title}</div><div class=\"card-body\">"
+                f"<p class=\"lead mb-3\">{prompt}</p>"
                 f"<form id=\"response-form\" method=\"post\" action=\"/calls/{call_id}/submissions\">"
                 f"<input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\"><input type=\"hidden\" name=\"submission_id\" value=\"{submission_id}\">"
                 "<input type=\"hidden\" name=\"result\" id=\"result\">" + fields +
-                "<button type=\"submit\">提交回答</button></form>"
+                "<button type=\"submit\" class=\"btn btn-primary btn-lg btn-block mt-3\">提交回答</button></form>"
+                "</div></div>"
                 "<script>document.getElementById('response-form').addEventListener('submit',function(e){var f=e.currentTarget,r={};"
                 "f.querySelectorAll('[data-result-key]').forEach(function(x){var k=x.dataset.resultKey;if(x.type==='checkbox'||x.type==='radio'){(r[k]||(r[k]=[]));if(x.checked)r[k].push(x.value)}else r[k]=x.value});"
                 "['confirmed','acknowledged'].forEach(function(k){if(typeof r[k]==='string')r[k]=r[k]==='true'});document.getElementById('result').value=JSON.stringify(r)});</script></body></html>")
-    return head + "<h1>当前呼叫不可处理</h1><p>请刷新页面查看最新状态。</p></body></html>"
+    return head + ("<div class=\"card\"><div class=\"card-body text-center py-5\">"
+                   "<div style=\"font-size:40px\" class=\"mb-3\">⏳</div>"
+                   "<h4 class=\"mb-2\">当前呼叫不可处理</h4>"
+                   "<p class=\"text-muted mb-0\">请刷新页面查看最新状态。</p>"
+                   "</div></div></body></html>")
 
 
 def _mobile_tool_title(tool: str) -> str:
@@ -101,32 +121,35 @@ def _mobile_response_fields(tool: str, payload: Mapping[str, object], esc: Calla
     """Return labelled controls for the seven shared interaction families."""
     required = " required" if payload.get("required", True) else ""
     if "confirm" in tool:
-        return ("<fieldset><legend>请选择确认结果</legend><label><input data-result-key=\"confirmed\" type=\"radio\" name=\"confirmed\" value=\"true\" required> 是，确认</label>"
-                "<label><input data-result-key=\"confirmed\" type=\"radio\" name=\"confirmed\" value=\"false\"> 否，不确认</label></fieldset>")
+        return ("<fieldset class=\"mb-3\"><legend class=\"form-label\">请选择确认结果</legend>"
+                "<div class=\"form-check\"><input class=\"form-check-input\" data-result-key=\"confirmed\" type=\"radio\" name=\"confirmed\" value=\"true\" id=\"confirmed-yes\" required><label class=\"form-check-label\" for=\"confirmed-yes\">是，确认</label></div>"
+                "<div class=\"form-check\"><input class=\"form-check-input\" data-result-key=\"confirmed\" type=\"radio\" name=\"confirmed\" value=\"false\" id=\"confirmed-no\"><label class=\"form-check-label\" for=\"confirmed-no\">否，不确认</label></div></fieldset>")
     if "info" in tool or "acknowledge" in tool:
-        return "<label><input data-result-key=\"acknowledged\" type=\"checkbox\" value=\"true\" required> 我已阅读并确认此信息</label>"
+        return "<div class=\"form-check mb-3\"><input class=\"form-check-input\" data-result-key=\"acknowledged\" type=\"checkbox\" value=\"true\" id=\"ack\" required><label class=\"form-check-label\" for=\"ack\">我已阅读并确认此信息</label></div>"
     if "feedback" in tool:
-        return f"<label for=\"feedback\">反馈内容<textarea id=\"feedback\" data-result-key=\"feedback\"{required}></textarea></label>"
+        return f"<div class=\"mb-3\"><label class=\"form-label\" for=\"feedback\">反馈内容</label><textarea class=\"form-control\" id=\"feedback\" data-result-key=\"feedback\" rows=\"5\"{required}></textarea></div>"
     if "task" in tool or "assign" in tool:
-        return ("<label for=\"task-status\">任务状态<select id=\"task-status\" data-result-key=\"status\"><option value=\"completed\">已完成</option><option value=\"failed\">执行失败</option></select></label>"
-                f"<label for=\"task-report\">任务报告<textarea id=\"task-report\" data-result-key=\"report\"{required}></textarea></label>")
+        return ("<div class=\"mb-3\"><label class=\"form-label\" for=\"task-status\">任务状态</label><select class=\"form-select\" id=\"task-status\" data-result-key=\"status\"><option value=\"completed\">已完成</option><option value=\"failed\">执行失败</option></select></div>"
+                f"<div class=\"mb-3\"><label class=\"form-label\" for=\"task-report\">任务报告</label><textarea class=\"form-control\" id=\"task-report\" data-result-key=\"report\" rows=\"5\"{required}></textarea></div>")
     choices = payload.get("choices") or payload.get("options")
     if ("choice" in tool or "select" in tool or isinstance(choices, list)) and isinstance(choices, list):
         multiple = bool(payload.get("multiple") or payload.get("allow_multiple"))
         input_type, key = ("checkbox", "selected_choices") if multiple else ("radio", "selected_choices")
-        rendered = "<fieldset><legend>请选择" + ("一个或多个选项" if multiple else "一个选项") + "</legend>"
+        rendered = "<fieldset class=\"mb-3\"><legend class=\"form-label\">请选择" + ("一个或多个选项" if multiple else "一个选项") + "</legend>"
         for index, choice in enumerate(choices):
             value = choice.get("value", choice.get("label", "")) if isinstance(choice, Mapping) else choice
             label = choice.get("label", value) if isinstance(choice, Mapping) else choice
-            rendered += f"<label><input data-result-key=\"{key}\" type=\"{input_type}\" name=\"choice\" value=\"{esc(value)}\"{' required' if index == 0 and not multiple else ''}> {esc(label)}</label>"
+            cid = f"choice-{index}"
+            rendered += (f"<div class=\"form-check\"><input class=\"form-check-input\" data-result-key=\"{key}\" type=\"{input_type}\" name=\"choice\" value=\"{esc(value)}\" id=\"{cid}\"{' required' if index == 0 and not multiple else ''}>"
+                         f"<label class=\"form-check-label\" for=\"{cid}\">{esc(label)}</label></div>")
         return rendered + "</fieldset>"
     numeric = "number" in tool or str(payload.get("input_type", "")).lower() == "number"
     multiline = "multiline" in tool or "long" in tool or bool(payload.get("multiline"))
     if multiline:
-        return f"<label for=\"user-input\">请输入完整回答<textarea id=\"user-input\" data-result-key=\"user_input\"{required}></textarea></label>"
+        return f"<div class=\"mb-3\"><label class=\"form-label\" for=\"user-input\">请输入完整回答</label><textarea class=\"form-control\" id=\"user-input\" data-result-key=\"user_input\" rows=\"5\"{required}></textarea></div>"
     input_type = "number" if numeric else "text"
     label = "请输入数字" if numeric else "请输入回答"
-    return f"<label for=\"user-input\">{label}<input id=\"user-input\" data-result-key=\"user_input\" type=\"{input_type}\"{required}></label>"
+    return f"<div class=\"mb-3\"><label class=\"form-label\" for=\"user-input\">{label}</label><input class=\"form-control\" id=\"user-input\" data-result-key=\"user_input\" type=\"{input_type}\"{required}></div>"
 
 
 @dataclass(frozen=True)
