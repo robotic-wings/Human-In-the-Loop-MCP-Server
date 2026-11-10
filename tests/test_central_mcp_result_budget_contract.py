@@ -140,11 +140,21 @@ def test_sub_minimum_budget_is_rejected_before_call_creation(tmp_path: Path) -> 
     assert result["status"] == "invalid_result_budget"
 
 
-def test_interaction_tool_input_schema_includes_max_result_bytes(tmp_path: Path) -> None:
+INTERACTION_TOOLS = [
+    "get_user_input", "get_number_input", "get_user_choice", "get_multiline_input",
+    "show_confirmation_dialog", "show_info_message", "get_feedback_from_user", "assign_task_to_human",
+]
+
+
+def test_all_interaction_tool_input_schemas_include_max_result_bytes(tmp_path: Path) -> None:
     app = make_app(tmp_path, Clock())
     tools = tools_list(app)
-    text_tool = next(t for t in tools if t["name"] == "get_user_input")
-    assert "max_result_bytes" in text_tool["inputSchema"].get("properties", {})
+    by_name = {tool["name"]: tool for tool in tools}
+    missing = [
+        name for name in INTERACTION_TOOLS
+        if "max_result_bytes" not in by_name[name]["inputSchema"].get("properties", {})
+    ]
+    assert missing == []
 
 
 def test_oversized_result_is_saved_with_omission_marker_and_result_id(tmp_path: Path) -> None:
