@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import re
+import uuid
+
 import pytest
 
 from central_http_service import mobile_html_renderer
@@ -36,3 +39,22 @@ def test_mobile_accept_page_names_both_human_actions() -> None:
     assert "接听" in page
     assert "拒绝本次呼叫" in page
     assert "请明确选择接听或拒绝" in page
+
+
+def _operation_ids(page: str) -> list[str]:
+    return re.findall(r'name="operation_id" value="([^"]+)"', page)
+
+
+def test_mobile_accept_page_operation_ids_are_unique_uuids() -> None:
+    page = mobile_html_renderer({"call_id": "call-1", "can_accept": True, "payload": {"prompt": "请决定"}}, "csrf-1")
+    ids = _operation_ids(page)
+    assert len(ids) == 2
+    for op in ids:
+        uuid.UUID(op)
+    assert ids[0] != ids[1]
+
+
+def test_mobile_accept_page_operation_ids_are_fresh_each_render() -> None:
+    first = mobile_html_renderer({"call_id": "call-1", "can_accept": True, "payload": {"prompt": "请决定"}}, "csrf-1")
+    second = mobile_html_renderer({"call_id": "call-1", "can_accept": True, "payload": {"prompt": "请决定"}}, "csrf-1")
+    assert _operation_ids(first)[0] != _operation_ids(second)[0]

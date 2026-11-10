@@ -8,7 +8,9 @@ not exercise the old TerminalCallService or CallCoordinator web adapters.
 from __future__ import annotations
 
 import asyncio
+import re
 import sqlite3
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -208,6 +210,18 @@ def test_cookie_authenticated_initial_page_is_html_and_inert_while_link_or_forei
         denied = _request(app, "GET", f"/calls/{call['call_id']}", cookie=cookie)
         assert denied.status_code in {401, 404}
         assert call["call_id"] not in denied.text
+
+
+def test_fallback_accept_page_operation_ids_are_unique_uuids(tmp_path: Path) -> None:
+    app, _state = _components(tmp_path, route_mode="iphone")
+    call = _create(app)
+    page = _request(app, "GET", f"/calls/{call['call_id']}", cookie="operator-cookie")
+    assert page.status_code == 200
+    ids = re.findall(r'name="operation_id" value="([^"]+)"', page.text)
+    assert len(ids) == 2
+    for op in ids:
+        uuid.UUID(op)
+    assert ids[0] != ids[1]
 
 
 def test_protected_form_actions_enforce_cookie_csrf_origin_and_host_then_preserve_submission_replay(tmp_path: Path) -> None:
