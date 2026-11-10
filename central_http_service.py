@@ -98,7 +98,7 @@ def mobile_html_renderer(view: Mapping[str, object], csrf_token: str) -> str:
                 "</div></div>"
                 "<script>document.getElementById('response-form').addEventListener('submit',function(e){var f=e.currentTarget,r={};"
                 "f.querySelectorAll('[data-result-key]').forEach(function(x){var k=x.dataset.resultKey;if(x.type==='checkbox'||x.type==='radio'){(r[k]||(r[k]=[]));if(x.checked)r[k].push(x.value)}else r[k]=x.value});"
-                "['confirmed','acknowledged'].forEach(function(k){if(typeof r[k]==='string')r[k]=r[k]==='true'});document.getElementById('result').value=JSON.stringify(r)});</script></body></html>")
+                "['confirmed','acknowledged'].forEach(function(k){var v=r[k];if(typeof v==='string')r[k]=v==='true';else if(Array.isArray(v)&&v.length===1)r[k]=v[0]==='true'});document.getElementById('result').value=JSON.stringify(r)});</script></body></html>")
     return head + ("<div class=\"card\"><div class=\"card-body text-center py-5\">"
                    "<div style=\"font-size:40px\" class=\"mb-3\">⏳</div>"
                    "<h4 class=\"mb-2\">当前呼叫不可处理</h4>"
