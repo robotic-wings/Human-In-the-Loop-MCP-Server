@@ -90,6 +90,13 @@ class DesktopTerminalClient:
         except (ConnectionError, OSError):
             return self._central_lost()
         if not state.get("success"):
+            if event.get("call_state") == "accepted" and event.get("handled_on") == "iphone_web":
+                self.listener.acknowledge(dict(event))
+                show_hint = getattr(self.presenter, "show_handled_hint", None)
+                if callable(show_hint):
+                    show_hint(call_id, "已在手机端接听")
+                self._close(call_id)
+                return {"success": True, "status": "synchronized", "call_id": call_id}
             return {"success": False, "status": "session_not_found"}
         self.listener.acknowledge(dict(event))
         if state.get("call_state") != "ringing":

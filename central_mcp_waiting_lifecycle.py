@@ -1727,7 +1727,7 @@ class Application:
             if router is not None:
                 dispatch = getattr(router, "dispatch_desktop_state_change", None)
                 if callable(dispatch):
-                    await dispatch(call_id, "accepted", self.lifecycle.call_version(call_id))
+                    await dispatch(call_id, "accepted", self.lifecycle.call_version(call_id), "iphone_web")
         if cookie_mode:
             view = self._browser_call_view(call_id, operator_id, browser_session_id)
             await self._send_html(send, self._action_status(response), self._render_browser_page(view, csrf_token, response))

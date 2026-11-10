@@ -250,7 +250,8 @@ class NotificationRouter:
             self._decision_sink(decisions)
         return {"call_decisions": decisions}
 
-    async def dispatch_desktop_state_change(self, call_id: str, call_state: str, version: int) -> None:
+    async def dispatch_desktop_state_change(self, call_id: str, call_state: str, version: int,
+                                            handled_on: str | None = None) -> None:
         """Push an authoritative call-state change to the ready desktop terminal.
 
         This mirrors the desktop branch of ``_dispatch_row`` but is invoked
@@ -262,6 +263,8 @@ class NotificationRouter:
         if terminal is None:
             return
         payload: dict[str, object] = {"call_id": call_id, "call_state": call_state, "version": version}
+        if handled_on is not None:
+            payload["handled_on"] = handled_on
         payload.update(terminal)
         try:
             response = self._desktop_dispatch(payload)
