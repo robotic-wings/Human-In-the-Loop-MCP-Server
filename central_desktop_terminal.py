@@ -74,6 +74,20 @@ class DesktopTerminalClient:
     def status(self) -> dict[str, object]:
         return {"gui_ready": self._gui_ready, "online": self._online}
 
+    def recover(self) -> dict[str, object]:
+        """Re-register after the central service restarted or the session was lost."""
+        self._online = False
+        self._session_id = None
+        central = self._central
+        central._session_id = None
+        session_file = getattr(central, "_session_file", lambda: None)()
+        if session_file is not None:
+            try:
+                session_file.unlink()
+            except OSError:
+                pass
+        return self.start()
+
     def receive_notification(
         self, event: Mapping[str, object], *, callback_credential: str | None
     ) -> dict[str, object]:
@@ -804,6 +818,11 @@ def run_heartbeat_tick(central: Any, client: Any, *, callback_credential: str | 
     def network_group() -> None:
         try:
             central.heartbeat()
+            status = getattr(client, "status", None)
+            if callable(status) and not status().get("online"):
+                recover = getattr(client, "recover", None)
+                if callable(recover):
+                    recover()
             for state in central.synchronize():
                 client.receive_notification(state, callback_credential=callback_credential)
             client.sync()
