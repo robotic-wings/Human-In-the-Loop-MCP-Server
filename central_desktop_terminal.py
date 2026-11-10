@@ -405,7 +405,7 @@ def build_settings_panel(root: Any, ring: Any, central: Any, ringtones_dir: str,
         if callable(qconfigure):
             qconfigure(1, weight=1)
         quiet_minutes_entry = tk.Entry(quiet_frame)
-        quiet_minutes_entry.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=2)
+        quiet_minutes_entry.grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=2)
         setter = getattr(quiet_minutes_entry, "set_text", None)
         if callable(setter):
             setter(str(minutes))
@@ -424,12 +424,13 @@ def build_settings_panel(root: Any, ring: Any, central: Any, ringtones_dir: str,
                 set_quiet(minutes_val * 60, quiet_mode_var.get())
             quiet_status.set("已同步")
 
-        tk.Radiobutton(quiet_frame, text="短铃声", variable=quiet_mode_var, value="short").grid(row=0, column=0, sticky="w", pady=(0, 4))
-        tk.Radiobutton(quiet_frame, text="静音", variable=quiet_mode_var, value="silent").grid(row=0, column=1, sticky="w", pady=(0, 4))
-        tk.Label(quiet_frame, text="时长(分钟)").grid(row=1, column=0, sticky="w", pady=2)
+        tk.Label(quiet_frame, text="接听一次来电后，设定时长内的新来电自动降铃，避免频繁打扰", fg="gray").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        tk.Radiobutton(quiet_frame, text="短铃声", variable=quiet_mode_var, value="short").grid(row=1, column=0, sticky="w", pady=(0, 4))
+        tk.Radiobutton(quiet_frame, text="静音", variable=quiet_mode_var, value="silent").grid(row=1, column=1, sticky="w", pady=(0, 4))
+        tk.Label(quiet_frame, text="时长(分钟)").grid(row=2, column=0, sticky="w", pady=2)
         quiet_save = tk.Button(quiet_frame, text="保存", command=sync_quiet)
-        quiet_save.grid(row=2, column=1, sticky="e", pady=(6, 2))
-        tk.Label(quiet_frame, textvariable=quiet_status, fg="gray").grid(row=3, column=0, columnspan=2, sticky="w")
+        quiet_save.grid(row=3, column=1, sticky="e", pady=(6, 2))
+        tk.Label(quiet_frame, textvariable=quiet_status, fg="gray").grid(row=4, column=0, columnspan=2, sticky="w")
 
 
 class CentralHttpDesktopClient:
