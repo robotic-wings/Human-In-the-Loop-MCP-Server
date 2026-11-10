@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import hashlib
 import html
 import hmac
 import httpx
 import json
+import os
 import sys
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
@@ -30,6 +33,13 @@ from central_notification_router import NotificationRouter, TerminalRegistry
 Clock = Callable[[], float]
 Notification = Callable[[dict[str, object]], None]
 Waiter = Callable[[float], Awaitable[None]]
+
+
+def hash_operator_password(password: str) -> str:
+    """Return a salted PBKDF2 hash of an operator password, never the plaintext."""
+    salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100_000)
+    return base64.b64encode(salt + digest).decode("ascii")
 
 
 def mobile_html_renderer(view: Mapping[str, object], csrf_token: str) -> str:

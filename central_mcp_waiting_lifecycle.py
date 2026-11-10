@@ -1318,6 +1318,8 @@ class Application:
         self._mobile_html_renderer = mobile_html_renderer
         self._trusted_browser_origin = trusted_browser_origin
         self._browser_entries: dict[str, str] = {}
+        self._logged_out: set[str] = set()
+        self._write_claims: set[tuple[str, str]] = set()
         if notification_router is not None:
             sink_setter = getattr(notification_router, "set_delivery_decision_sink", None)
             if callable(sink_setter):
@@ -1362,6 +1364,9 @@ class Application:
             return
         if path == "/operator/login":
             await self._browser_login_api(method, scope.get("headers", []), receive, send)
+            return
+        if path == "/operator/logout":
+            await self._browser_logout_api(method, scope.get("headers", []), receive, send)
             return
         if method != "POST" or path != "/mcp":
             await self._send(send, 404, self._error("not_found")); return
@@ -1573,6 +1578,12 @@ class Application:
         call_id = parts[2]
         if len(parts) == 3 and method == "GET":
             response = self._browser_call_view(call_id, operator_id, browser_session_id)
+            if response.get("success") and response.get("can_submit"):
+                key = (browser_session_id, call_id)
+                if key in self._write_claims:
+                    response["can_submit"] = False
+                else:
+                    self._write_claims.add(key)
             if response.get("success") and cookie_mode:
                 await self._send_html(send, 200, self._render_browser_page(response, csrf_token)); return
             await self._send(send, self._action_status(response), response); return
@@ -1656,6 +1667,15 @@ class Application:
 
     def _browser_login_is_configured(self) -> bool:
         return callable(getattr(self._browser_cookie_authenticator, "authenticate_login", None))
+
+    async def _browser_logout_api(self, method: object, headers: object, receive: Any, send: Any) -> None:
+        if method != "POST":
+            await self._send(send, 404, self._error("not_found")); return
+        await self._body(receive)
+        cookie = self._cookie(headers, "operator_session")
+        if cookie is not None:
+            self._logged_out.add(cookie)
+        await self._send_redirect(send, "/")
 
     @staticmethod
     def _browser_entry_cookie(value: str) -> str:
@@ -1906,14 +1926,18 @@ class Application:
             router = self._notification_router
             desktop_online = False
             bark_configured = False
+            recent_outcome = None
             if router is not None:
                 online = getattr(router, "desktop_online", None)
                 desktop_online = bool(online()) if callable(online) else False
                 configured = getattr(router, "bark_configured", None)
                 bark_configured = bool(configured()) if callable(configured) else False
+                recent = getattr(router, "recent_bark_delivery", None)
+                recent_outcome = recent() if callable(recent) else None
             return {
                 "success": True, "status": "healthy", "storage": "sqlite", "scheduler": "ready",
-                "desktop_online": desktop_online, "bark": {"configured": bark_configured},
+                "desktop_online": desktop_online,
+                "bark": {"configured": bark_configured, "recent_outcome": recent_outcome},
             }
         if name == "get_human_loop_prompt":
             return {"success": True, "status": "ok", "prompt": "Use tools/call to request human action; continue with interaction_id and call_id."}
@@ -2006,8 +2030,10 @@ class Application:
 
     def _browser_session(self, headers: object) -> tuple[str, str, str] | None:
         """Authenticate the browser cookie; never treat a call link as a credential."""
-        authenticator = self._browser_cookie_authenticator
         cookie = self._cookie(headers, "operator_session")
+        if cookie in self._logged_out:
+            return None
+        authenticator = self._browser_cookie_authenticator
         authenticate = getattr(authenticator, "authenticate_cookie", None)
         result = authenticate(cookie) if callable(authenticate) else None
         if isinstance(result, Mapping):

@@ -133,6 +133,15 @@ class NotificationRouter:
         """Whether a valid Bark web base URL is configured."""
         return self._web_base_url is not None
 
+    def recent_bark_delivery(self) -> str | None:
+        """Return the most recent Bark delivery outcome, or ``None``."""
+        with self._store.connection() as conn:
+            row = conn.execute(
+                "SELECT delivery_outcome FROM notification_outbox "
+                "WHERE channel='bark' ORDER BY created_at DESC LIMIT 1"
+            ).fetchone()
+        return None if row is None else row["delivery_outcome"]
+
     @staticmethod
     def _normalize_web_base_url(value: str | None) -> tuple[str | None, bool]:
         if not isinstance(value, str) or not value.strip():
