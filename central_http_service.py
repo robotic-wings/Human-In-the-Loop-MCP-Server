@@ -63,7 +63,7 @@ def mobile_html_renderer(view: Mapping[str, object], csrf_token: str) -> str:
             "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
             f"<title>{title}</title>"
             "<link href=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css\" rel=\"stylesheet\">"
-            "<style>body{background:#f5f6f8}.card{max-width:640px;margin:16px auto;border:0;border-radius:16px;box-shadow:0 2px 12px rgba(0,0,0,.08)}"
+            "<style>body{background:#f5f6f8;padding:16px 0}.card{max-width:640px;width:calc(100% - 32px);margin:16px auto;border:0;border-radius:16px;box-shadow:0 2px 12px rgba(0,0,0,.08)}"
             ".card-header{background:#fff;border-bottom:1px solid #eef0f2;font-weight:600;padding:14px 20px;border-radius:16px 16px 0 0}"
             ".card-body{padding:20px}.btn-block{width:100%;margin-bottom:8px;border-radius:10px}</style>"
             "</head><body>")
@@ -84,7 +84,7 @@ def mobile_html_renderer(view: Mapping[str, object], csrf_token: str) -> str:
                 f"<p class=\"lead mb-3\">{prompt}</p>"
                 "<p class=\"text-muted small mb-4\">请明确选择接听或拒绝。</p>"
                 f"<form method=\"post\" action=\"/calls/{call_id}/accept\"><input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\"><input type=\"hidden\" name=\"operation_id\" value=\"{esc(uuid.uuid4())}\"><button type=\"submit\" class=\"btn btn-success btn-lg btn-block\">接听</button></form>"
-                f"<form method=\"post\" action=\"/calls/{call_id}/decline\"><input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\"><input type=\"hidden\" name=\"operation_id\" value=\"{esc(uuid.uuid4())}\"><button type=\"submit\" class=\"btn btn-outline-danger btn-block\">拒绝本次呼叫</button></form>"
+                f"<form method=\"post\" action=\"/calls/{call_id}/decline\"><input type=\"hidden\" name=\"csrf_token\" value=\"{csrf}\"><input type=\"hidden\" name=\"operation_id\" value=\"{esc(uuid.uuid4())}\"><button type=\"submit\" class=\"btn btn-outline-danger btn-lg btn-block\">拒绝本次呼叫</button></form>"
                 "</div></div></body></html>")
     if view.get("can_submit"):
         fields = _mobile_response_fields(tool, payload, esc)
