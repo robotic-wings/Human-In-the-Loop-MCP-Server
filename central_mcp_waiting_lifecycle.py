@@ -38,39 +38,39 @@ class _RpcError(Exception):
         self.code, self.message = code, message
 
 
-_HUMAN_LOOP_MANUAL = """HITL MCP 操作手册（人机协作工具集）
+_HUMAN_LOOP_MANUAL = """HITL MCP Operating Manual (human-in-the-loop toolset)
 
-一、核心模型：一次调用即等待
-- 交互工具（get_user_input / get_number_input / get_user_choice / get_multiline_input / show_confirmation_dialog / show_info_message / get_feedback_from_user / assign_task_to_human）每调用一次即发起一轮"呼叫"，服务端会驻留等待接近 client_timeout_seconds（缺省 30，可按需传更长，如 300）。
-- 人在驻留期内接听并作答，同一次调用直接返回最终结果——不要轮询、不要并行另发呼叫。
-- 超时未决则返回 heartbeat，按下方续接协议再调一次即可。
+1. Core model: one call waits
+- Each interactive tool (get_user_input / get_number_input / get_user_choice / get_multiline_input / show_confirmation_dialog / show_info_message / get_feedback_from_user / assign_task_to_human) starts one call round. The server parks the call for nearly client_timeout_seconds (default 30; pass longer, e.g. 300, when the human may be away).
+- If the human answers within the park window, that SAME call returns the final result. Do not poll, do not fire parallel calls.
+- If it returns a heartbeat, follow the continuation protocol below and call once more.
 
-二、续接协议（关键）
-- 返回 needs_continuation=true（heartbeat / opened / in_progress）时：用同一工具立即重发，携带 interaction_id、call_id 与 after_event_seq = 你已见过的最大 event_seq（该响应未含事件则填 0）。
-- 游标只能前进：每次续接都更新到刚拿到的 event_seq，绝不重用旧值——否则会反复排到旧事件，永远等不到终局。
-- opened（人已接听）与 in_progress（人处理中，可含进度报告）都属"继续等待"，直接续接，勿另起新呼叫（会得到 busy）。
+2. Continuation protocol (critical)
+- When a response has needs_continuation=true (heartbeat / opened / in_progress): immediately re-call the SAME tool with interaction_id, call_id, and after_event_seq = the largest event_seq you have seen (0 if the response carried no event).
+- The cursor must only advance: update it to the event_seq from each response and never reuse an old value — a stale cursor re-drains old events forever and you will never reach the outcome.
+- opened (human accepted) and in_progress (human working, may carry progress reports) both mean "keep waiting": continue the round. Do NOT start a new call (it returns busy).
 
-三、终局判定（needs_continuation=false 即本轮结束）
-- answered：简单问答，答案在 result。
-- completed / failed：任务终报在 report；resubmittable=true 时可再发一轮修订后的 assign_task_to_human。
-- declined (human_declined)：本人拒绝该任务。勿立即原样重发；改计划或改任务再试。
-- declined (do_not_disturb)："留言"：勿扰开启。等待、绕行或礼貌收尾，不要连续重呼。
-- cancelled：本轮已取消（可能是你调用了 cancel_interaction）。
-- not_accepted (ring_timeout)：响铃期内无人接听。按 retry_after_seconds 等待后可重试，或改计划。
-- disconnected (terminal_disconnected)：接听后终端失联。按 retry_after_seconds 可重试。
-- unreachable (no_available_channel)：无可用通知渠道；可先 health_check 排查。
-- busy：唯一线路被占用（可能是你上一轮未终结的呼叫）。等 retry_after_seconds 再发。
+3. Terminal outcomes (needs_continuation=false ends the round)
+- answered: simple answer, in result.
+- completed / failed: task final report in report; when resubmittable=true you may issue a fresh assign_task_to_human with a revised task_description.
+- declined (human_declined): the human refused THIS task. Do not reissue it unchanged; re-plan or reword.
+- declined (do_not_disturb): "message" — DND is on. Wait, route around it, or wind down politely; do not re-ring repeatedly.
+- cancelled: the round was cancelled (possibly by your own cancel_interaction).
+- not_accepted (ring_timeout): nobody picked up within the ring window. Retry after retry_after_seconds, or re-plan.
+- disconnected (terminal_disconnected): the human accepted but their terminal went away. Retryable after retry_after_seconds.
+- unreachable (no_available_channel): no notification channel is available; check health_check first.
+- busy: the single line is occupied (possibly by your own unfinished round). Wait retry_after_seconds and call again.
 
-四、弃置守卫
-- 人接听后长时间只回心跳（accepted 持续多轮无进展）时，呼叫在终端存活期间不会自动超时。多轮无进展应调用 cancel_interaction（携带该轮 interaction_id/call_id）释放线路，并改计划。
+4. Abandonment guard
+- If the human accepted but only heartbeats return for many rounds (accepted with no progress), the call will NOT expire on its own while their terminal is alive. After several stalled rounds, call cancel_interaction with that round's interaction_id/call_id to release the line, then re-plan.
 
-五、结果预算与分页
-- 发起呼叫可带 max_result_bytes（>=16384）。结果超预算时以 body_omitted_for_size 与 result_id 返回；用 read_interaction_result（cursor 翻页）和 read_interaction_attachment（offset_bytes 翻页）取回完整正文与附件，不要让人重发。
+5. Result budget and pagination
+- Pass max_result_bytes (>=16384) when creating a call. Oversized results come back with body_omitted_for_size and a result_id; fetch the full body with read_interaction_result (paginate via cursor) and attachments with read_interaction_attachment (paginate via offset_bytes). Never ask the human to resend what the server already holds.
 
-六、调用纪律
-- 幂等由服务端按会话自动管理（MCP 会话 + 请求指纹），无需自备 request_id；网络闪断后原样重发同一调用即可安全重放。
-- 一个调用只做一件事：提问用 input/choice 类工具，派任务用 assign_task_to_human（task_description 为单条可执行指令），不要用任务工具提问。
-- 业务错误（missing_call_id / session_not_found / invalid_cursor 等）在 structuredContent 中返回；协议层错误为 JSON-RPC error。
+6. Call discipline
+- Idempotency is managed server-side (MCP session + request fingerprint); you need no request_id. After a network drop, re-sending the same call safely replays.
+- One call, one thing: ask with input/choice tools, delegate with assign_task_to_human (task_description = a single actionable instruction). Never ask questions through the task tool.
+- Business errors (missing_call_id / session_not_found / invalid_cursor, ...) arrive in structuredContent; protocol errors arrive as JSON-RPC errors.
 """
 
 _MCP_TOOLS = (
