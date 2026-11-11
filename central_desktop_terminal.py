@@ -997,14 +997,48 @@ def run_heartbeat_tick(central: Any, client: Any, *, callback_credential: str | 
 
 
 def acquire_instance_lock(lock_path: str | Path) -> bool:
-    """Exclusively create a lock file; return False if it already exists."""
+    """Exclusively create a PID lock; steal it when the holder is dead.
+
+    A bare O_EXCL file survives SIGKILL (launchctl kickstart -k, crashes)
+    and then blocks every KeepAlive respawn forever.  Writing the owner's
+    PID lets a fresh start detect a dead holder and take over.
+    """
+    path = str(lock_path)
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-    try:
-        fd = os.open(str(lock_path), flags)
-    except FileExistsError:
-        return False
-    os.close(fd)
-    return True
+    for _ in range(2):
+        try:
+            fd = os.open(path, flags)
+        except FileExistsError:
+            try:
+                holder = Path(path).read_text(encoding="utf-8").strip()
+            except OSError:
+                holder = ""
+            if holder.isdigit():
+                try:
+                    os.kill(int(holder), 0)
+                    return False  # holder is alive: genuinely locked
+                except OSError:
+                    pass  # holder is dead: steal the stale lock
+            elif holder == "":
+                # Empty legacy lock with no PID: refuse to steal while ANY
+                # terminal process is alive (locks are per-central-url, and
+                # a legacy holder writes no PID to identify itself).
+                import subprocess
+                probe = subprocess.run(
+                    ["pgrep", "-f", "central_desktop_terminal.py"],
+                    capture_output=True, text=True)
+                if probe.stdout.strip():
+                    return False
+                pass  # nobody alive: fall through and steal
+            try:
+                Path(path).unlink()
+            except OSError:
+                return False
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(str(os.getpid()))
+        return True
+    return False
 
 
 def main(argv: list[str] | None = None) -> None:
