@@ -84,6 +84,9 @@ class Application(McpRpcMixin):
         if isinstance(path, str) and path.startswith("/calls/"):
             await self._browser_call_api(method, path, scope.get("headers", []), receive, send)
             return
+        if isinstance(path, str) and path.startswith("/api/agent/outcomes"):
+            await self._agent_outcomes_api(method, path, scope.get("headers", []), receive, send)
+            return
         if path == "/operator/login":
             await self._browser_login_api(method, scope.get("headers", []), receive, send)
             return
@@ -355,6 +358,42 @@ class Application(McpRpcMixin):
             "can_decline": state == "ringing" and invited,
             "payload": payload if isinstance(payload, Mapping) else {},
         }
+
+    async def _agent_outcomes_api(self, method: object, path: object, headers: object,
+                                   receive: Any, send: Any) -> None:
+        """Transport-neutral terminal-outcome feed (SPEC-chidori §4.3).
+
+        GET /api/agent/outcomes?after=<seq>&limit=N[&undeliverable=1]
+        POST /api/agent/outcomes/ack  {seq, status: "delivered"|"undeliverable"}
+        """
+        caller = self._caller(headers)
+        if caller is None:
+            await self._send(send, 401, self._error("unauthorized")); return
+        if method == "POST" and path == "/api/agent/outcomes/ack":
+            body = await self._body(receive)
+            if body is None:
+                await self._send(send, 400, self._error("invalid_request")); return
+            seq, status = body.get("seq"), body.get("status")
+            if not isinstance(seq, int) or isinstance(seq, bool) or status not in {"delivered", "undeliverable"}:
+                await self._send(send, 400, self._error("invalid_request")); return
+            self.lifecycle.ack_delivery(seq, status)
+            await self._send(send, 200, {"success": True}); return
+        if method != "GET" or path != "/api/agent/outcomes":
+            await self._send(send, 404, self._error("not_found")); return
+        import urllib.parse as _up
+        qs = _up.parse_qs(_up.urlsplit(str(path)).query)
+        try:
+            after = int(qs.get("after", ["0"])[0])
+            limit = max(1, min(500, int(qs.get("limit", ["100"])[0])))
+        except ValueError:
+            await self._send(send, 400, self._error("invalid_request")); return
+        want_undeliverable = qs.get("undeliverable", ["0"])[0] == "1"
+        feed = self.lifecycle.outcome_feed(after, limit, caller_id=caller, undeliverable=want_undeliverable)
+        await self._send(send, 200, {
+            "success": True,
+            "outcomes": feed,
+            "next_after": (feed[-1]["seq"] if feed else after),
+        })
 
     async def _browser_call_api(self, method: object, path: object, headers: object, receive: Any, send: Any) -> None:
         if not isinstance(path, str):
@@ -729,9 +768,18 @@ class Application(McpRpcMixin):
             # slot, or disclose an active call when no human channel is
             # enabled for this new call.
             return self._error("no_enabled_channel"), False
-        invited_desktop_id = self._invited_desktop_id() if not replay else None
-        mobile_eligible = self._mobile_eligible() if not replay else False
-        return self.lifecycle.create(caller, request_id, payload, invited_desktop_id, mobile_eligible), not replay
+        callsign = body.get("callsign")
+        if callsign is not None and not isinstance(callsign, str):
+            return self._error("invalid_request"), False
+        delivery = body.get("delivery")
+        if delivery is not None and not isinstance(delivery, Mapping):
+            return self._error("invalid_request"), False
+        invited_desktop_id = self._invited_desktop_id(callsign) if not replay else None
+        mobile_eligible = self._mobile_eligible(callsign) if not replay else False
+        return self.lifecycle.create(
+            caller, request_id, payload, invited_desktop_id, mobile_eligible,
+            operator_callsign=callsign, delivery=delivery,
+        ), not replay
 
     def _route_is_enabled(self) -> bool:
         """Accept only the central configuration's affirmative route result."""

@@ -73,6 +73,7 @@ class WaitingLifecycle:
                 terminal_platform TEXT, invited_desktop_id TEXT,
                 mobile_eligible INTEGER NOT NULL DEFAULT 0,
                 operator_callsign TEXT,
+                delivery_json TEXT,
                 terminal_last_seen_at REAL, terminal_disconnect_deadline REAL,
                 version INTEGER NOT NULL DEFAULT 1,
                 draft_content TEXT, draft_version INTEGER NOT NULL DEFAULT 0,
@@ -107,6 +108,9 @@ class WaitingLifecycle:
                 enabled INTEGER NOT NULL DEFAULT 0,
                 message TEXT NOT NULL DEFAULT ''
               );
+              CREATE TABLE IF NOT EXISTS lifecycle_delivery_status (
+                seq INTEGER PRIMARY KEY, status TEXT NOT NULL, updated_at REAL NOT NULL
+              );
               CREATE TABLE IF NOT EXISTS lifecycle_quiet_window (
                 operator_id TEXT PRIMARY KEY,
                 quiet_window_seconds INTEGER NOT NULL DEFAULT 300,
@@ -137,7 +141,7 @@ class WaitingLifecycle:
             ("handled_on", "TEXT"), ("terminal_platform", "TEXT"),
             ("invited_desktop_id", "TEXT"),
             ("mobile_eligible", "INTEGER NOT NULL DEFAULT 0"),
-            ("operator_callsign", "TEXT"),
+            ("operator_callsign", "TEXT"), ("delivery_json", "TEXT"),
             ("terminal_last_seen_at", "REAL"), ("terminal_disconnect_deadline", "REAL"),
             ("version", "INTEGER NOT NULL DEFAULT 1"),
             ("draft_content", "TEXT"), ("draft_version", "INTEGER NOT NULL DEFAULT 0"),
@@ -151,7 +155,8 @@ class WaitingLifecycle:
 
     def create(self, caller_id: str, request_id: str, payload: Mapping[str, object],
                invited_desktop_id: str | None = None, mobile_eligible: bool = False,
-               operator_callsign: str | None = None) -> dict[str, object]:
+               operator_callsign: str | None = None,
+               delivery: Mapping[str, object] | None = None) -> dict[str, object]:
         target = self.resolve_operator(operator_callsign)
         if target is None:
             return {"success": False, "status": "unknown_callsign",
@@ -197,10 +202,12 @@ class WaitingLifecycle:
                     deadline = self._clock() + self._ring_timeout
                     conn.execute(
                         "INSERT INTO lifecycle_calls "
-                        "(call_id, interaction_id, caller_id, call_state, ring_deadline, reason, payload_json, agent_reconnect_deadline, invited_desktop_id, mobile_eligible, operator_callsign, created_at) "
-                        "VALUES (?, ?, ?, 'ringing', ?, NULL, ?, NULL, ?, ?, ?, ?)",
+                        "(call_id, interaction_id, caller_id, call_state, ring_deadline, reason, payload_json, agent_reconnect_deadline, invited_desktop_id, mobile_eligible, operator_callsign, delivery_json, created_at) "
+                        "VALUES (?, ?, ?, 'ringing', ?, NULL, ?, NULL, ?, ?, ?, ?, ?)",
                         (call_id, interaction_id, caller_id, deadline, encoded, invited_desktop_id,
-                         int(mobile_eligible), target, self._clock()),
+                         int(mobile_eligible), target,
+                         json.dumps(dict(delivery), sort_keys=True, separators=(",", ":")) if delivery else None,
+                         self._clock()),
                     )
                     outcome = self._heartbeat(interaction_id, call_id, "ringing")
                     outcome["operator"] = target
@@ -1154,6 +1161,81 @@ class WaitingLifecycle:
                 "SELECT operator_callsign FROM lifecycle_calls WHERE call_id=?", (call_id,)
             ).fetchone()
         return str(row["operator_callsign"]) if row is not None and row["operator_callsign"] else None
+
+    def ack_delivery(self, seq: int, status: str) -> None:
+        """Postman acknowledgement for one outcome-feed entry."""
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "INSERT INTO lifecycle_delivery_status (seq, status, updated_at) VALUES (?, ?, ?) "
+                    "ON CONFLICT(seq) DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at",
+                    (seq, status, self._clock()),
+                )
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+
+    def outcome_feed(self, after: int, limit: int, *, caller_id: str | None = None,
+                     undeliverable: bool = False) -> list[dict[str, object]]:
+        """Terminal outcomes ordered by a global monotonic seq (SPEC-chidori §4.3).
+
+        Facts live in the event log; this feed is only a read view.  Entries
+        marked undeliverable by the postman are excluded unless requested.
+        """
+        result: list[dict[str, object]] = []
+        with self._connection() as conn:
+            cursor = after
+            while len(result) < limit:
+                batch = conn.execute(
+                    "SELECT e.rowid AS seq, e.body_json, c.call_id, c.interaction_id, c.caller_id, "
+                    "c.operator_callsign, c.delivery_json, c.payload_json, d.status AS ack_status "
+                    "FROM lifecycle_events e JOIN lifecycle_calls c ON c.call_id = e.call_id "
+                    "LEFT JOIN lifecycle_delivery_status d ON d.seq = e.rowid "
+                    "WHERE e.rowid > ? AND (? IS NULL OR c.caller_id = ?) "
+                    "ORDER BY e.rowid LIMIT ?",
+                    (cursor, caller_id, caller_id, limit * 3),
+                ).fetchall()
+                if not batch:
+                    break
+                cursor = batch[-1]["seq"]
+                for row in batch:
+                    if len(result) >= limit:
+                        break
+                    try:
+                        body = json.loads(row["body_json"])
+                    except (TypeError, ValueError):
+                        continue
+                    if body.get("needs_continuation") is not False:
+                        continue
+                    if (row["ack_status"] == "undeliverable") != undeliverable:
+                        continue
+                    delivery: dict[str, object] | None = None
+                    tool: str | None = None
+                    for column, into in (("delivery_json", "d"), ("payload_json", "t")):
+                        raw = row[column]
+                        if not raw:
+                            continue
+                        try:
+                            loaded = json.loads(raw)
+                        except (TypeError, ValueError):
+                            continue
+                        if not isinstance(loaded, dict):
+                            continue
+                        if into == "d":
+                            delivery = loaded
+                        elif isinstance(loaded.get("tool"), str):
+                            tool = str(loaded["tool"])
+                    result.append({
+                        "seq": int(row["seq"]), "call_id": row["call_id"],
+                        "interaction_id": row["interaction_id"],
+                        "operator": row["operator_callsign"], "tool": tool,
+                        "delivery": delivery, "outcome": body,
+                    })
+                if len(batch) < limit * 3:
+                    break
+        return result
 
     def call_version(self, call_id: str) -> int:
         with self._connection() as conn:
