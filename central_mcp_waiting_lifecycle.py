@@ -184,6 +184,7 @@ class WaitingLifecycle:
     def __init__(self, path: str | Path, clock: Clock, notify: Notifier, ring_timeout: float,
                  agent_reconnect_seconds: float, terminal_disconnect_seconds: float = 180,
                  operator_id: str = "only-operator",
+                 operator_profile: Mapping[str, object] | None = None,
                  max_attachment_bytes: int = 20 * 1024 * 1024,
                  max_submission_bytes: int = 50 * 1024 * 1024,
                  max_storage_bytes: int = 1024 * 1024 * 1024) -> None:
@@ -191,6 +192,7 @@ class WaitingLifecycle:
         self._ring_timeout, self._agent_reconnect_seconds = ring_timeout, agent_reconnect_seconds
         self._terminal_disconnect_seconds = terminal_disconnect_seconds
         self._operator_id = operator_id
+        self._operator_profile: dict[str, object] = dict(operator_profile or {})
         self._max_attachment_bytes = max_attachment_bytes
         self._max_submission_bytes = max_submission_bytes
         self._max_storage_bytes = max_storage_bytes
@@ -2331,7 +2333,9 @@ class Application:
 
     def _rpc_readonly(self, name: str) -> dict[str, object]:
         if name == "get_operator_profile":
-            return {"success": True, "status": "ok", "operator_id": self.lifecycle._operator_id}
+            profile: dict[str, object] = {"operator_id": self.lifecycle._operator_id}
+            profile.update(self.lifecycle._operator_profile)
+            return {"success": True, "status": "ok", "result": profile}
         if name == "health_check":
             router = self._notification_router
             desktop_online = False
@@ -2388,7 +2392,15 @@ class Application:
                 summary += f" Partial result: {json.dumps(result, ensure_ascii=False)}"
             return summary
         if result is not None:
-            return f"{name}: {status}. Result: {json.dumps(result, ensure_ascii=False)}"
+            summary = f"{name}: {status}. Result: {json.dumps(result, ensure_ascii=False)}"
+            attachments = structured.get("attachments")
+            if isinstance(attachments, list) and attachments:
+                listed = ", ".join(
+                    f"{a.get('filename', '?')} ({a.get('byte_count', '?')} B, id {str(a.get('attachment_id', ''))[:8]})"
+                    for a in attachments if isinstance(a, Mapping))
+                summary += (f" Attachments: {listed}. Fetch their bytes with read_interaction_attachment "
+                            f"(interaction_id + attachment_id, paginate with offset_bytes).")
+            return summary
         detail = ""
         reason = structured.get("reason")
         message = structured.get("message")
@@ -2407,6 +2419,10 @@ class Application:
             }.get(str(status))
             if guidance:
                 detail += f" — {guidance}"
+        if "desktop_online" in structured:
+            bark = structured.get("bark")
+            detail += (f" — desktop {'online' if structured.get('desktop_online') else 'OFFLINE'}, "
+                       f"bark push {'configured' if isinstance(bark, Mapping) and bark.get('configured') else 'not configured'}")
         return f"{name}: {status}{detail}"
 
     @staticmethod
@@ -2701,6 +2717,7 @@ def create_app(*, database_path: str | Path, credentials: Mapping[str, str], clo
                mobile_html_renderer: Any | None = None,
                trusted_browser_origin: str | None = None,
                operator_id: str = "only-operator",
+                operator_profile: Mapping[str, object] | None = None,
                max_attachment_bytes: int = 20 * 1024 * 1024,
                max_submission_bytes: int = 50 * 1024 * 1024,
                max_storage_bytes: int = 1024 * 1024 * 1024) -> Application:
@@ -2708,7 +2725,7 @@ def create_app(*, database_path: str | Path, credentials: Mapping[str, str], clo
         raise ValueError("scheduler tick seconds must be positive")
     return Application(
         WaitingLifecycle(database_path, clock, notify, ring_timeout_seconds, agent_reconnect_seconds,
-                         terminal_disconnect_seconds, operator_id,
+                         terminal_disconnect_seconds, operator_id, operator_profile,
                          max_attachment_bytes, max_submission_bytes, max_storage_bytes),
         credentials,
         wait,

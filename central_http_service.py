@@ -171,6 +171,7 @@ class CentralServiceConfig:
     operator_sessions: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
     operator_login_credentials: Mapping[str, str] = field(default_factory=dict)
     operator_id: str = "only-operator"
+    operator_profile: Mapping[str, object] = field(default_factory=dict)
     ring_timeout_seconds: float = 60
 
     @classmethod
@@ -294,6 +295,12 @@ class CentralServiceConfig:
             raise ValueError("operator_login_credentials must target a single operator")
         operator_id = next(iter(login_operator_ids), "only-operator")
 
+        raw_profile = mapping.get("operator_profile", {})
+        if not isinstance(raw_profile, Mapping):
+            raise ValueError("operator_profile must be a mapping")
+        operator_profile = {str(k): v for k, v in raw_profile.items()
+                            if isinstance(v, (str, int, float, bool))}
+
         return cls(
             listen_host=listen_host,
             listen_port=port,
@@ -310,6 +317,7 @@ class CentralServiceConfig:
             operator_sessions=operator_sessions,
             operator_login_credentials=operator_login_credentials,
             operator_id=operator_id,
+            operator_profile=operator_profile,
             ring_timeout_seconds=ring_timeout_seconds,
         )
 
@@ -325,7 +333,6 @@ class CentralHttpApplication:
         notify: Notification,
         wait: Waiter,
     ) -> None:
-        config.data_dir.mkdir(parents=True, exist_ok=True)
         self._config = config
         self._clock = clock
         self._wait = wait
@@ -615,6 +622,7 @@ def create_lifecycle_app(
         mobile_html_renderer=mobile_html_renderer,
         trusted_browser_origin=config.web_base_url,
         operator_id=config.operator_id,
+        operator_profile=dict(config.operator_profile),
         ring_timeout_seconds=config.ring_timeout_seconds,
     )
     lifecycle_holder["app"] = app
