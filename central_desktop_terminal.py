@@ -874,7 +874,12 @@ class RingtonePlayer:
         if mode == "short":
             short_path = self._short_ringtone_path
             if short_path and Path(short_path).is_file():
-                self._player.play(short_path, loop=False)
+                handle = self._player.play(short_path, loop=False)
+                if handle is not None:
+                    # Register even one-shot plays: accept/decline must be
+                    # able to kill the sound mid-file instead of letting a
+                    # long "short" ringtone play to its natural end.
+                    self._handles[call_id] = handle
                 return
             if self._bell is not None:
                 self._bell()

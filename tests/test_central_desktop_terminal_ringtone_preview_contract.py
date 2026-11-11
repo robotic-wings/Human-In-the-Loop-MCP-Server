@@ -287,3 +287,37 @@ def test_dropdown_change_resets_preview_button_text() -> None:
     tk.option_menus[0]["variable"].set("b.mp3")
     assert ring.stop_preview_calls == 1
     assert button.text == "测试播放"
+
+
+def test_short_ring_stops_on_accept() -> None:
+    """A short (quiet-window) ring must be killable on accept/decline.
+
+    Regression: one-shot short plays did not register a handle, so
+    ring.stop(call_id) was a no-op and a long "short" ringtone kept
+    playing after the user accepted.
+    """
+    import central_desktop_terminal as mod
+
+    played: list[tuple[str, bool]] = []
+    stopped: list[object] = []
+
+    class FakePlayer:
+        def play(self, path: str, loop: bool = True) -> object:
+            played.append((path, loop))
+            return object()
+
+        def stop(self, handle: object) -> None:
+            stopped.append(handle)
+
+    import tempfile
+    from pathlib import Path as _Path
+    with tempfile.TemporaryDirectory() as tmp:
+        short = _Path(tmp) / "short.mp3"
+        short.write_bytes(b"x")
+        ring = mod.RingtonePlayer(ringtone_path="", ringtone_alt_path=None,
+                                  player=FakePlayer(), bell=lambda: None,
+                                  short_ringtone_path=str(short))
+        ring.start("call-1", "short")
+        assert played and played[0][1] is False
+        ring.stop("call-1")
+        assert len(stopped) == 1, "short ring must be stopped via its handle"
