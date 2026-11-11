@@ -1620,7 +1620,9 @@ class Application:
         if body is None:
             await self._send(send, 400, self._error("invalid_request")); return
         if "jsonrpc" in body or "method" in body or "id" in body:
-            result = self._rpc(caller, body)
+            session = self._header(scope.get("headers", []), b"mcp-session-id")
+            session_token = session.strip() if isinstance(session, str) and session.strip() else None
+            result = self._rpc(caller, body, session_token)
             # Event-driven long-poll: a heartbeat with live call ids means
             # the call is active.  Park this response on the state machine's
             # bus until the call reaches a terminal state or the client's
@@ -1642,7 +1644,10 @@ class Application:
                     if isinstance(outcome, dict) and outcome.get("status") != "heartbeat":
                         result["result"]["structuredContent"] = outcome
                         result["result"]["content"] = [{"type": "text", "text": self._rpc_summary(str(params.get("name", "")), outcome)}]
-            await self._send(send, 200, result); return
+            headers: list[tuple[bytes, bytes]] | None = None
+            if isinstance(body, Mapping) and body.get("method") == "initialize" and session_token is None:
+                headers = [(b"mcp-session-id", uuid.uuid4().hex.encode("ascii"))]
+            await self._send(send, 200, result, extra_headers=headers); return
         timeout = body.get("client_timeout_seconds")
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 2:
             await self._send(send, 400, self._error("invalid_client_timeout")); return
@@ -2085,7 +2090,7 @@ class Application:
             await self._notification_scheduler_sleep(self._notification_dispatch_tick_seconds)
             await self.dispatch_notification_delivery()
 
-    def _rpc(self, caller: str, body: Mapping[str, object]) -> dict[str, object]:
+    def _rpc(self, caller: str, body: Mapping[str, object], session: str | None = None) -> dict[str, object]:
         rid = body.get("id")
         jsonrpc = body.get("jsonrpc")
         method = body.get("method")
@@ -2099,7 +2104,7 @@ class Application:
             elif method == "tools/list":
                 result = {"tools": self._tool_catalog()}
             elif method == "tools/call":
-                result = self._rpc_tools_call(caller, body.get("params"), rid)
+                result = self._rpc_tools_call(caller, body.get("params"), rid, session)
             else:
                 return self._rpc_error(rid, -32601, "Method not found")
         except _RpcError as error:
@@ -2128,7 +2133,7 @@ class Application:
                 return tool
         return None
 
-    def _rpc_tools_call(self, caller: str, params: object, rid: object) -> dict[str, object]:
+    def _rpc_tools_call(self, caller: str, params: object, rid: object, session: str | None = None) -> dict[str, object]:
         if not isinstance(params, Mapping):
             raise _RpcError(-32602, "Invalid params")
         name = params.get("name")
@@ -2142,9 +2147,9 @@ class Application:
             arguments = {}
         kind = tool["kind"]
         if kind == "interaction":
-            structured = self._rpc_interaction(caller, name, arguments, rid)
+            structured = self._rpc_interaction(caller, name, arguments, rid, session)
         elif kind == "control":
-            structured = self._rpc_cancel(caller, arguments, rid)
+            structured = self._rpc_cancel(caller, arguments, rid, session)
         elif kind == "read":
             structured = self._rpc_read_tool(caller, name, arguments)
         else:
@@ -2155,8 +2160,8 @@ class Application:
             "structuredContent": structured,
         }
 
-    def _rpc_interaction(self, caller: str, name: str, arguments: Mapping[str, object], rid: object) -> dict[str, object]:
-        request_id = self._rpc_request_id(rid, name, arguments)
+    def _rpc_interaction(self, caller: str, name: str, arguments: Mapping[str, object], rid: object, session: str | None = None) -> dict[str, object]:
+        request_id = self._rpc_request_id(rid, name, arguments, session)
         interaction_id = arguments.get("interaction_id")
         call_id = arguments.get("call_id")
         interaction_present = isinstance(interaction_id, str) and bool(interaction_id)
@@ -2183,15 +2188,16 @@ class Application:
             result = {"success": False, "status": "session_not_found", "needs_continuation": False}
         return dict(result)
 
-    def _rpc_cancel(self, caller: str, arguments: Mapping[str, object], rid: object) -> dict[str, object]:
+    def _rpc_cancel(self, caller: str, arguments: Mapping[str, object], rid: object, session: str | None = None) -> dict[str, object]:
         interaction_id = arguments.get("interaction_id")
         call_id = arguments.get("call_id")
         if not isinstance(interaction_id, str) or not interaction_id or not isinstance(call_id, str) or not call_id:
             raise _RpcError(-32602, "Invalid params")
-        return dict(self.lifecycle.cancel(caller, self._rpc_request_id(rid, "cancel_interaction", arguments), interaction_id, call_id))
+        return dict(self.lifecycle.cancel(caller, self._rpc_request_id(rid, "cancel_interaction", arguments, session), interaction_id, call_id))
 
     @staticmethod
-    def _rpc_request_id(rid: object, name: str, arguments: Mapping[str, object]) -> str:
+    def _rpc_request_id(rid: object, name: str, arguments: Mapping[str, object],
+                        session: str | None = None) -> str:
         """Namescope a JSON-RPC id with its payload fingerprint.
 
         JSON-RPC request ids are unique only within one client session, but
@@ -2206,7 +2212,14 @@ class Application:
         fingerprint = hashlib.sha1(
             f"{name}|{json.dumps(dict(arguments), sort_keys=True, separators=(',', ':'))}".encode()
         ).hexdigest()[:8]
-        return f"rpc-{rid}-{fingerprint}"
+        # The MCP streamable-HTTP session id (echoed by the client after
+        # initialize) scopes ids to one client session: genuine retries
+        # replay, while a fresh session never collides with -- or replays --
+        # an earlier session's row even when both reuse small ids with
+        # identical payloads.  Clients that never echo a session id fall
+        # back to the bare payload fingerprint.
+        prefix = f"{session[:12]}-" if isinstance(session, str) and session else ""
+        return f"rpc-{prefix}{rid}-{fingerprint}"
 
     def _rpc_read_tool(self, caller: str, name: str, arguments: Mapping[str, object]) -> dict[str, object]:
         if name == "read_interaction_result":
@@ -2541,8 +2554,10 @@ class Application:
     def _terminal_error(status: str) -> dict[str, object]:
         return {"success": False, "status": status}
 
-    async def _send(self, send: Any, status: int, body: Mapping[str, object]) -> None:
-        await send({"type": "http.response.start", "status": status, "headers": [(b"content-type", b"application/json")]})
+    async def _send(self, send: Any, status: int, body: Mapping[str, object],
+                    extra_headers: list[tuple[bytes, bytes]] | None = None) -> None:
+        await send({"type": "http.response.start", "status": status,
+                    "headers": [(b"content-type", b"application/json"), *(extra_headers or [])]})
         await send({"type": "http.response.body", "body": json.dumps(body).encode(), "more_body": False})
 
     @staticmethod
