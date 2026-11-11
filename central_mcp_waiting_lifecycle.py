@@ -68,7 +68,13 @@ _HUMAN_LOOP_MANUAL = """HITL MCP Operating Manual (human-in-the-loop toolset)
 5. Result budget and pagination
 - Pass max_result_bytes (>=16384) when creating a call. Oversized results come back with body_omitted_for_size and a result_id; fetch the full body with read_interaction_result (paginate via cursor) and attachments with read_interaction_attachment (paginate via offset_bytes). Never ask the human to resend what the server already holds.
 
-6. Call discipline
+6. Multiple operators
+- This service may serve several humans, each addressed by a short callsign. Call list_operators first: it returns every callsign with display name, language, mobile capability, and current do-not-disturb state.
+- Pass callsign on the FIRST call of a round (interactive tools) to choose who is called; omit it to target the primary operator. Continuation calls do not need callsign — the round is already bound to its operator.
+- Each operator has their OWN busy line, DND and quiet window: one busy operator does not block calls to another, and DND of one operator only declines calls addressed to them.
+- unknown_callsign in a response means the callsign is not in the directory; call list_operators to see valid ones.
+
+7. Call discipline
 - Retries are safe: re-sending the same call after a network drop replays its recorded outcome instead of duplicating work. You need no request_id.
 - One call, one thing: ask with input/choice tools, delegate with assign_task_to_human (task_description = a single actionable instruction). Never ask questions through the task tool.
 - Business errors (missing_call_id / session_not_found / invalid_cursor, ...) arrive in structuredContent; protocol errors arrive as JSON-RPC errors.
@@ -82,6 +88,11 @@ def _interactive_schema(properties: Mapping[str, object]) -> dict[str, object]:
             "description": "How long this single call parks server-side waiting for the human "
                            "(default 30; use a larger value such as 300 if the human may be away). "
                            "If the human answers within the window, this same call returns their final answer.",
+        },
+        "callsign": {
+            "type": "string",
+            "description": "Which operator to address, from list_operators (e.g. \"kefan\"). "
+                           "Omit to target the primary operator.",
         },
         "interaction_id": {
             "type": "string",
@@ -162,9 +173,16 @@ _MCP_TOOLS = (
      "inputSchema": {"type": "object", "properties": {
          "interaction_id": {"type": "string"}, "attachment_id": {"type": "string"},
          "offset_bytes": {"type": "integer"}, "max_result_bytes": {"type": "integer"}}}},
-    {"name": "get_operator_profile", "kind": "readonly",
-     "description": "Read the operator profile: who the human is and how to address them.",
+    {"name": "list_operators", "kind": "readonly",
+     "description": "List the human operators (callsigns) this service can reach, with display "
+                    "names, languages, and whether each currently has do-not-disturb on. "
+                    "Use a callsign as the callsign argument of interactive tools.",
      "inputSchema": {"type": "object"}},
+    {"name": "get_operator_profile", "kind": "readonly",
+     "description": "Read one operator's profile (pass callsign; omit for the primary operator): "
+                    "who they are and how to address them.",
+     "inputSchema": {"type": "object", "properties": {
+         "callsign": {"type": "string", "description": "Operator callsign from list_operators."}}}},
     {"name": "health_check", "kind": "readonly",
      "description": "Report HITL service health (storage, desktop online, push channels).",
      "inputSchema": {"type": "object"}},
@@ -185,6 +203,7 @@ class WaitingLifecycle:
                  agent_reconnect_seconds: float, terminal_disconnect_seconds: float = 180,
                  operator_id: str = "only-operator",
                  operator_profile: Mapping[str, object] | None = None,
+                 operator_directory: Mapping[str, Mapping[str, object]] | None = None,
                  max_attachment_bytes: int = 20 * 1024 * 1024,
                  max_submission_bytes: int = 50 * 1024 * 1024,
                  max_storage_bytes: int = 1024 * 1024 * 1024) -> None:
@@ -193,6 +212,20 @@ class WaitingLifecycle:
         self._terminal_disconnect_seconds = terminal_disconnect_seconds
         self._operator_id = operator_id
         self._operator_profile: dict[str, object] = dict(operator_profile or {})
+        # Multi-operator directory.  Without configuration a single default
+        # operator is synthesised so every historical single-user deployment
+        # and test keeps behaving identically.
+        if operator_directory:
+            self._operators: dict[str, dict[str, object]] = {
+                str(callsign): dict(entry) for callsign, entry in operator_directory.items()
+            }
+        else:
+            self._operators = {
+                operator_id: {"password": None, "devices": [], "mobile": True, "primary": True,
+                              **({"profile": dict(self._operator_profile)} if self._operator_profile else {})}
+            }
+        primaries = [c for c, e in self._operators.items() if e.get("primary")]
+        self._primary_operator = primaries[0] if primaries else next(iter(self._operators))
         self._max_attachment_bytes = max_attachment_bytes
         self._max_submission_bytes = max_submission_bytes
         self._max_storage_bytes = max_storage_bytes
@@ -211,6 +244,7 @@ class WaitingLifecycle:
                 owner_device_id TEXT, owner_session_id TEXT, handled_on TEXT,
                 terminal_platform TEXT, invited_desktop_id TEXT,
                 mobile_eligible INTEGER NOT NULL DEFAULT 0,
+                operator_callsign TEXT,
                 terminal_last_seen_at REAL, terminal_disconnect_deadline REAL,
                 version INTEGER NOT NULL DEFAULT 1,
                 draft_content TEXT, draft_version INTEGER NOT NULL DEFAULT 0,
@@ -275,6 +309,7 @@ class WaitingLifecycle:
             ("handled_on", "TEXT"), ("terminal_platform", "TEXT"),
             ("invited_desktop_id", "TEXT"),
             ("mobile_eligible", "INTEGER NOT NULL DEFAULT 0"),
+            ("operator_callsign", "TEXT"),
             ("terminal_last_seen_at", "REAL"), ("terminal_disconnect_deadline", "REAL"),
             ("version", "INTEGER NOT NULL DEFAULT 1"),
             ("draft_content", "TEXT"), ("draft_version", "INTEGER NOT NULL DEFAULT 0"),
@@ -287,7 +322,13 @@ class WaitingLifecycle:
             conn.execute("ALTER TABLE lifecycle_requests ADD COLUMN operation_kind TEXT NOT NULL DEFAULT 'create'")
 
     def create(self, caller_id: str, request_id: str, payload: Mapping[str, object],
-               invited_desktop_id: str | None = None, mobile_eligible: bool = False) -> dict[str, object]:
+               invited_desktop_id: str | None = None, mobile_eligible: bool = False,
+               operator_callsign: str | None = None) -> dict[str, object]:
+        target = self.resolve_operator(operator_callsign)
+        if target is None:
+            return {"success": False, "status": "unknown_callsign",
+                    "message": f"no operator with callsign {operator_callsign!r}; call list_operators for the directory",
+                    "needs_continuation": False}
         encoded = self._dump(payload)
         notification: dict[str, object] | None = None
         with self._connection() as conn:
@@ -299,23 +340,27 @@ class WaitingLifecycle:
                         return self._error("request_conflict")
                     return self._load(existing["outcome_json"])
                 self._settle_due(conn)
-                dnd = self._dnd_state(conn)
+                dnd = self._dnd_state(conn, target)
                 if dnd["enabled"]:
                     outcome = {
                         "success": True, "status": "declined", "reason": "do_not_disturb",
+                        "operator": target,
                         "message": dnd["message"], "human_action": False, "needs_continuation": False,
                     }
                     conn.execute("INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?, 'create')", (caller_id, request_id, encoded, self._dump(outcome)))
                     conn.commit()
                     return outcome
-                quiet = self._quiet_window_state(conn)
+                quiet = self._quiet_window_state(conn, target)
                 last_accept_at = quiet.get("last_accept_at")
                 degraded = last_accept_at is not None and (self._clock() - last_accept_at) < quiet["quiet_window_seconds"]
-                active = conn.execute("SELECT call_id FROM lifecycle_calls WHERE call_state IN ('ringing', 'accepted', 'in_progress') LIMIT 1").fetchone()
+                active = conn.execute(
+                    "SELECT call_id FROM lifecycle_calls WHERE call_state IN ('ringing', 'accepted', 'in_progress') "
+                    "AND operator_callsign=? LIMIT 1", (target,)).fetchone()
                 if active is not None:
                     outcome = {
                         "success": True, "status": "busy", "call_state": None, "call_id": None,
                         "reason": None, "interaction_id": None, "human_action": False,
+                        "operator": target,
                         "handled_on": None, "terminal_platform": None, "event_seq": None,
                         "needs_continuation": False, "retryable": True, "retry_after_seconds": 30,
                     }
@@ -324,11 +369,13 @@ class WaitingLifecycle:
                     deadline = self._clock() + self._ring_timeout
                     conn.execute(
                         "INSERT INTO lifecycle_calls "
-                        "(call_id, interaction_id, caller_id, call_state, ring_deadline, reason, payload_json, agent_reconnect_deadline, invited_desktop_id, mobile_eligible, created_at) "
-                        "VALUES (?, ?, ?, 'ringing', ?, NULL, ?, NULL, ?, ?, ?)",
-                        (call_id, interaction_id, caller_id, deadline, encoded, invited_desktop_id, int(mobile_eligible), self._clock()),
+                        "(call_id, interaction_id, caller_id, call_state, ring_deadline, reason, payload_json, agent_reconnect_deadline, invited_desktop_id, mobile_eligible, operator_callsign, created_at) "
+                        "VALUES (?, ?, ?, 'ringing', ?, NULL, ?, NULL, ?, ?, ?, ?)",
+                        (call_id, interaction_id, caller_id, deadline, encoded, invited_desktop_id,
+                         int(mobile_eligible), target, self._clock()),
                     )
                     outcome = self._heartbeat(interaction_id, call_id, "ringing")
+                    outcome["operator"] = target
                     short_title = next(
                         (str(payload.get(key)) for key in ("title", "task_description", "prompt", "message")
                          if isinstance(payload.get(key), str) and payload.get(key).strip()),
@@ -350,8 +397,9 @@ class WaitingLifecycle:
             self._notify(notification)
         return outcome
 
-    def set_dnd(self, enabled: bool, message: str) -> dict[str, object]:
-        """Persist the operator-level do-not-disturb state and auto-reply."""
+    def set_dnd(self, enabled: bool, message: str = "", *, operator_id: str | None = None) -> dict[str, object]:
+        """Persist one operator's do-not-disturb state and auto-reply."""
+        operator_id = operator_id or self._operator_id
         message = message if isinstance(message, str) else ""
         with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -359,33 +407,34 @@ class WaitingLifecycle:
                 conn.execute(
                     "INSERT INTO lifecycle_dnd (operator_id, enabled, message) VALUES (?, ?, ?) "
                     "ON CONFLICT(operator_id) DO UPDATE SET enabled=excluded.enabled, message=excluded.message",
-                    (self._operator_id, int(enabled), message),
+                    (operator_id, int(enabled), message),
                 )
                 conn.commit()
             except BaseException:
                 conn.rollback()
                 raise
-        return {"success": True, "enabled": bool(enabled), "message": message}
+        return {"success": True, "operator": operator_id, "enabled": bool(enabled), "message": message}
 
-    def get_dnd(self) -> dict[str, object]:
+    def get_dnd(self, operator_id: str | None = None) -> dict[str, object]:
         with self._connection() as conn:
-            state = self._dnd_state(conn)
-        return {"success": True, **state}
+            state = self._dnd_state(conn, operator_id or self._operator_id)
+        return {"success": True, "operator": operator_id or self._operator_id, **state}
 
-    def _dnd_state(self, conn: sqlite3.Connection) -> dict[str, object]:
+    def _dnd_state(self, conn: sqlite3.Connection, operator_id: str | None = None) -> dict[str, object]:
         row = conn.execute(
-            "SELECT enabled, message FROM lifecycle_dnd WHERE operator_id=?", (self._operator_id,)
+            "SELECT enabled, message FROM lifecycle_dnd WHERE operator_id=?", (operator_id or self._operator_id,)
         ).fetchone()
         if row is None:
             return {"enabled": False, "message": ""}
         return {"enabled": bool(row["enabled"]), "message": str(row["message"])}
 
-    def get_quiet_window(self) -> dict[str, object]:
+    def get_quiet_window(self, operator_id: str | None = None) -> dict[str, object]:
         with self._connection() as conn:
-            state = self._quiet_window_state(conn)
-        return {"success": True, **state}
+            state = self._quiet_window_state(conn, operator_id or self._operator_id)
+        return {"success": True, "operator": operator_id or self._operator_id, **state}
 
-    def set_quiet_window(self, quiet_window_seconds: int, quiet_mode: str) -> dict[str, object]:
+    def set_quiet_window(self, quiet_window_seconds: int, quiet_mode: str,
+                         operator_id: str | None = None) -> dict[str, object]:
         if isinstance(quiet_window_seconds, bool) or not isinstance(quiet_window_seconds, int) or quiet_window_seconds < 0:
             return self._error("invalid_request")
         if quiet_mode not in {"short", "silent"}:
@@ -397,7 +446,7 @@ class WaitingLifecycle:
                     "INSERT INTO lifecycle_quiet_window (operator_id, quiet_window_seconds, quiet_mode, last_accept_at) "
                     "VALUES (?, ?, ?, NULL) "
                     "ON CONFLICT(operator_id) DO UPDATE SET quiet_window_seconds=excluded.quiet_window_seconds, quiet_mode=excluded.quiet_mode",
-                    (self._operator_id, quiet_window_seconds, quiet_mode),
+                    (operator_id or self._operator_id, quiet_window_seconds, quiet_mode),
                 )
                 conn.commit()
             except BaseException:
@@ -405,10 +454,10 @@ class WaitingLifecycle:
                 raise
         return {"success": True, "quiet_window_seconds": quiet_window_seconds, "quiet_mode": quiet_mode}
 
-    def _quiet_window_state(self, conn: sqlite3.Connection) -> dict[str, object]:
+    def _quiet_window_state(self, conn: sqlite3.Connection, operator_id: str | None = None) -> dict[str, object]:
         row = conn.execute(
             "SELECT quiet_window_seconds, quiet_mode, last_accept_at FROM lifecycle_quiet_window WHERE operator_id=?",
-            (self._operator_id,),
+            (operator_id or self._operator_id,),
         ).fetchone()
         if row is None:
             return {"quiet_window_seconds": 300, "quiet_mode": "short", "last_accept_at": None}
@@ -418,12 +467,12 @@ class WaitingLifecycle:
             "last_accept_at": row["last_accept_at"],
         }
 
-    def _record_accept(self, conn: sqlite3.Connection) -> None:
+    def _record_accept(self, conn: sqlite3.Connection, operator_id: str | None = None) -> None:
         conn.execute(
             "INSERT INTO lifecycle_quiet_window (operator_id, quiet_window_seconds, quiet_mode, last_accept_at) "
             "VALUES (?, 300, 'short', ?) "
             "ON CONFLICT(operator_id) DO UPDATE SET last_accept_at=excluded.last_accept_at",
-            (self._operator_id, self._clock()),
+            (operator_id or self._operator_id, self._clock()),
         )
 
     def has_request(self, caller_id: str, request_id: str) -> bool:
@@ -668,7 +717,7 @@ class WaitingLifecycle:
                                 "agent_reconnect_deadline": None,
                             },
                         )
-                        self._record_accept(conn)
+                        self._record_accept(conn, str(call["operator_callsign"]) if call["operator_callsign"] else None)
                     else:
                         # A decline ends the invitation without assigning a
                         # processing owner.  Keep its audit endpoint separate
@@ -713,7 +762,7 @@ class WaitingLifecycle:
         The invitation's mobile eligibility is stored at creation time, so a
         later route configuration change cannot grant a browser authority.
         """
-        if action not in {"accept", "decline"} or operator_id != self._operator_id:
+        if action not in {"accept", "decline"}:
             return self._error("session_not_found")
         encoded = self._dump({"call_id": call_id, "action": action})
         actor = f"browser:{session_id}"
@@ -732,6 +781,8 @@ class WaitingLifecycle:
                 self._settle_due(conn)
                 call = conn.execute("SELECT * FROM lifecycle_calls WHERE call_id=?", (call_id,)).fetchone()
                 if call is None or not bool(call["mobile_eligible"]):
+                    return self._error("session_not_found")
+                if operator_id != (str(call["operator_callsign"]) if call["operator_callsign"] else self._operator_id):
                     return self._error("session_not_found")
                 # A browser opened after a desktop owns the call is a
                 # read-only truth view, not a second action surface.
@@ -761,7 +812,7 @@ class WaitingLifecycle:
                             "agent_reconnect_deadline": None,
                         },
                     )
-                    self._record_accept(conn)
+                    self._record_accept(conn, str(call["operator_callsign"]) if call["operator_callsign"] else None)
                 else:
                     _, seq = self._machine.transition(
                         conn, call_id, "decline", reason="human_declined",
@@ -1078,7 +1129,11 @@ class WaitingLifecycle:
 
     def resubmit(self, caller_id: str, request_id: str, interaction_id: str, call_id: str,
                  revision_id: str, payload: Mapping[str, object],
-                 invited_desktop_id: str | None = None, mobile_eligible: bool = False) -> dict[str, object]:
+                 invited_desktop_id: str | None = None, mobile_eligible: bool = False,
+                 operator_callsign: str | None = None) -> dict[str, object]:
+        target = self.resolve_operator(operator_callsign)
+        if target is None:
+            return {"success": False, "status": "unknown_callsign", "needs_continuation": False}
         """Open a new call round for a completed/failed task under a revision."""
         if not isinstance(revision_id, str) or not revision_id or len(revision_id) > 128:
             return self._error("invalid_request")
@@ -1131,7 +1186,8 @@ class WaitingLifecycle:
                 if parent["call_state"] not in {"completed", "failed"}:
                     return self._error("invalid_request")
                 active = conn.execute(
-                    "SELECT call_id FROM lifecycle_calls WHERE call_state IN ('ringing', 'accepted', 'in_progress') LIMIT 1"
+                    "SELECT call_id FROM lifecycle_calls WHERE call_state IN ('ringing', 'accepted', 'in_progress') "
+                    "AND operator_callsign=? LIMIT 1", (target,)
                 ).fetchone()
                 if active is not None:
                     conn.execute("INSERT INTO lifecycle_requests VALUES (?, ?, ?, ?, 'resubmit')",
@@ -1142,10 +1198,10 @@ class WaitingLifecycle:
                 deadline = self._clock() + self._ring_timeout
                 conn.execute(
                     "INSERT INTO lifecycle_calls "
-                    "(call_id, interaction_id, caller_id, call_state, ring_deadline, reason, payload_json, agent_reconnect_deadline, invited_desktop_id, mobile_eligible, created_at) "
-                    "VALUES (?, ?, ?, 'ringing', ?, NULL, ?, NULL, ?, ?, ?)",
+                    "(call_id, interaction_id, caller_id, call_state, ring_deadline, reason, payload_json, agent_reconnect_deadline, invited_desktop_id, mobile_eligible, operator_callsign, created_at) "
+                    "VALUES (?, ?, ?, 'ringing', ?, NULL, ?, NULL, ?, ?, ?, ?)",
                     (new_call_id, interaction_id, caller_id, deadline, encoded,
-                     invited_desktop_id, int(mobile_eligible), self._clock()),
+                     invited_desktop_id, int(mobile_eligible), target, self._clock()),
                 )
                 conn.execute(
                     "INSERT INTO lifecycle_revisions VALUES (?, ?, ?, ?, ?)",
@@ -1227,6 +1283,55 @@ class WaitingLifecycle:
             except BaseException:
                 conn.rollback()
                 raise
+
+    def directory_view(self) -> list[dict[str, object]]:
+        """Public operator directory for agents: callsigns, profiles, channels."""
+        view = []
+        for callsign, entry in sorted(self._operators.items()):
+            view.append({
+                "callsign": callsign,
+                "display_name": entry.get("display_name") or callsign,
+                "language": entry.get("language"),
+                "timezone": entry.get("timezone"),
+                "primary": entry is not None and bool(entry.get("primary")),
+                "mobile": bool(entry.get("mobile")),
+            })
+        return view
+
+    def resolve_operator(self, callsign: object) -> str | None:
+        """Map an optional callsign to a directory operator (default = primary)."""
+        if not isinstance(callsign, str) or not callsign.strip():
+            return self._primary_operator
+        return callsign.strip() if callsign.strip() in self._operators else None
+
+    def operator_password(self, callsign: str) -> str | None:
+        entry = self._operators.get(callsign) or {}
+        password = entry.get("password")
+        return str(password) if isinstance(password, str) and password else None
+
+    def operator_for_device(self, device_id: str) -> str | None:
+        """Reverse lookup: which operator owns this desktop device."""
+        for callsign, entry in self._operators.items():
+            if device_id in self.operator_devices(callsign):
+                return callsign
+        return None
+
+    def operator_devices(self, callsign: str) -> list[str]:
+        entry = self._operators.get(callsign) or {}
+        devices = entry.get("devices")
+        return [str(d) for d in devices] if isinstance(devices, list) else []
+
+    def operator_mobile(self, callsign: str) -> bool:
+        entry = self._operators.get(callsign) or {}
+        return bool(entry.get("mobile"))
+
+    def call_operator(self, call_id: str) -> str | None:
+        """The operator (callsign) a call round belongs to."""
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT operator_callsign FROM lifecycle_calls WHERE call_id=?", (call_id,)
+            ).fetchone()
+        return str(row["operator_callsign"]) if row is not None and row["operator_callsign"] else None
 
     def call_version(self, call_id: str) -> int:
         with self._connection() as conn:
@@ -1618,6 +1723,7 @@ class WaitingLifecycle:
 class Application:
     def __init__(self, lifecycle: WaitingLifecycle, credentials: Mapping[str, str], wait: Waiter,
                  deadline_tick_seconds: float, scheduler_sleep: Waiter,
+                 operator_session_secret: bytes | None,
                  route_admission: RouteAdmission, notification_router: Any | None,
                  notification_dispatch_tick_seconds: float, notification_scheduler_sleep: Waiter,
                  desktop_registration_service: Any | None = None,
@@ -1626,6 +1732,7 @@ class Application:
                  mobile_html_renderer: Any | None = None,
                  trusted_browser_origin: str | None = None) -> None:
         self.lifecycle, self._credentials, self._wait = lifecycle, dict(credentials), wait
+        self._session_secret = operator_session_secret or b"hitl-default-session-secret"
         self._deadline_tick_seconds, self._scheduler_sleep = deadline_tick_seconds, scheduler_sleep
         self._route_admission = route_admission
         self._notification_router = notification_router
@@ -1787,6 +1894,11 @@ class Application:
                     merged.update({str(item["call_id"]): item for item in central_states})
                     response = {**response, "states": [merged[key] for key in sorted(merged)]}
         elif method == "POST" and path == "/api/terminals/dnd":
+            session = self._terminal_session(headers)
+            context = self._terminal_context(session) if session is not None else None
+            if context is None:
+                await self._send(send, 401, self._terminal_error("session_not_found")); return
+            device_op = self.lifecycle.operator_for_device(context[0])
             body = await self._body(receive)
             dnd = body.get("dnd") if body is not None else None
             message = body.get("message") if body is not None else ""
@@ -1794,10 +1906,20 @@ class Application:
                 await self._send(send, 400, self._error("invalid_request")); return
             if not isinstance(message, str):
                 message = ""
-            response = self.lifecycle.set_dnd(dnd, message)
+            response = self.lifecycle.set_dnd(dnd, message, operator_id=device_op)
         elif method == "GET" and path == "/api/terminals/dnd":
-            response = self.lifecycle.get_dnd()
+            session = self._terminal_session(headers)
+            context = self._terminal_context(session) if session is not None else None
+            if context is None:
+                await self._send(send, 401, self._terminal_error("session_not_found")); return
+            device_op = self.lifecycle.operator_for_device(context[0])
+            response = self.lifecycle.get_dnd(operator_id=device_op)
         elif method == "POST" and path == "/api/terminals/quiet":
+            session = self._terminal_session(headers)
+            context = self._terminal_context(session) if session is not None else None
+            if context is None:
+                await self._send(send, 401, self._terminal_error("session_not_found")); return
+            device_op = self.lifecycle.operator_for_device(context[0])
             body = await self._body(receive)
             quiet_window_seconds = body.get("quiet_window_seconds") if body is not None else None
             quiet_mode = body.get("quiet_mode") if body is not None else None
@@ -1805,9 +1927,14 @@ class Application:
                 await self._send(send, 400, self._error("invalid_request")); return
             if quiet_mode not in {"short", "silent"}:
                 await self._send(send, 400, self._error("invalid_request")); return
-            response = self.lifecycle.set_quiet_window(quiet_window_seconds, quiet_mode)
+            response = self.lifecycle.set_quiet_window(quiet_window_seconds, quiet_mode, operator_id=device_op)
         elif method == "GET" and path == "/api/terminals/quiet":
-            response = self.lifecycle.get_quiet_window()
+            session = self._terminal_session(headers)
+            context = self._terminal_context(session) if session is not None else None
+            if context is None:
+                await self._send(send, 401, self._terminal_error("session_not_found")); return
+            device_op = self.lifecycle.operator_for_device(context[0])
+            response = self.lifecycle.get_quiet_window(operator_id=device_op)
         else:
             await self._send(send, 404, self._error("not_found")); return
         await self._send(send, self._action_status(response), response)
@@ -1977,7 +2104,7 @@ class Application:
             response = self.lifecycle.submit(
                 call_id=call_id, device_id="iphone_web", session_id=browser_session_id,
                 submission_id=submission_id, result=result,
-            ) if operator_id == self.lifecycle._operator_id else self._terminal_error("session_not_found")
+            ) if operator_id == (self.lifecycle.call_operator(call_id) or self.lifecycle._operator_id) else self._terminal_error("session_not_found")
             if cookie_mode:
                 await self._send_html(send, self._action_status(response), self._render_browser_page(response, csrf_token, response)); return
             await self._send(send, self._action_status(response), response); return
@@ -1989,7 +2116,7 @@ class Application:
             response = self.lifecycle.upload_attachment(
                 call_id=call_id, device_id="iphone_web", session_id=browser_session_id,
                 filename=filename, media_type=media_type, content=content,
-            ) if operator_id == self.lifecycle._operator_id else self._terminal_error("session_not_found")
+            ) if operator_id == (self.lifecycle.call_operator(call_id) or self.lifecycle._operator_id) else self._terminal_error("session_not_found")
             if cookie_mode:
                 await self._send_html(send, self._action_status(response), self._render_browser_page(response, csrf_token, response)); return
             await self._send(send, self._action_status(response), response); return
@@ -2021,9 +2148,17 @@ class Application:
         entry = self._cookie(headers, "browser_entry")
         destination = self._browser_entries.get(entry or "")
         body = await self._form_body(receive)
-        credential = body.get("credential") if body is not None else None
+        callsign = body.get("callsign") if body is not None else None
+        password = (body.get("password") or body.get("credential")) if body is not None else None
+        session_cookie = None
         authenticate = getattr(self._browser_cookie_authenticator, "authenticate_login", None)
-        session_cookie = authenticate(credential) if callable(authenticate) else None
+        if callable(authenticate) and not callsign:
+            session_cookie = authenticate(password)
+        elif isinstance(callsign, str) and callsign and isinstance(password, str):
+            expected = self.lifecycle.operator_password(callsign)
+            import hmac as _hmac
+            if expected is not None and _hmac.compare_digest(password, expected):
+                session_cookie = self._mint_operator_session(callsign)
         if not isinstance(destination, str) or not isinstance(session_cookie, str) or not session_cookie:
             await self._send(send, 401, self._terminal_error("session_not_found")); return
         del self._browser_entries[entry]
@@ -2052,6 +2187,45 @@ class Application:
     def _operator_session_cookie(value: str) -> str:
         return f"operator_session={value}; Path=/; Secure; HttpOnly; SameSite=Lax"
 
+    def _mint_operator_session(self, callsign: str) -> str:
+        """Mint an HMAC-signed browser session token for one operator."""
+        import hmac as _hmac
+        payload = json.dumps({
+            "operator": callsign,
+            "browser_session_id": uuid.uuid4().hex,
+            "csrf_token": uuid.uuid4().hex,
+            "exp": self.lifecycle._clock() + 30 * 24 * 3600,
+        }, sort_keys=True, separators=(",", ":")).encode()
+        mac = _hmac.new(self._session_secret, payload, hashlib.sha256).hexdigest()
+        return base64.b64encode(payload).decode() + "." + mac
+
+    def _verify_operator_session_token(self, token: str | None) -> dict[str, str] | None:
+        import hmac as _hmac
+        if not isinstance(token, str) or "." not in token:
+            return None
+        raw, mac = token.rsplit(".", 1)
+        try:
+            payload = base64.b64decode(raw.encode())
+        except (ValueError, TypeError):
+            return None
+        expected = _hmac.new(self._session_secret, payload, hashlib.sha256).hexdigest()
+        if not _hmac.compare_digest(mac, expected):
+            return None
+        try:
+            data = json.loads(payload)
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(data, Mapping) or data.get("exp", 0) < self.lifecycle._clock():
+            return None
+        operator = data.get("operator")
+        browser_session = data.get("browser_session_id")
+        csrf = data.get("csrf_token")
+        if not all(isinstance(v, str) and v for v in (operator, browser_session, csrf)):
+            return None
+        if operator not in self.lifecycle._operators:
+            return None
+        return {"operator_id": str(operator), "browser_session_id": browser_session, "csrf_token": csrf}
+
     @staticmethod
     def _render_login_entry() -> str:
         return ("<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">"
@@ -2062,14 +2236,17 @@ class Application:
                 "</head><body><div class=\"card\"><div class=\"card-body\">"
                 "<h5 class=\"mb-3 text-center\">操作者登录</h5>"
                 "<form method=\"post\" action=\"/operator/login\">"
-                "<div class=\"mb-3\"><label class=\"form-label\" for=\"operator-credential\">登录凭证</label>"
-                "<input class=\"form-control\" id=\"operator-credential\" type=\"password\" name=\"credential\" required></div>"
+                "<div class=\"mb-3\"><label class=\"form-label\" for=\"operator-callsign\">呼号</label>"
+                "<input class=\"form-control\" id=\"operator-callsign\" type=\"text\" name=\"callsign\" required autofocus></div>"
+                "<div class=\"mb-3\"><label class=\"form-label\" for=\"operator-password\">密码</label>"
+                "<input class=\"form-control\" id=\"operator-password\" type=\"password\" name=\"password\" required></div>"
                 "<button type=\"submit\" class=\"btn btn-primary w-100\">登录</button>"
                 "</form></div></div></body></html>")
 
     def _browser_call_view(self, call_id: str, operator_id: str,
                            browser_session_id: str | None = None) -> dict[str, object]:
-        if operator_id != self.lifecycle._operator_id:
+        call_op = self.lifecycle.call_operator(call_id)
+        if operator_id != (call_op or self.lifecycle._operator_id):
             return self._terminal_error("session_not_found")
         with self.lifecycle._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -2124,11 +2301,32 @@ class Application:
                 return device_id, str(platform) if isinstance(platform, str) else "unknown"
         return None
 
-    def _invited_desktop_id(self) -> str | None:
+    def _invited_desktop_id(self, callsign: str | None = None) -> str | None:
         router = self._notification_router
         if getattr(router, "_route_mode", None) not in {"desktop", "both"}:
             return None
         registry = getattr(router, "_registry", None) if router is not None else None
+        if registry is None:
+            return None
+        if callsign:
+            # Invite the freshest GUI-ready device OWNED by this operator.
+            best_device, best_seen = None, -1.0
+            for device_id in self.lifecycle.operator_devices(callsign):
+                state = registry.desktop_state(device_id)
+                if isinstance(state, Mapping) and state.get("gui_ready") and state.get("fresh"):
+                    row_seen = getattr(registry, "_store", None)
+                    seen = None
+                    if row_seen is not None:
+                        with row_seen.connection() as conn:
+                            row = conn.execute(
+                                "SELECT last_seen FROM desktop_terminals WHERE device_id=?", (device_id,)
+                            ).fetchone()
+                            seen = row["last_seen"] if row is not None else None
+                    if seen is not None and float(seen) > best_seen:
+                        best_device, best_seen = device_id, float(seen)
+            if best_device is not None:
+                return best_device
+            return None
         ready_desktop = getattr(registry, "ready_desktop", None)
         if not callable(ready_desktop):
             return None
@@ -2136,8 +2334,12 @@ class Application:
         device_id = terminal.get("device_id") if isinstance(terminal, Mapping) else None
         return device_id if isinstance(device_id, str) else None
 
-    def _mobile_eligible(self) -> bool:
-        return getattr(self._notification_router, "_route_mode", None) in {"iphone", "both"}
+    def _mobile_eligible(self, callsign: str | None = None) -> bool:
+        if getattr(self._notification_router, "_route_mode", None) not in {"iphone", "both"}:
+            return False
+        if callsign:
+            return self.lifecycle.operator_mobile(callsign)
+        return True
 
     async def _lifespan(self, receive: Any, send: Any) -> None:
         while True:
@@ -2234,7 +2436,7 @@ class Application:
         elif kind == "read":
             structured = self._rpc_read_tool(caller, name, arguments)
         else:
-            structured = self._rpc_readonly(name)
+            structured = self._rpc_readonly(name, arguments)
         after = arguments.get("after_event_seq")
         cursor_hint = after if isinstance(after, int) and not isinstance(after, bool) and after >= 0 else 0
         if isinstance(structured, dict) and structured.get("needs_continuation") and isinstance(structured.get("interaction_id"), str):
@@ -2267,9 +2469,13 @@ class Application:
                 or max_result_bytes < 16384
             ):
                 return {"success": False, "status": "invalid_result_budget", "needs_continuation": False}
-            payload = {"tool": name, **dict(arguments)}
+            callsign = arguments.get("callsign")
+            if callsign is not None and not isinstance(callsign, str):
+                return {"success": False, "status": "invalid_request", "needs_continuation": False}
+            payload = {"tool": name, **{k: v for k, v in dict(arguments).items() if k != "callsign"}}
             result = self.lifecycle.create(
-                caller, request_id, payload, self._invited_desktop_id(), self._mobile_eligible(),
+                caller, request_id, payload, self._invited_desktop_id(callsign), self._mobile_eligible(callsign),
+                operator_callsign=callsign,
             )
         if result is None:
             result = {"success": False, "status": "session_not_found", "needs_continuation": False}
@@ -2331,10 +2537,28 @@ class Application:
             )
         raise _RpcError(-32602, "Invalid params")
 
-    def _rpc_readonly(self, name: str) -> dict[str, object]:
+    def _rpc_readonly(self, name: str, arguments: Mapping[str, object] | None = None) -> dict[str, object]:
+        if name == "list_operators":
+            listing = self.lifecycle.directory_view()
+            for entry in listing:
+                dnd = self.lifecycle.get_dnd(operator_id=str(entry["callsign"]))
+                entry["dnd"] = bool(dnd.get("enabled"))
+                entry["dnd_message"] = dnd.get("message", "")
+            return {"success": True, "status": "ok", "result": {"operators": listing}}
         if name == "get_operator_profile":
-            profile: dict[str, object] = {"operator_id": self.lifecycle._operator_id}
-            profile.update(self.lifecycle._operator_profile)
+            callsign = arguments.get("callsign") if isinstance(arguments, Mapping) else None
+            target = self.lifecycle.resolve_operator(callsign)
+            if target is None:
+                return {"success": False, "status": "unknown_callsign", "needs_continuation": False,
+                        "message": f"no operator with callsign {callsign!r}; call list_operators"}
+            entry = self.lifecycle._operators.get(target, {})
+            profile: dict[str, object] = {"operator_id": target, "callsign": target}
+            for field in ("display_name", "language", "timezone", "notes"):
+                if entry.get(field) is not None:
+                    profile[field] = entry[field]
+            if not any(k in profile for k in ("display_name", "language", "timezone", "notes")):
+                profile.update(self.lifecycle._operator_profile)
+            profile["primary"] = bool(entry.get("primary"))
             return {"success": True, "status": "ok", "result": profile}
         if name == "health_check":
             router = self._notification_router
@@ -2526,6 +2750,9 @@ class Application:
         cookie = self._cookie(headers, "operator_session")
         if cookie in self._logged_out:
             return None
+        signed = self._verify_operator_session_token(cookie)
+        if isinstance(signed, Mapping):
+            return str(signed["operator_id"]), str(signed["browser_session_id"]), str(signed["csrf_token"])
         authenticator = self._browser_cookie_authenticator
         authenticate = getattr(authenticator, "authenticate_cookie", None)
         result = authenticate(cookie) if callable(authenticate) else None
@@ -2733,20 +2960,29 @@ def create_app(*, database_path: str | Path, credentials: Mapping[str, str], clo
                mobile_html_renderer: Any | None = None,
                trusted_browser_origin: str | None = None,
                operator_id: str = "only-operator",
-                operator_profile: Mapping[str, object] | None = None,
+               operator_profile: Mapping[str, object] | None = None,
+               operator_directory: Mapping[str, Mapping[str, object]] | None = None,
+               operator_session_secret: bytes | None = None,
                max_attachment_bytes: int = 20 * 1024 * 1024,
                max_submission_bytes: int = 50 * 1024 * 1024,
                max_storage_bytes: int = 1024 * 1024 * 1024) -> Application:
     if deadline_tick_seconds <= 0 or notification_dispatch_tick_seconds <= 0 or terminal_disconnect_seconds <= 0:
         raise ValueError("scheduler tick seconds must be positive")
     return Application(
-        WaitingLifecycle(database_path, clock, notify, ring_timeout_seconds, agent_reconnect_seconds,
-                         terminal_disconnect_seconds, operator_id, operator_profile,
-                         max_attachment_bytes, max_submission_bytes, max_storage_bytes),
+        WaitingLifecycle(
+            database_path, clock, notify, ring_timeout_seconds, agent_reconnect_seconds,
+            terminal_disconnect_seconds,
+            operator_id=operator_id, operator_profile=operator_profile,
+            operator_directory=operator_directory,
+            max_attachment_bytes=max_attachment_bytes,
+            max_submission_bytes=max_submission_bytes,
+            max_storage_bytes=max_storage_bytes,
+        ),
         credentials,
         wait,
         deadline_tick_seconds,
         scheduler_sleep,
+        operator_session_secret,
         route_admission if route_admission is not None else (lambda: {"success": True, "status": "ready"}),
         notification_router,
         notification_dispatch_tick_seconds,

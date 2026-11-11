@@ -172,6 +172,8 @@ class CentralServiceConfig:
     operator_login_credentials: Mapping[str, str] = field(default_factory=dict)
     operator_id: str = "only-operator"
     operator_profile: Mapping[str, object] = field(default_factory=dict)
+    operator_directory: Mapping[str, Mapping[str, object]] = field(default_factory=dict)
+    operator_session_secret: bytes | None = None
     ring_timeout_seconds: float = 60
 
     @classmethod
@@ -301,6 +303,31 @@ class CentralServiceConfig:
         operator_profile = {str(k): v for k, v in raw_profile.items()
                             if isinstance(v, (str, int, float, bool))}
 
+        raw_operators = mapping.get("operators", {})
+        if not isinstance(raw_operators, Mapping):
+            raise ValueError("operators must be a mapping of callsign to operator entry")
+        operator_directory: dict[str, dict[str, object]] = {}
+        for callsign, raw_entry in raw_operators.items():
+            if not isinstance(callsign, str) or not callsign.strip() or not isinstance(raw_entry, Mapping):
+                raise ValueError("operators entries must be callsign -> mapping")
+            entry: dict[str, object] = {}
+            for field_name in ("password", "display_name", "language", "timezone", "notes"):
+                value = raw_entry.get(field_name)
+                if isinstance(value, str):
+                    entry[field_name] = value
+            devices = raw_entry.get("desktop_devices")
+            if isinstance(devices, list):
+                entry["devices"] = [str(d) for d in devices if isinstance(d, str)]
+            if isinstance(raw_entry.get("mobile"), bool):
+                entry["mobile"] = raw_entry["mobile"]
+            if isinstance(raw_entry.get("primary"), bool):
+                entry["primary"] = raw_entry["primary"]
+            operator_directory[callsign.strip()] = entry
+        if operator_directory and not any(e.get("primary") for e in operator_directory.values()):
+            operator_directory[next(iter(operator_directory))]["primary"] = True
+        raw_secret = mapping.get("operator_session_secret")
+        operator_session_secret = raw_secret.encode() if isinstance(raw_secret, str) and raw_secret else None
+
         return cls(
             listen_host=listen_host,
             listen_port=port,
@@ -318,6 +345,8 @@ class CentralServiceConfig:
             operator_login_credentials=operator_login_credentials,
             operator_id=operator_id,
             operator_profile=operator_profile,
+            operator_directory=operator_directory,
+            operator_session_secret=operator_session_secret,
             ring_timeout_seconds=ring_timeout_seconds,
         )
 
@@ -623,6 +652,8 @@ def create_lifecycle_app(
         trusted_browser_origin=config.web_base_url,
         operator_id=config.operator_id,
         operator_profile=dict(config.operator_profile),
+        operator_directory=dict(config.operator_directory) or None,
+        operator_session_secret=config.operator_session_secret,
         ring_timeout_seconds=config.ring_timeout_seconds,
     )
     lifecycle_holder["app"] = app
