@@ -2288,13 +2288,25 @@ class Application:
         needs = structured.get("needs_continuation")
         result = structured.get("result")
         if needs and iid and cid:
-            summary = f"{name}: {status}. Waiting for human response — call {name} again with interaction_id={iid}, call_id={cid}, after_event_seq=0, client_timeout_seconds=30 to poll."
+            # Advance the cursor past what this response already showed:
+            # draining from the last seen event_seq lets the next call return
+            # the *next* event instead of replaying the oldest one forever.
+            seq = structured.get("event_seq")
+            cursor = seq if isinstance(seq, int) and seq >= 0 else 0
+            summary = f"{name}: {status}. Waiting for human response — call {name} again with interaction_id={iid}, call_id={cid}, after_event_seq={cursor}, client_timeout_seconds=30 to poll."
             if result is not None:
                 summary += f" Partial result: {json.dumps(result, ensure_ascii=False)}"
             return summary
         if result is not None:
             return f"{name}: {status}. Result: {json.dumps(result, ensure_ascii=False)}"
-        return f"{name}: {status}"
+        detail = ""
+        reason = structured.get("reason")
+        message = structured.get("message")
+        if isinstance(reason, str) and reason:
+            detail = f" ({reason})"
+        if isinstance(message, str) and message:
+            detail += f": {message}"
+        return f"{name}: {status}{detail}"
 
     @staticmethod
     def _rpc_error(rid: object, code: int, message: str) -> dict[str, object]:
