@@ -38,6 +38,41 @@ class _RpcError(Exception):
         self.code, self.message = code, message
 
 
+_HUMAN_LOOP_MANUAL = """HITL MCP 操作手册（人机协作工具集）
+
+一、核心模型：一次调用即等待
+- 交互工具（get_user_input / get_number_input / get_user_choice / get_multiline_input / show_confirmation_dialog / show_info_message / get_feedback_from_user / assign_task_to_human）每调用一次即发起一轮"呼叫"，服务端会驻留等待接近 client_timeout_seconds（缺省 30，可按需传更长，如 300）。
+- 人在驻留期内接听并作答，同一次调用直接返回最终结果——不要轮询、不要并行另发呼叫。
+- 超时未决则返回 heartbeat，按下方续接协议再调一次即可。
+
+二、续接协议（关键）
+- 返回 needs_continuation=true（heartbeat / opened / in_progress）时：用同一工具立即重发，携带 interaction_id、call_id 与 after_event_seq = 你已见过的最大 event_seq（该响应未含事件则填 0）。
+- 游标只能前进：每次续接都更新到刚拿到的 event_seq，绝不重用旧值——否则会反复排到旧事件，永远等不到终局。
+- opened（人已接听）与 in_progress（人处理中，可含进度报告）都属"继续等待"，直接续接，勿另起新呼叫（会得到 busy）。
+
+三、终局判定（needs_continuation=false 即本轮结束）
+- answered：简单问答，答案在 result。
+- completed / failed：任务终报在 report；resubmittable=true 时可再发一轮修订后的 assign_task_to_human。
+- declined (human_declined)：本人拒绝该任务。勿立即原样重发；改计划或改任务再试。
+- declined (do_not_disturb)："留言"：勿扰开启。等待、绕行或礼貌收尾，不要连续重呼。
+- cancelled：本轮已取消（可能是你调用了 cancel_interaction）。
+- not_accepted (ring_timeout)：响铃期内无人接听。按 retry_after_seconds 等待后可重试，或改计划。
+- disconnected (terminal_disconnected)：接听后终端失联。按 retry_after_seconds 可重试。
+- unreachable (no_available_channel)：无可用通知渠道；可先 health_check 排查。
+- busy：唯一线路被占用（可能是你上一轮未终结的呼叫）。等 retry_after_seconds 再发。
+
+四、弃置守卫
+- 人接听后长时间只回心跳（accepted 持续多轮无进展）时，呼叫在终端存活期间不会自动超时。多轮无进展应调用 cancel_interaction（携带该轮 interaction_id/call_id）释放线路，并改计划。
+
+五、结果预算与分页
+- 发起呼叫可带 max_result_bytes（>=16384）。结果超预算时以 body_omitted_for_size 与 result_id 返回；用 read_interaction_result（cursor 翻页）和 read_interaction_attachment（offset_bytes 翻页）取回完整正文与附件，不要让人重发。
+
+六、调用纪律
+- 幂等由服务端按会话自动管理（MCP 会话 + 请求指纹），无需自备 request_id；网络闪断后原样重发同一调用即可安全重放。
+- 一个调用只做一件事：提问用 input/choice 类工具，派任务用 assign_task_to_human（task_description 为单条可执行指令），不要用任务工具提问。
+- 业务错误（missing_call_id / session_not_found / invalid_cursor 等）在 structuredContent 中返回；协议层错误为 JSON-RPC error。
+"""
+
 _MCP_TOOLS = (
     {"name": "get_user_input", "kind": "interaction",
      "description": "Request a single text or numeric answer from the operator.",
@@ -2117,6 +2152,7 @@ class Application:
             "protocolVersion": "2025-06-18",
             "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": {"name": "hitl-central-mcp", "version": "1.0.0"},
+            "instructions": _HUMAN_LOOP_MANUAL,
         }
 
     @staticmethod
@@ -2265,19 +2301,7 @@ class Application:
                 "bark": {"configured": bark_configured, "recent_outcome": recent_outcome},
             }
         if name == "get_human_loop_prompt":
-            return {
-                "success": True, "status": "ok",
-                "prompt": (
-                    "Human-in-the-Loop 协议指南：Agent 通过 tools/call 请求人参与。"
-                    "每个工具调用须携带 request_id 用于幂等重试（相同 request_id 与相同参数重放同一结果）。"
-                    "首次调用返回 interaction_id 与 call_id，后续续接必须同时携带 interaction_id、call_id 与 after_event_seq "
-                    "以按序读取事件（心跳不产生新事件）。返回体中的 needs_continuation 为 true 表示仍需用同一 interaction_id/call_id 续接等待，"
-                    "为 false 表示本轮已终结（answered/completed/failed/declined/not_accepted/busy/cancelled/disconnected 等）。"
-                    "可用 max_result_bytes 限制返回结果预算；超预算时结果以 body_omitted_for_size 与 result_id 返回，"
-                    "并可用 read_interaction_result/read_interaction_attachment 分页读取完整正文与附件。"
-                    "错误码如 invalid_request/method_not_found/invalid_params/missing_call_id/session_not_found 等与业务结果分开。"
-                ),
-            }
+            return {"success": True, "status": "ok", "prompt": _HUMAN_LOOP_MANUAL}
         raise _RpcError(-32602, "Invalid params")
 
     @staticmethod
