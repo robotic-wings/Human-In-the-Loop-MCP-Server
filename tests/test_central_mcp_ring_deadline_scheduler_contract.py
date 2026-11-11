@@ -130,7 +130,7 @@ def test_lifespan_timer_settles_ring_deadline_without_any_followup_request_or_re
             "retry_after_seconds": 60,
             "handled_on": None,
             "terminal_platform": None,
-            "message": "人类未接受通信，60 秒内无人接听，这不是主动拒绝，可以稍后重新呼叫。",
+            "message": "Nobody picked up within the ring window; not a refusal — retry later if you still need the human.",
         }
         assert notifications == [{"call_id": ringing["call_id"], "ring_deadline": 1_700_000_060.0, "title": "agent-a", "body": "Human-in-the-Loop request"}]
         await stop_lifespan(task, incoming, sent)

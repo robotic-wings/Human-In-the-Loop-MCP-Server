@@ -307,3 +307,38 @@ def test_mcp_session_scoped_request_ids(tmp_path: Path) -> None:
     b1_retry = sc(call(3, "same prompt", session="bbbb2222bbbb3333"))
     assert b1_retry["call_id"] == b1["call_id"], "same-session retry must replay"
     app.lifecycle.cancel("agent-a", "sess-cancel-b", b1["interaction_id"], b1["call_id"])
+
+
+def test_heartbeat_summary_never_resets_cursor(tmp_path: Path) -> None:
+    """Regression: heartbeat summaries must carry the caller's cursor forward.
+
+    The cursor used to fall back to 0 on heartbeats (no event_seq), so an
+    agent following the summary ping-ponged 0<->1 and never drained past
+    the accept event — human cancellation at seq 2 was invisible.
+    """
+    lifecycle_mod = _lifecycle_module()
+    app = lifecycle_mod.create_app(
+        database_path=tmp_path / "cursor.sqlite3",
+        credentials={"agent-a": "token-a"},
+        clock=lambda: 1_700_000_000.0,
+        notify=lambda _n: None,
+        wait=_noop_wait(),
+        ring_timeout_seconds=60,
+    )
+    lifecycle = app.lifecycle
+    created = lifecycle.create("agent-a", "r1", {"tool": "get_user_input", "prompt": "hi"})
+    iid, cid = created["interaction_id"], created["call_id"]
+    lifecycle._human_action(cid, "opened", "accepted", None,
+                            {"handled_on": "desktop", "human_action": True})
+
+    # Agent followed guidance: after=1 (accept event seen), drains → heartbeat
+    heartbeat = lifecycle.continue_call("agent-a", "c-hb", iid, cid, 1)
+    assert heartbeat["status"] == "heartbeat" and heartbeat["call_state"] == "accepted"
+    summary = app._rpc_summary("get_user_input", heartbeat, cursor_hint=1)
+    assert "after_event_seq=1" in summary, summary
+    assert "after_event_seq=0" not in summary, summary
+
+    # The round ends (seq 2): the next drain with the preserved cursor MUST see it
+    lifecycle.cancel("agent-a", "cancel-r1", iid, cid)
+    outcome = lifecycle.continue_call("agent-a", "c-after-cancel", iid, cid, 1)
+    assert outcome["status"] == "cancelled"

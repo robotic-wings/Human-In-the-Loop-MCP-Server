@@ -103,7 +103,7 @@ def test_definitive_all_channel_failure_is_one_durable_unreachable_event_and_rel
     ]
 
     result = continuation(app, ringing, "read-unreachable")
-    assert result == {"success": True, "status": "unreachable", "call_state": "unreachable", "reason": "no_available_channel", "human_action": False, "retryable": False, "handled_on": None, "terminal_platform": None, "message": "所有启用的通知渠道均不可用。", "event_seq": 1, "needs_continuation": False, "interaction_id": ringing["interaction_id"], "call_id": ringing["call_id"]}
+    assert result == {"success": True, "status": "unreachable", "call_state": "unreachable", "reason": "no_available_channel", "human_action": False, "retryable": False, "handled_on": None, "terminal_platform": None, "message": "The human could not be reached on any channel.", "event_seq": 1, "needs_continuation": False, "interaction_id": ringing["interaction_id"], "call_id": ringing["call_id"]}
     # The same operation is an immutable replay, and terminal delivery frees
     # the sole operator slot without a second notification for the old call.
     assert continuation(app, ringing, "read-unreachable") == result

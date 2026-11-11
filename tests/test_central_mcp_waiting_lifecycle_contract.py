@@ -251,7 +251,7 @@ def test_ring_timeout_is_absolute_persisted_and_recovered_without_reringing(tmp_
         "retry_after_seconds": 60,
         "handled_on": None,
         "terminal_platform": None,
-        "message": "人类未接受通信，60 秒内无人接听，这不是主动拒绝，可以稍后重新呼叫。",
+        "message": "Nobody picked up within the ring window; not a refusal — retry later if you still need the human.",
     }
     assert len(notifications) == 1
     assert restarted_notifications == []

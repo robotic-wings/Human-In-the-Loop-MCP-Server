@@ -112,7 +112,7 @@ def expected_disconnected(call: dict[str, object]) -> dict[str, object]:
         "retry_after_seconds": 30,
         "handled_on": None,
         "terminal_platform": None,
-        "message": "调用方已失联，通信已结束。",
+        "message": "The calling agent went away; the round ended.",
     }
 
 

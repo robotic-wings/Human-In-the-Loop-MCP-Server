@@ -92,7 +92,7 @@ def expected_cancelled(call: dict[str, object], event_seq: int) -> dict[str, obj
         "retryable": False,
         "handled_on": None,
         "terminal_platform": None,
-        "message": "调用方已取消本次通信。",
+        "message": "The round was cancelled by the caller.",
     }
 
 
@@ -190,6 +190,6 @@ def test_deadline_is_settled_before_late_agent_cancellation(tmp_path: Path) -> N
         "retry_after_seconds": 60,
         "handled_on": None,
         "terminal_platform": None,
-        "message": "人类未接受通信，60 秒内无人接听，这不是主动拒绝，可以稍后重新呼叫。",
+        "message": "Nobody picked up within the ring window; not a refusal — retry later if you still need the human.",
     }
     assert len(notifications) == 1

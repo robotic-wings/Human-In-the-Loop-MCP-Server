@@ -167,7 +167,7 @@ def test_tools_list_includes_get_number_input_with_complete_schema(tmp_path: Pat
 
     properties = schema.get("properties")
     assert isinstance(properties, dict), "inputSchema must declare a properties map"
-    assert properties.get("prompt") == {"type": "string"}
+    assert isinstance(properties.get("prompt"), dict) and properties["prompt"].get("type") == "string"
     assert properties.get("required") == {"type": "boolean"}
 
 

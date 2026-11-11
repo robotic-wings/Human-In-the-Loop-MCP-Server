@@ -46,8 +46,9 @@ _HUMAN_LOOP_MANUAL = """HITL MCP Operating Manual (human-in-the-loop toolset)
 - If it returns a heartbeat, follow the continuation protocol below and call once more.
 
 2. Continuation protocol (critical)
-- When a response has needs_continuation=true (heartbeat / opened / in_progress): immediately re-call the SAME tool with interaction_id, call_id, and after_event_seq = the largest event_seq you have seen (0 if the response carried no event).
-- The cursor must only advance: update it to the event_seq from each response and never reuse an old value — a stale cursor re-drains old events forever and you will never reach the outcome.
+- When a response has needs_continuation=true (heartbeat / opened / in_progress): re-call the SAME tool with interaction_id, call_id, and after_event_seq = next_after_event_seq from that response (it is the machine-readable cursor; plain heartbeats repeat your current value).
+- The cursor only moves forward: whenever a response contains an event_seq, adopt it; when it is a plain heartbeat (no event), keep your current value exactly. Resetting to an old value re-drains old events forever and hides later ones (accept, progress, cancel) from you.
+- Each call already parks server-side for nearly client_timeout_seconds, so there is no need to re-call quickly; and while a round is open (needs_continuation=true) never report the task as done, failed, or abandoned — either keep waiting or end it explicitly with cancel_interaction.
 - opened (human accepted) and in_progress (human working, may carry progress reports) both mean "keep waiting": continue the round. Do NOT start a new call (it returns busy).
 
 3. Terminal outcomes (needs_continuation=false ends the round)
@@ -73,71 +74,107 @@ _HUMAN_LOOP_MANUAL = """HITL MCP Operating Manual (human-in-the-loop toolset)
 - Business errors (missing_call_id / session_not_found / invalid_cursor, ...) arrive in structuredContent; protocol errors arrive as JSON-RPC errors.
 """
 
+def _interactive_schema(properties: Mapping[str, object]) -> dict[str, object]:
+    """Interactive-tool schema: specific fields first, then shared round fields."""
+    common: dict[str, object] = {
+        "client_timeout_seconds": {
+            "type": "integer",
+            "description": "How long this single call parks server-side waiting for the human "
+                           "(default 30; use a larger value such as 300 if the human may be away). "
+                           "If the human answers within the window, this same call returns their final answer.",
+        },
+        "interaction_id": {
+            "type": "string",
+            "description": "Continuation: the interaction_id from the previous response of this round.",
+        },
+        "call_id": {
+            "type": "string",
+            "description": "Continuation: the call_id from the previous response (pass together with interaction_id).",
+        },
+        "after_event_seq": {
+            "type": "integer",
+            "description": "Continuation cursor: echo next_after_event_seq from the previous response. "
+                           "Keep it unchanged while responses are plain heartbeats.",
+        },
+        "max_result_bytes": {
+            "type": "integer",
+            "description": "Result body budget in bytes (minimum 16384). Oversized bodies are omitted "
+                           "and served by read_interaction_result instead.",
+        },
+    }
+    return {"type": "object", "properties": {**properties, **common}}
+
+
 _MCP_TOOLS = (
     {"name": "get_user_input", "kind": "interaction",
-     "description": "Request a single text or numeric answer from the operator.",
-     "inputSchema": {"type": "object", "properties": {
-         "prompt": {"type": "string"}, "required": {"type": "boolean"},
-         "interaction_id": {"type": "string"}, "call_id": {"type": "string"},
-         "after_event_seq": {"type": "integer"}, "max_result_bytes": {"type": "integer"}}}},
+     "description": "Ask the operator one short question and WAIT: the call parks server-side for up to "
+                    "client_timeout_seconds and returns the operator's answer in this same call. "
+                    "Read get_human_loop_prompt before your first interactive call.",
+     "inputSchema": _interactive_schema({
+         "prompt": {"type": "string", "description": "The question shown to the operator."},
+         "required": {"type": "boolean", "description": "Whether an answer is mandatory."}})},
     {"name": "get_number_input", "kind": "interaction",
-     "description": "Request a numeric answer from the operator.",
-     "inputSchema": {"type": "object", "properties": {
-         "prompt": {"type": "string"}, "required": {"type": "boolean"},
-         "interaction_id": {"type": "string"}, "call_id": {"type": "string"},
-         "after_event_seq": {"type": "integer"}, "max_result_bytes": {"type": "integer"}}}},
+     "description": "Ask the operator for a number and WAIT: the call parks server-side and returns the "
+                    "answer in this same call. Read get_human_loop_prompt before first use.",
+     "inputSchema": _interactive_schema({
+         "prompt": {"type": "string", "description": "The question shown to the operator."},
+         "required": {"type": "boolean"}})},
     {"name": "get_user_choice", "kind": "interaction",
-     "description": "Ask the operator to choose one or more options.",
-     "inputSchema": {"type": "object", "properties": {
-         "choices": {"type": "array"}, "prompt": {"type": "string"},
-         "multiple": {"type": "boolean"}, "interaction_id": {"type": "string"},
-         "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}, "max_result_bytes": {"type": "integer"}}}},
+     "description": "Offer the operator a set of options and WAIT: the call parks server-side and returns "
+                    "their selection in this same call. Read get_human_loop_prompt before first use.",
+     "inputSchema": _interactive_schema({
+         "choices": {"type": "array", "description": "The options to choose from."},
+         "prompt": {"type": "string"},
+         "multiple": {"type": "boolean", "description": "Allow selecting more than one option."}})},
     {"name": "get_multiline_input", "kind": "interaction",
-     "description": "Request a free-form multi-line answer from the operator.",
-     "inputSchema": {"type": "object", "properties": {
-         "prompt": {"type": "string"}, "interaction_id": {"type": "string"},
-         "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}, "max_result_bytes": {"type": "integer"}}}},
+     "description": "Ask the operator for a long free-form answer and WAIT: the call parks server-side "
+                    "and returns the answer in this same call.",
+     "inputSchema": _interactive_schema({
+         "prompt": {"type": "string"}})},
     {"name": "show_confirmation_dialog", "kind": "interaction",
-     "description": "Ask the operator to confirm or deny a proposal.",
-     "inputSchema": {"type": "object", "properties": {
-         "prompt": {"type": "string"}, "interaction_id": {"type": "string"},
-         "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}, "max_result_bytes": {"type": "integer"}}}},
+     "description": "Ask the operator to confirm or deny one proposal and WAIT: the call parks "
+                    "server-side and returns their decision in this same call.",
+     "inputSchema": _interactive_schema({
+         "prompt": {"type": "string", "description": "The proposal to confirm."}})},
     {"name": "show_info_message", "kind": "interaction",
-     "description": "Present information and require the operator to acknowledge it.",
-     "inputSchema": {"type": "object", "properties": {
-         "message": {"type": "string"}, "interaction_id": {"type": "string"},
-         "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}, "max_result_bytes": {"type": "integer"}}}},
+     "description": "Show the operator one message and WAIT for their acknowledgement.",
+     "inputSchema": _interactive_schema({
+         "message": {"type": "string"}})},
     {"name": "get_feedback_from_user", "kind": "interaction",
-     "description": "Request unstructured feedback from the operator.",
-     "inputSchema": {"type": "object", "properties": {
-         "prompt": {"type": "string"}, "interaction_id": {"type": "string"},
-         "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}, "max_result_bytes": {"type": "integer"}}}},
+     "description": "Collect free-form feedback from the operator and WAIT: the call parks server-side "
+                    "and returns the feedback in this same call.",
+     "inputSchema": _interactive_schema({
+         "prompt": {"type": "string"}})},
     {"name": "assign_task_to_human", "kind": "interaction",
-     "description": "Assign a task for the operator to perform and report on.",
-     "inputSchema": {"type": "object", "properties": {
-         "task_description": {"type": "string"}, "interaction_id": {"type": "string"},
-         "call_id": {"type": "string"}, "after_event_seq": {"type": "integer"}, "max_result_bytes": {"type": "integer"}}}},
+     "description": "Hand the operator one physical/real-world task and WAIT: the call parks server-side; "
+                    "the operator accepts, executes, and reports back, and this same call returns their "
+                    "final report. Use for doing, not for asking questions.",
+     "inputSchema": _interactive_schema({
+         "task_description": {"type": "string", "description": "One actionable instruction for the operator."}})},
     {"name": "read_interaction_result", "kind": "read",
-     "description": "Read the full body and attachment list of a saved result.",
+     "description": "Read the full body of a saved result (pagination via cursor) when a response came "
+                    "back with body_omitted_for_size.",
      "inputSchema": {"type": "object", "properties": {
          "interaction_id": {"type": "string"}, "result_id": {"type": "string"},
          "cursor": {"type": "string"}, "max_result_bytes": {"type": "integer"}}}},
     {"name": "read_interaction_attachment", "kind": "read",
-     "description": "Read a byte chunk of a saved attachment.",
+     "description": "Read one byte chunk of a saved attachment (pagination via offset_bytes).",
      "inputSchema": {"type": "object", "properties": {
          "interaction_id": {"type": "string"}, "attachment_id": {"type": "string"},
          "offset_bytes": {"type": "integer"}, "max_result_bytes": {"type": "integer"}}}},
     {"name": "get_operator_profile", "kind": "readonly",
-     "description": "Read the operator profile without requesting human action.",
+     "description": "Read the operator profile: who the human is and how to address them.",
      "inputSchema": {"type": "object"}},
     {"name": "health_check", "kind": "readonly",
-     "description": "Report central service health without requesting human action.",
+     "description": "Report HITL service health (storage, desktop online, push channels).",
      "inputSchema": {"type": "object"}},
     {"name": "get_human_loop_prompt", "kind": "readonly",
-     "description": "Return the human-in-the-loop protocol guidance.",
+     "description": "Return the HITL operating manual (wait model, continuation cursor, outcomes). "
+                    "Call this before your first interactive tool call.",
      "inputSchema": {"type": "object"}},
     {"name": "cancel_interaction", "kind": "control",
-     "description": "Cancel an existing call round.",
+     "description": "End one open round (yours or the human's) to release the single line, e.g. when the "
+                    "human accepted but has stalled for many rounds.",
      "inputSchema": {"type": "object", "properties": {
          "interaction_id": {"type": "string"}, "call_id": {"type": "string"}}}},
 )
@@ -1547,11 +1584,11 @@ class WaitingLifecycle:
         retryable = reason in {"ring_timeout", "terminal_disconnected", "agent_disconnected"}
         retry_after = 60 if reason == "ring_timeout" else (30 if retryable else None)
         messages = {
-            "ring_timeout": "人类未接受通信，60 秒内无人接听，这不是主动拒绝，可以稍后重新呼叫。",
-            "terminal_disconnected": "接听端已失联，通信已结束。",
-            "agent_disconnected": "调用方已失联，通信已结束。",
-            "no_available_channel": "所有启用的通知渠道均不可用。",
-            "agent_cancelled": "调用方已取消本次通信。",
+            "ring_timeout": "Nobody picked up within the ring window; not a refusal — retry later if you still need the human.",
+            "terminal_disconnected": "The human's terminal went away; the round ended.",
+            "agent_disconnected": "The calling agent went away; the round ended.",
+            "no_available_channel": "The human could not be reached on any channel.",
+            "agent_cancelled": "The round was cancelled by the caller.",
         }
         result: dict[str, object] = {
             "success": True, "status": state, "call_state": state, "reason": reason,
@@ -1678,7 +1715,13 @@ class Application:
                     )
                     if isinstance(outcome, dict) and outcome.get("status") != "heartbeat":
                         result["result"]["structuredContent"] = outcome
-                        result["result"]["content"] = [{"type": "text", "text": self._rpc_summary(str(params.get("name", "")), outcome)}]
+                        after_arg = args.get("after_event_seq")
+                        hint = after_arg if isinstance(after_arg, int) and not isinstance(after_arg, bool) and after_arg >= 0 else 0
+                        if isinstance(outcome, dict) and outcome.get("needs_continuation") and isinstance(outcome.get("interaction_id"), str):
+                            eseq = outcome.get("event_seq")
+                            outcome = dict(outcome)
+                            outcome["next_after_event_seq"] = eseq if isinstance(eseq, int) and eseq >= 0 else hint
+                        result["result"]["content"] = [{"type": "text", "text": self._rpc_summary(str(params.get("name", "")), outcome, hint)}]
             headers: list[tuple[bytes, bytes]] | None = None
             if isinstance(body, Mapping) and body.get("method") == "initialize" and session_token is None:
                 headers = [(b"mcp-session-id", uuid.uuid4().hex.encode("ascii"))]
@@ -2190,8 +2233,14 @@ class Application:
             structured = self._rpc_read_tool(caller, name, arguments)
         else:
             structured = self._rpc_readonly(name)
+        after = arguments.get("after_event_seq")
+        cursor_hint = after if isinstance(after, int) and not isinstance(after, bool) and after >= 0 else 0
+        if isinstance(structured, dict) and structured.get("needs_continuation") and isinstance(structured.get("interaction_id"), str):
+            seq = structured.get("event_seq")
+            structured = dict(structured)
+            structured["next_after_event_seq"] = seq if isinstance(seq, int) and seq >= 0 else cursor_hint
         return {
-            "content": [{"type": "text", "text": self._rpc_summary(name, structured)}],
+            "content": [{"type": "text", "text": self._rpc_summary(name, structured, cursor_hint)}],
             "isError": False,
             "structuredContent": structured,
         }
@@ -2305,19 +2354,36 @@ class Application:
         raise _RpcError(-32602, "Invalid params")
 
     @staticmethod
-    def _rpc_summary(name: str, structured: Mapping[str, object]) -> str:
+    def _rpc_summary(name: str, structured: Mapping[str, object], cursor_hint: int = 0) -> str:
         status = structured.get("status", structured.get("call_state", "ok"))
         iid = structured.get("interaction_id")
         cid = structured.get("call_id")
         needs = structured.get("needs_continuation")
         result = structured.get("result")
         if needs and iid and cid:
-            # Advance the cursor past what this response already showed:
-            # draining from the last seen event_seq lets the next call return
-            # the *next* event instead of replaying the oldest one forever.
+            # Cursor rule: a response that carries an event advances the
+            # cursor to that event_seq; a heartbeat (no new event) keeps the
+            # cursor the caller already used.  Never fall back to 0 — a
+            # reset re-drains the oldest event forever and hides every later
+            # one (accept, progress, cancel) from the agent.
+            nxt = structured.get("next_after_event_seq")
             seq = structured.get("event_seq")
-            cursor = seq if isinstance(seq, int) and seq >= 0 else 0
-            summary = f"{name}: {status}. Waiting for human response — call {name} again with interaction_id={iid}, call_id={cid}, after_event_seq={cursor}, client_timeout_seconds=30 to poll."
+            cursor = (nxt if isinstance(nxt, int) and nxt >= 0
+                      else seq if isinstance(seq, int) and seq >= 0
+                      else max(0, cursor_hint))
+            state = structured.get("call_state")
+            if status == "opened" or state == "accepted":
+                meaning = "The human ACCEPTED this task and is working on it."
+            elif status == "in_progress" or state == "in_progress":
+                meaning = "The human is still working (progress report included)." if result is not None else "The human is still working."
+            else:
+                meaning = "The human has not picked up yet. The task is NOT done and NOT failed."
+            summary = (
+                f"{name}: still waiting ({status}). {meaning} "
+                f"Keep waiting: call {name} again with interaction_id={iid}, call_id={cid}, "
+                f"after_event_seq={cursor} (keep exactly this value until a response contains a new event_seq), "
+                f"client_timeout_seconds=30. Each call already waits server-side; do not re-call immediately and do not conclude the task while it is still open."
+            )
             if result is not None:
                 summary += f" Partial result: {json.dumps(result, ensure_ascii=False)}"
             return summary
@@ -2330,6 +2396,17 @@ class Application:
             detail = f" ({reason})"
         if isinstance(message, str) and message:
             detail += f": {message}"
+        if structured.get("success") is False:
+            guidance = {
+                "busy": f"another call holds the single line; wait {structured.get('retry_after_seconds', 30)}s and call again",
+                "invalid_cursor": "after_event_seq is past the event history; call again with the newest event_seq you received, or 0",
+                "session_not_found": "unknown or expired round; start a fresh call without continuation ids",
+                "missing_call_id": "pass interaction_id and call_id together, or omit both to start a new round",
+                "request_conflict": "this request was already recorded with different arguments; retry unchanged or start fresh",
+                "expired": "the round already ended; start a fresh call",
+            }.get(str(status))
+            if guidance:
+                detail += f" — {guidance}"
         return f"{name}: {status}{detail}"
 
     @staticmethod
