@@ -84,8 +84,8 @@ def components(tmp_path: Path, *, route_mode: str = "desktop") -> tuple[Any, Fak
     _register(registry, "desktop-owner", gui_ready=False)
     registration = DesktopRegistrationStateService(
         registry=registry, clock=clock,
-        registered_credentials={
-            "desktop-secret": {"device_id": "desktop-owner", "terminal_platform": "windows"},
+        operator_directory={
+            "desktop-owner": {"password": "desktop-secret", "devices": ["desktop-owner"], "primary": True},
         }, device_state=lambda _device: [],
     )
 
@@ -113,6 +113,7 @@ def components(tmp_path: Path, *, route_mode: str = "desktop") -> tuple[Any, Fak
         database_path=lifecycle_path, credentials={"agent-a": "agent-secret"},
         clock=clock, notify=router.enqueue, wait=no_wait, route_admission=router.validate_route,
         notification_router=router, desktop_registration_service=registration,
+        operator_directory={"desktop-owner": {"password": "desktop-secret", "devices": ["desktop-owner"], "primary": True}},
     )
     return app, clock
 

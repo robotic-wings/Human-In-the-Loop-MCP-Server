@@ -59,9 +59,7 @@ class DesktopTerminalClient:
             self._online = False
             return {"success": False, "status": "gui_unavailable"}
         try:
-            authenticated = self._central.authenticate_desktop(
-                str(self._config.get("terminal_credential", ""))
-            )
+            authenticated = self._central.authenticate_desktop()
         except (ConnectionError, OSError):
             return self._central_lost()
         if not authenticated.get("success") or not isinstance(authenticated.get("session_id"), str):
@@ -203,10 +201,14 @@ class DesktopTerminalConfig:
     """Configuration owned by the independently installed terminal process."""
 
     central_url: str
-    terminal_credential: str
+    callsign: str
+    operator_password: str
+    device_id: str
     callback_credential: str
     listener_host: str
     listener_port: int
+    terminal_platform: str = "macos"
+    terminal_credential: str = ""  # legacy device secret; unused in operator login
     listener_scheme: str = "http"
     listener_tls_cert_file: str | None = None
     listener_tls_key_file: str | None = None
@@ -229,7 +231,7 @@ class DesktopTerminalConfig:
         normalized = dict(value)
         if "listener_host" not in normalized and isinstance(normalized.get("listener_address"), str):
             normalized["listener_host"] = normalized["listener_address"]
-        required = ("central_url", "terminal_credential", "callback_credential", "listener_host", "listener_port")
+        required = ("central_url", "callsign", "operator_password", "device_id", "callback_credential", "listener_host", "listener_port")
         missing = [name for name in required if not normalized.get(name)]
         if missing:
             raise ValueError(f"missing desktop terminal configuration: {', '.join(missing)}")
@@ -248,7 +250,7 @@ class DesktopTerminalConfig:
         verify_tls = normalized.get("verify_tls", True)
         if not isinstance(verify_tls, (bool, str)):
             raise ValueError("verify_tls must be true, false, or a CA bundle path")
-        if normalized["terminal_credential"] == normalized["callback_credential"]:
+        if normalized.get("terminal_credential") and normalized["terminal_credential"] == normalized["callback_credential"]:
             raise ValueError("callback_credential must differ from terminal_credential")
         ringtone_path = normalized.get("ringtone_path", "ringtone.mp3")
         if not isinstance(ringtone_path, str) or not ringtone_path:
@@ -263,8 +265,12 @@ class DesktopTerminalConfig:
         session_store = normalized.get("session_store_path")
         session_store_path = session_store if isinstance(session_store, str) and session_store else None
         return cls(
-            central_url=central_url.rstrip("/"), terminal_credential=str(normalized["terminal_credential"]),
+            central_url=central_url.rstrip("/"),
             callback_credential=str(normalized["callback_credential"]), listener_host=str(normalized["listener_host"]),
+            callsign=str(normalized.get("callsign", "")),
+            operator_password=str(normalized.get("operator_password", "")),
+            device_id=str(normalized.get("device_id", "")),
+            terminal_platform=str(normalized.get("platform") or normalized.get("terminal_platform") or "macos"),
             listener_port=port, listener_scheme=str(scheme), verify_tls=verify_tls,
             listener_tls_cert_file=(str(normalized["listener_tls_cert_file"]) if normalized.get("listener_tls_cert_file") else None),
             listener_tls_key_file=(str(normalized["listener_tls_key_file"]) if normalized.get("listener_tls_key_file") else None),
@@ -358,8 +364,12 @@ def build_settings_panel(root: Any, ring: Any, central: Any, ringtones_dir: str,
     if callable(set_short) and short_value:
         set_short(os.path.join(ringtones_dir, short_value))
 
+    callsign = getattr(central, "operator", None) or getattr(getattr(central, "_config", object()), "callsign", "") or ""
+    tk.Label(root, text=f"呼号：{callsign}" if callsign else "呼号：—", anchor="w",
+             font=("TkDefaultFont", 11, "bold")).pack(fill="x", padx=12, pady=(12, 0))
+
     notify = tk.LabelFrame(root, text="通知", padx=10, pady=8)
-    notify.pack(fill="x", padx=12, pady=(12, 8))
+    notify.pack(fill="x", padx=12, pady=(6, 8))
     tk.Label(notify, text="铃声").grid(row=0, column=0, sticky="w", pady=2)
     tk.OptionMenu(notify, ringtone_var, *mp3s).grid(row=0, column=1, sticky="w", padx=(8, 8), pady=2)
     preview_button = tk.Button(notify, text="测试播放")
@@ -478,13 +488,16 @@ class CentralHttpDesktopClient:
     def __init__(self, config: DesktopTerminalConfig) -> None:
         self._config, self._session_id = config, None
         self._states: dict[str, dict[str, object]] = {}
+        self.operator: str | None = getattr(self._config, "callsign", None) or None
 
     def _request(self, method: str, path: str, *, json_body: object | None = None) -> dict[str, object]:
         headers: dict[str, str] = {}
         if self._session_id:
             headers["x-terminal-session"] = self._session_id
         else:
-            headers["authorization"] = f"Terminal {self._config.terminal_credential}"
+            legacy = getattr(self._config, "terminal_credential", "")
+            if legacy:
+                headers["authorization"] = f"Terminal {legacy}"
         try:
             with httpx.Client(timeout=5.0, verify=self._config.verify_tls) as client:
                 response = client.request(method, self._config.central_url + path, json=json_body, headers=headers)
@@ -493,9 +506,7 @@ class CentralHttpDesktopClient:
             raise ConnectionError("central service is unreachable") from error
         return data if isinstance(data, dict) else {"success": False, "status": "invalid_response"}
 
-    def authenticate_desktop(self, credential: str) -> dict[str, object]:
-        if credential != self._config.terminal_credential:
-            return {"success": False, "status": "terminal_not_authenticated"}
+    def authenticate_desktop(self, credential: str | None = None) -> dict[str, object]:
         session_file = self._session_file()
         if session_file.exists():
             try:
@@ -506,7 +517,12 @@ class CentralHttpDesktopClient:
                 self._session_id = recovered
                 return {"success": True, "session_id": recovered}
         result = self._request("POST", "/api/terminals/register", json_body={
-            "endpoint": self._config.listener_endpoint, "gui_ready": True,
+            "callsign": self._config.callsign,
+            "password": self._config.operator_password,
+            "device_id": self._config.device_id,
+            "terminal_platform": self._config.terminal_platform,
+            "endpoint": (self._config.listener_endpoint() if callable(getattr(self._config, "listener_endpoint", None)) else getattr(self._config, "listener_endpoint", "")),
+            "gui_ready": True,
         })
         session = result.get("session_id")
         if result.get("success") and isinstance(session, str):
@@ -1064,7 +1080,7 @@ def main(argv: list[str] | None = None) -> None:
     short_state_file = str(Path(args.config).with_name("terminal-state.json"))
     short_ringtone_path = config.short_ringtone_path or load_short_ringtone(short_state_file)
     ring = RingtonePlayer(ringtone_path=config.ringtone_path, ringtone_alt_path=config.ringtone_alt_path, bell=root.bell, short_ringtone_path=short_ringtone_path)
-    client = DesktopTerminalClient(config={"terminal_credential": config.terminal_credential, "callback_credential": config.callback_credential}, central=central, listener=_TerminalListener(), gui_capability=lambda: True, ring=ring, presenter=presenter)
+    client = DesktopTerminalClient(config={"callsign": config.callsign, "operator_password": config.operator_password, "device_id": config.device_id, "terminal_credential": config.terminal_credential, "callback_credential": config.callback_credential}, central=central, listener=_TerminalListener(), gui_capability=lambda: True, ring=ring, presenter=presenter)
     holder["client"] = client
     build_settings_panel(root, ring, central, config.ringtones_dir, scan_ringtones(config.ringtones_dir), config.ringtone_path, tk, short_ringtone_path, short_state_file)
     if config.listener_scheme == "https" and (not config.listener_tls_cert_file or not config.listener_tls_key_file):

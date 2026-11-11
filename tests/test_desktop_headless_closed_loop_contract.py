@@ -139,6 +139,10 @@ def test_agent_receives_answer_submitted_by_headless_desktop_over_real_http(tmp_
     try:
         terminal_config = DesktopTerminalConfig(
             central_url=f"http://127.0.0.1:{central_port}",
+            callsign="desktop-61",
+            operator_password="desktop-secret",
+            device_id="desktop-61",
+            terminal_platform="windows",
             terminal_credential="desktop-secret",
             callback_credential="callback-secret",
             listener_host="127.0.0.1",

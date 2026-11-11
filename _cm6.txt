@@ -1,0 +1,10 @@
+Operator-identity login for desktop terminals
+
+The desktop terminal now logs in as its OPERATOR: registration
+carries callsign + operator password + device_id, and sessions
+know (device, platform, operator) directly. The server-side
+device-to-operator reverse mapping is gone: DND, quiet window and
+state responses derive from session identity. Device secrets
+(terminal_credential) are legacy and unused. Configs without an
+operators directory synthesise one per device credential for
+test compatibility. All 384 tests migrated.

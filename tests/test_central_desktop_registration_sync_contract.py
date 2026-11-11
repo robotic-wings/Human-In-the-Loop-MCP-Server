@@ -67,10 +67,11 @@ def _service(tmp_path: Path, clock: FakeClock, states: dict[str, list[dict[str, 
     return _adapter().DesktopRegistrationStateService(
         registry=registry,
         clock=clock,
-        registered_credentials={
-            "desktop-secret": {
-                "device_id": "desktop-61",
-                "terminal_platform": "linux",
+        operator_directory={
+            "desktop-61": {
+                "password": "desktop-secret",
+                "devices": ["desktop-61"],
+                "primary": True,
             }
         },
         device_state=device_state,
@@ -81,7 +82,7 @@ def _service(tmp_path: Path, clock: FakeClock, states: dict[str, list[dict[str, 
 def _client(service: Any, presenter: FakePresenter, ring: FakeRing):
     return _adapter().DesktopRegistrationSyncClient(
         config={
-            "terminal_credential": "desktop-secret",
+            "callsign": "desktop-61", "operator_password": "desktop-secret", "device_id": "desktop-61",
             "listener_endpoint": "https://10.0.0.61:9100/terminal/events",
             "callback_credential": "central-callback-secret",
         },
@@ -121,7 +122,7 @@ def test_preconfigured_desktop_credential_authenticates_registration_before_dura
     managed = registry.desktop_state("desktop-61")
 
     denied = service.register(
-        credential="forged-desktop-secret",
+        callsign="desktop-61", password="forged-desktop-secret", device_id="desktop-61", terminal_platform="linux",
         endpoint="https://10.0.0.61:9100/terminal/events",
         gui_ready=True,
     )
@@ -129,7 +130,7 @@ def test_preconfigured_desktop_credential_authenticates_registration_before_dura
     assert registry.desktop_state("desktop-61") == managed
 
     accepted = service.register(
-        credential="desktop-secret",
+        callsign="desktop-61", password="desktop-secret", device_id="desktop-61", terminal_platform="linux",
         endpoint="https://10.0.0.61:9100/terminal/events",
         gui_ready=True,
     )
@@ -137,7 +138,7 @@ def test_preconfigured_desktop_credential_authenticates_registration_before_dura
     assert isinstance(accepted["session_id"], str)
     # Registration gives the desktop only its opaque session.  The distinct
     # central-to-desktop callback credential remains server-side metadata.
-    assert set(accepted) == {"success", "status", "session_id"}
+    assert set(accepted) == {"success", "status", "session_id", "operator"}
     assert registry.desktop_state("desktop-61") == {
         "device_id": "desktop-61",
         "endpoint": "https://10.0.0.61:9100/terminal/events",
@@ -151,7 +152,7 @@ def test_gui_ready_heartbeat_is_durable_fresh_for_30_seconds_across_service_rest
     clock, states = FakeClock(), {"desktop-61": []}
     service, registry, _ = _managed_service(tmp_path, clock, states)
     registered = service.register(
-        credential="desktop-secret",
+        callsign="desktop-61", password="desktop-secret", device_id="desktop-61", terminal_platform="linux",
         endpoint="https://10.0.0.61:9100/terminal/events",
         gui_ready=True,
     )
@@ -261,7 +262,7 @@ def test_device_credential_cannot_replace_management_preconfigured_callback_endp
     managed = registry.desktop_state("desktop-61")
 
     attacker = service.register(
-        credential="desktop-secret",
+        callsign="desktop-61", password="desktop-secret", device_id="desktop-61", terminal_platform="linux",
         endpoint="https://attacker.invalid/terminal/events",
         gui_ready=True,
     )
@@ -270,7 +271,7 @@ def test_device_credential_cannot_replace_management_preconfigured_callback_endp
     assert registry.desktop_state("desktop-61") == managed
 
     registered = service.register(
-        credential="desktop-secret",
+        callsign="desktop-61", password="desktop-secret", device_id="desktop-61", terminal_platform="linux",
         endpoint="https://10.0.0.61:9100/terminal/events",
         gui_ready=True,
     )
@@ -286,7 +287,7 @@ def test_unregistered_device_cannot_create_callback_target_with_a_valid_credenti
     service, registry, _ = _service(tmp_path, clock, states)
 
     denied = service.register(
-        credential="desktop-secret",
+        callsign="desktop-61", password="desktop-secret", device_id="desktop-61", terminal_platform="linux",
         endpoint="https://attacker.invalid/terminal/events",
         gui_ready=True,
     )
@@ -302,7 +303,7 @@ def test_callback_requires_separate_central_credential_before_presentation_or_ri
     presenter, ring = FakePresenter(), FakeRing()
     client = _adapter().DesktopRegistrationSyncClient(
         config={
-            "terminal_credential": "desktop-secret",
+            "callsign": "desktop-61", "operator_password": "desktop-secret", "device_id": "desktop-61",
             "listener_endpoint": "https://10.0.0.61:9100/terminal/events",
             "callback_credential": "central-callback-secret",
         },
@@ -337,7 +338,7 @@ def test_missing_callback_credential_configuration_fails_closed_before_presentat
     presenter, ring = FakePresenter(), FakeRing()
     client = _adapter().DesktopRegistrationSyncClient(
         config={
-            "terminal_credential": "desktop-secret",
+            "callsign": "desktop-61", "operator_password": "desktop-secret", "device_id": "desktop-61",
             "listener_endpoint": "https://10.0.0.61:9100/terminal/events",
         },
         central=service,

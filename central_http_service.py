@@ -323,6 +323,18 @@ class CentralServiceConfig:
             if isinstance(raw_entry.get("primary"), bool):
                 entry["primary"] = raw_entry["primary"]
             operator_directory[callsign.strip()] = entry
+        if not operator_directory:
+            # No operators configured: synthesise one operator per legacy
+            # device credential (callsign = device_id) so device-only test
+            # and deployment configs keep a working login path.
+            operator_directory = {
+                str(meta["device_id"]): {
+                    "password": secret,
+                    "devices": [str(meta["device_id"])],
+                    "primary": index == 0,
+                }
+                for index, (secret, meta) in enumerate(sorted(desktop_credentials.items()))
+            }
         if operator_directory and not any(e.get("primary") for e in operator_directory.values()):
             operator_directory[next(iter(operator_directory))]["primary"] = True
         raw_secret = mapping.get("operator_session_secret")
@@ -632,7 +644,7 @@ def create_lifecycle_app(
     registration = DesktopRegistrationStateService(
         registry=registry,
         clock=clock,
-        registered_credentials=config.desktop_credentials,
+        operator_directory=config.operator_directory,
         device_state=lambda device_id: lifecycle_holder["app"].lifecycle.terminal_states(device_id),
     )
     app = create_lifecycle_asgi_app(

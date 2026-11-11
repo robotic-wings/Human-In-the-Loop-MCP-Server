@@ -18,6 +18,9 @@ from central_desktop_terminal import DesktopTerminalConfig
 
 BASE_CONFIG: dict[str, object] = {
     "central_url": "https://central.test",
+    "callsign": "desktop-61",
+    "operator_password": "desktop-secret",
+    "device_id": "desktop-61",
     "terminal_credential": "desktop-secret",
     "callback_credential": "callback-secret",
     "listener_host": "127.0.0.1",

@@ -67,7 +67,7 @@ def _components(tmp_path: Path, *, route_mode: str = "both") -> tuple[Any, Runti
     )
     registration = DesktopRegistrationStateService(
         registry=registry, clock=clock,
-        registered_credentials={"desktop-secret": {"device_id": "desktop-61", "terminal_platform": "windows"}},
+        operator_directory={"desktop-61": {"password": "desktop-secret", "devices": ["desktop-61"], "primary": True}},
         device_state=lambda _device: [],
     )
     state = RuntimeState(tmp_path, clock, registry, registration, CookieBrowserSessions({
@@ -251,7 +251,7 @@ def test_refresh_after_desktop_ownership_is_truthful_and_reconstruction_keeps_fo
     call = _create(app)
     async def desktop_accept() -> httpx.Response:
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://central.example.test") as client:
-            registered = await client.post("/api/terminals/register", headers={"authorization": "Terminal desktop-secret"}, json={"endpoint": "https://desktop.example.test:9100/terminal/events", "gui_ready": True})
+            registered = await client.post("/api/terminals/register", json={"callsign": "desktop-61", "password": "desktop-secret", "device_id": "desktop-61", "terminal_platform": "windows", "endpoint": "https://desktop.example.test:9100/terminal/events", "gui_ready": True})
             return await client.post(f"/api/calls/{call['call_id']}/accept", headers={"x-terminal-session": registered.json()["session_id"]}, json={"operation_id": "desktop"})
     assert asyncio.run(desktop_accept()).status_code == 200
     desktop_view = _request(app, "GET", f"/calls/{call['call_id']}", cookie="operator-cookie")
@@ -492,7 +492,7 @@ def test_mobile_accept_dispatches_accepted_callback_to_desktop(tmp_path: Path) -
         "bark_endpoint": "https://bark.example.test/push",
         "bark_credential": "bark-secret",
         "operator_sessions": {
-            "operator-cookie": {"operator_id": "only-operator", "browser_session_id": "browser-61", "csrf_token": "csrf-61"},
+            "operator-cookie": {"operator_id": "desktop-61", "browser_session_id": "browser-61", "csrf_token": "csrf-61"},
         },
         "operator_login_credentials": {"operator-login-secret": "operator-cookie"},
     })
@@ -506,7 +506,7 @@ def test_mobile_accept_dispatches_accepted_callback_to_desktop(tmp_path: Path) -
 
     async def register() -> httpx.Response:
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://central.example.test") as client:
-            return await client.post("/api/terminals/register", headers={"authorization": "Terminal desktop-secret"}, json={"endpoint": "https://desktop.example.test:9100/terminal/events", "gui_ready": True})
+            return await client.post("/api/terminals/register", json={"callsign": "desktop-61", "password": "desktop-secret", "device_id": "desktop-61", "terminal_platform": "windows", "endpoint": "https://desktop.example.test:9100/terminal/events", "gui_ready": True})
     assert asyncio.run(register()).status_code == 201
 
     call = _create(app, request_id="accepted-callback-call")

@@ -56,8 +56,8 @@ def components(tmp_path: Path, *, route_mode: str = "desktop") -> tuple[Any, Clo
     )
     registration = DesktopRegistrationStateService(
         registry=registry, clock=clock,
-        registered_credentials={
-            "desktop-secret": {"device_id": "desktop-owner", "terminal_platform": "windows"},
+        operator_directory={
+            "desktop-owner": {"password": "desktop-secret", "devices": ["desktop-owner"], "primary": True},
         }, device_state=lambda _device: [],
     )
 
@@ -133,8 +133,11 @@ def register_terminal(app: Any, credential: str = "desktop-secret") -> str:
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://central.test") as client:
             return await client.post(
                 "/api/terminals/register",
-                headers={"authorization": f"Terminal {credential}"},
-                json={"endpoint": "https://desktop.test/events", "gui_ready": True},
+                json={"callsign": f"desktop-other" if "other" in credential else "desktop-owner",
+                "password": credential,
+                "device_id": f"desktop-other" if "other" in credential else "desktop-owner",
+                "terminal_platform": "windows",
+                "endpoint": "https://desktop.test/events", "gui_ready": True},
             )
     response = asyncio.run(run())
     assert response.status_code == 201, response.text

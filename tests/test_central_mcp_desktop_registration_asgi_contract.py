@@ -51,8 +51,8 @@ def _components(tmp_path: Path) -> tuple[Any, DesktopRegistrationStateService, T
     service = DesktopRegistrationStateService(
         registry=registry,
         clock=clock,
-        registered_credentials={
-            "desktop-secret": {"device_id": "desktop-61", "terminal_platform": "windows"},
+        operator_directory={
+            "desktop-61": {"password": "desktop-secret", "devices": ["desktop-61"], "primary": True},
         },
         device_state=lambda device_id: [dict(state) for state in states.get(device_id, [])],
     )
@@ -99,8 +99,9 @@ def _register(app: Any) -> str:
         app,
         "POST",
         "/api/terminals/register",
-        authorization="Terminal desktop-secret",
-        body={"endpoint": "https://10.10.0.61:9100/terminal/events", "gui_ready": True},
+        body={"callsign": "desktop-61", "password": "desktop-secret", "device_id": "desktop-61",
+              "terminal_platform": "windows",
+              "endpoint": "https://10.10.0.61:9100/terminal/events", "gui_ready": True},
     )
     assert response.status_code == 201
     payload = response.json()
@@ -115,7 +116,9 @@ def test_lifecycle_asgi_composes_pre_registered_terminal_registration_without_ag
 ) -> None:
     app, _service, registry, _clock = _components(tmp_path)
     before = registry.desktop_state("desktop-61")
-    body = {"endpoint": "https://10.10.0.61:9100/terminal/events", "gui_ready": True}
+    body = {"callsign": "desktop-61", "password": "forged-secret", "device_id": "desktop-61",
+            "terminal_platform": "windows",
+            "endpoint": "https://10.10.0.61:9100/terminal/events", "gui_ready": True}
 
     denied = _request(
         app, "POST", "/api/terminals/register", authorization="Bearer agent-secret", body=body
@@ -156,6 +159,8 @@ def test_session_heartbeat_refreshes_registry_but_authoritative_state_read_does_
     assert state.status_code == 200
     assert state.json() == {
         "success": True,
+        "device_id": "desktop-61",
+        "operator": "desktop-61",
         "states": [{"call_id": "call-ringing", "call_state": "ringing", "version": 7}],
     }
     # State synchronization is read-only: it cannot revive an expired desktop

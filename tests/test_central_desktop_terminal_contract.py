@@ -35,8 +35,8 @@ class FakeCentral:
     actions: list[tuple[str, str, str, str]] = field(default_factory=list)
     states: dict[str, dict[str, object]] = field(default_factory=dict)
 
-    def authenticate_desktop(self, credential: str) -> dict[str, object]:
-        if not self.available or credential != "desktop-secret":
+    def authenticate_desktop(self, credential: str | None = None) -> dict[str, object]:
+        if not self.available:
             return {"success": False, "status": "terminal_not_authenticated"}
         self.issued_sessions += 1
         return {"success": True, "session_id": f"desktop-session-{self.issued_sessions}"}
@@ -111,6 +111,9 @@ def _client(
 ):
     config: dict[str, object] = {
         "central_url": "https://10.0.0.1:8443",
+        "callsign": "desktop-61",
+        "operator_password": "desktop-secret",
+        "device_id": "desktop-61",
         "terminal_credential": "desktop-secret",
         "listener_address": "10.0.0.61",
         "listener_port": 9100,
@@ -399,6 +402,9 @@ def test_desktop_public_semantics_are_platform_neutral_and_client_never_exposes_
 def test_desktop_config_has_short_ringtone_path_defaulting_empty() -> None:
     config = _module().DesktopTerminalConfig.from_mapping({
         "central_url": "https://10.0.0.1:8443",
+        "callsign": "desktop-61",
+        "operator_password": "desktop-secret",
+        "device_id": "desktop-61",
         "terminal_credential": "desktop-secret",
         "callback_credential": "callback-secret",
         "listener_host": "10.0.0.61",

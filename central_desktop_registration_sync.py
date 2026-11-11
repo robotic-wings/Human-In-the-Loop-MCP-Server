@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import uuid
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -10,30 +11,45 @@ from central_notification_router import TerminalRegistry
 
 
 class DesktopRegistrationStateService:
-    """Central-facing authentication and state-read boundary for one desktop."""
+    """Central-facing authentication and state-read boundary for one desktop.
+
+    A desktop terminal logs in as its OPERATOR: registration carries the
+    operator callsign and password (the human's identity), plus the device
+    it runs on.  Sessions therefore know both the device and the operator,
+    and every operator-scoped setting (DND, quiet window, busy line)
+    follows from the session identity instead of a server-side
+    device-to-operator reverse mapping.
+    """
 
     def __init__(
         self,
         *,
         registry: TerminalRegistry,
         clock: Callable[[], float],
-        registered_credentials: Mapping[str, Mapping[str, str]],
+        operator_directory: Mapping[str, Mapping[str, object]],
         device_state: Callable[[str], list[dict[str, object]]],
         audit: list[str] | None = None,
     ) -> None:
         self._registry = registry
         self._clock = clock
-        self._credentials = dict(registered_credentials)
+        self._directory = {str(c): dict(e) for c, e in operator_directory.items()}
         self._device_state = device_state
         self._audit = audit if audit is not None else []
-        self._sessions: dict[str, str] = {}
+        self._sessions: dict[str, tuple[str, str, str]] = {}
         self.actions: list[dict[str, object]] = []
 
-    def register(self, *, credential: str, endpoint: str, gui_ready: bool) -> dict[str, object]:
-        metadata = self._credentials.get(credential)
-        if metadata is None:
+    def register(self, *, callsign: str, password: str, device_id: str,
+                 terminal_platform: str, endpoint: str, gui_ready: bool) -> dict[str, object]:
+        entry = self._directory.get(callsign)
+        if entry is None:
             return {"success": False, "status": "terminal_not_authenticated"}
-        device_id = str(metadata["device_id"])
+        expected = entry.get("password")
+        if not isinstance(expected, str) or not hmac.compare_digest(password, expected):
+            return {"success": False, "status": "terminal_not_authenticated"}
+        devices = entry.get("devices")
+        owned = [str(d) for d in devices] if isinstance(devices, list) else []
+        if device_id not in owned:
+            return {"success": False, "status": "device_not_owned"}
         managed = self._registry.desktop_state(device_id)
         if managed is None or endpoint != managed["endpoint"]:
             return {"success": False, "status": "endpoint_not_preconfigured"}
@@ -46,27 +62,40 @@ class DesktopRegistrationStateService:
             gui_ready=gui_ready,
         )
         session_id = str(uuid.uuid4())
-        self._sessions[session_id] = device_id
+        self._sessions[session_id] = (device_id, terminal_platform or "unknown", callsign)
         self._audit.append(f"register:{device_id}")
         return {
             "success": True,
             "status": "registered",
             "session_id": session_id,
+            "operator": callsign,
         }
 
     def heartbeat(self, *, session_id: str, gui_ready: bool) -> dict[str, object]:
-        device_id = self._sessions.get(session_id)
-        if device_id is None:
+        context = self._sessions.get(session_id)
+        if context is None:
             return {"success": False, "status": "session_not_found"}
+        device_id, _platform, _operator = context
         state = self._registry.heartbeat(device_id, gui_ready)
         self._audit.append(f"heartbeat:{device_id}")
-        return {"success": True, **(state or {})}
+        return {"success": True, **({"fresh": bool(state["fresh"])} if isinstance(state, Mapping) and "fresh" in state else {})}
+
+    def desktop_state(self, *, session_id: str) -> dict[str, object]:
+        context = self._sessions.get(session_id)
+        if context is None:
+            return {"success": False, "status": "session_not_found"}
+        device_id, platform, operator = context
+        return {"success": True, "device_id": device_id,
+                "terminal_platform": platform, "operator": operator}
 
     def states(self, *, session_id: str) -> dict[str, object]:
-        device_id = self._sessions.get(session_id)
-        if device_id is None:
+        context = self._sessions.get(session_id)
+        if context is None:
             return {"success": False, "status": "session_not_found"}
-        return {"success": True, "states": self._device_state(device_id)}
+        device_id, _platform, operator = context
+        states = self._device_state(device_id)
+        return {"success": True, "device_id": device_id, "operator": operator,
+                "states": states}
 
 
 class DesktopRegistrationSyncClient:
@@ -82,11 +111,16 @@ class DesktopRegistrationSyncClient:
         self._versions: dict[str, int] = {}
 
     def start(self) -> dict[str, object]:
-        credential = self._config.get("terminal_credential")
+        callsign = self._config.get("callsign")
+        password = self._config.get("operator_password")
+        device_id = self._config.get("device_id")
         endpoint = self._config.get("listener_endpoint")
-        if not isinstance(credential, str) or not isinstance(endpoint, str):
+        if not all(isinstance(v, str) and v for v in (callsign, password, device_id, endpoint)):
             return {"success": False, "status": "invalid_config"}
-        registered = self._central.register(credential=credential, endpoint=endpoint, gui_ready=True)
+        registered = self._central.register(
+            callsign=callsign, password=password, device_id=device_id,
+            terminal_platform=str(self._config.get("terminal_platform", "unknown")),
+            endpoint=endpoint, gui_ready=True)
         if not registered.get("success"):
             return registered
         self._session_id = str(registered["session_id"])

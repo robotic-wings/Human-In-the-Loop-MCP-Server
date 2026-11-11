@@ -41,14 +41,15 @@ def components(tmp_path: Path, clock: Clock) -> Any:
     )
     registration = DesktopRegistrationStateService(
         registry=registry, clock=clock,
-        registered_credentials={
-            "desktop-secret": {"device_id": "desktop-owner", "terminal_platform": "windows"},
+        operator_directory={
+            "desktop-owner": {"password": "desktop-secret", "devices": ["desktop-owner"], "primary": True},
         }, device_state=lambda _device: [],
     )
     return create_app(
         database_path=tmp_path / "lifecycle.sqlite3", credentials={"agent-a": "agent-secret"},
         clock=clock, notify=lambda _event: None, wait=no_wait,
         desktop_registration_service=registration,
+        operator_directory={"desktop-owner": {"password": "desktop-secret", "devices": ["desktop-owner"], "primary": True}},
     )
 
 
@@ -65,6 +66,7 @@ def request(app: Any, method: str, path: str, *, body: dict[str, object] | None 
 
 def register_terminal(app: Any) -> str:
     response = request(app, "POST", "/api/terminals/register", body={
+        "callsign": "desktop-owner", "password": "desktop-secret", "device_id": "desktop-owner", "terminal_platform": "windows",
         "endpoint": "https://desktop.test/events", "gui_ready": True,
     }, authorization="Terminal desktop-secret")
     assert response.status_code == 201, response.text

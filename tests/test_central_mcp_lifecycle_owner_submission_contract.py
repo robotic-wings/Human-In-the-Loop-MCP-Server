@@ -57,9 +57,9 @@ def components(tmp_path: Path, *, clock: Clock | None = None, route_mode: str = 
     )
     registration = DesktopRegistrationStateService(
         registry=registry, clock=clock,
-        registered_credentials={
-            "desktop-secret": {"device_id": "desktop-owner", "terminal_platform": "windows"},
-            "other-desktop-secret": {"device_id": "desktop-other", "terminal_platform": "linux"},
+        operator_directory={
+        "desktop-owner": {"password": "desktop-secret", "devices": ["desktop-owner"], "primary": True},
+        "desktop-other": {"password": "other-desktop-secret", "devices": ["desktop-other"]},
         }, device_state=lambda _device: [],
     )
 
@@ -115,13 +115,17 @@ def terminal_session(app: Any, credential: str = "desktop-secret") -> str:
         if credential == "other-desktop-secret"
         else "https://desktop.test/events"
     )
+    device = "desktop-other" if credential == "other-desktop-secret" else "desktop-owner"
     response = request(app, "POST", "/api/terminals/register", body={
+        "callsign": device, "password": credential, "device_id": device, "terminal_platform": "windows",
         "endpoint": endpoint, "gui_ready": True,
     })
     if response.status_code != 201:
         async def register() -> httpx.Response:
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://central.test") as client:
-                return await client.post("/api/terminals/register", headers={"authorization": f"Terminal {credential}"}, json={
+                return await client.post("/api/terminals/register", json={
+                    "callsign": device, "password": credential, "device_id": device,
+                    "terminal_platform": "windows",
                     "endpoint": endpoint, "gui_ready": True,
                 })
         response = asyncio.run(register())

@@ -60,8 +60,8 @@ def components(tmp_path: Path, *, route_mode: str = "both") -> tuple[Any, Clock]
     )
     registration = DesktopRegistrationStateService(
         registry=registry, clock=clock,
-        registered_credentials={
-            "desktop-secret": {"device_id": "desktop-owner", "terminal_platform": "windows"},
+        operator_directory={
+            "desktop-owner": {"password": "desktop-secret", "devices": ["desktop-owner"], "primary": True},
         }, device_state=lambda _device: [],
     )
 
@@ -122,12 +122,14 @@ def create_choice(app: Any, *, request_id: str = "choice-create",
 
 def terminal_session(app: Any) -> str:
     response = request(app, "POST", "/api/terminals/register", body={
+        "callsign": "desktop-owner", "password": "desktop-secret", "device_id": "desktop-owner", "terminal_platform": "windows",
         "endpoint": "https://desktop.test/events", "gui_ready": True,
     })
     if response.status_code != 201:
         async def register() -> httpx.Response:
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://central.test") as client:
-                return await client.post("/api/terminals/register", headers={"authorization": "Terminal desktop-secret"}, json={
+                return await client.post("/api/terminals/register", json={
+                    "callsign": "desktop-owner", "password": "desktop-secret", "device_id": "desktop-owner", "terminal_platform": "windows",
                     "endpoint": "https://desktop.test/events", "gui_ready": True,
                 })
         response = asyncio.run(register())

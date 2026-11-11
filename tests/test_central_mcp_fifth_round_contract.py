@@ -70,7 +70,13 @@ def test_human_loop_prompt_covers_protocol_semantics(tmp_path: Path) -> None:
 def _config(session_store_path: str | None = None) -> DesktopTerminalConfig:
     return DesktopTerminalConfig(
         central_url="https://central.test",
-        terminal_credential="desktop-secret",
+        callsign="desktop-61",
+
+        operator_password="desktop-secret",
+
+        device_id="desktop-61",
+
+        terminal_platform="windows",
         callback_credential="callback-secret",
         listener_host="127.0.0.1",
         listener_port=9100,

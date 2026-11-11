@@ -54,9 +54,9 @@ def _components(tmp_path: Path, *, route_mode: str = "desktop") -> tuple[Any, Te
     service = DesktopRegistrationStateService(
         registry=registry,
         clock=clock,
-        registered_credentials={
-            "desktop-secret": {"device_id": "desktop-61", "terminal_platform": "windows"},
-            "desktop-62-secret": {"device_id": "desktop-62", "terminal_platform": "windows"},
+        operator_directory={
+        "desktop-61": {"password": "desktop-secret", "devices": ["desktop-61"], "primary": True},
+        "desktop-62": {"password": "desktop-62-secret", "devices": ["desktop-62"]},
         },
         device_state=lambda _device_id: [],
     )
@@ -134,8 +134,9 @@ def _register(app: Any, *, credential: str = "desktop-secret") -> str:
         app,
         "POST",
         "/api/terminals/register",
-        authorization=f"Terminal {credential}",
-        body={"endpoint": f"https://10.10.0.{device_suffix}:9100/terminal/events", "gui_ready": True},
+        body={"callsign": f"desktop-{device_suffix}", "password": credential,
+              "device_id": f"desktop-{device_suffix}", "terminal_platform": "windows",
+              "endpoint": f"https://10.10.0.{device_suffix}:9100/terminal/events", "gui_ready": True},
     )
     assert response.status_code == 201
     return str(response.json()["session_id"])

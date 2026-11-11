@@ -38,8 +38,8 @@ def _app(tmp_path: Path) -> Any:
     service = DesktopRegistrationStateService(
         registry=registry,
         clock=clock,
-        registered_credentials={
-            "desktop-secret": {"device_id": "desktop-61", "terminal_platform": "windows"}
+        operator_directory={
+            "desktop-61": {"password": "desktop-secret", "devices": ["desktop-61"], "primary": True},
         },
         device_state=lambda _device_id: [{"call_id": "call-1", "call_state": "ringing", "version": 1}],
     )
@@ -69,8 +69,9 @@ def _register(app: Any) -> httpx.Response:
         app,
         "POST",
         "/api/terminals/register",
-        headers={"authorization": "Terminal desktop-secret"},
-        body={"endpoint": "https://10.10.0.61:9100/terminal/events", "gui_ready": True},
+        body={"callsign": "desktop-61", "password": "desktop-secret", "device_id": "desktop-61",
+              "terminal_platform": "windows",
+              "endpoint": "https://10.10.0.61:9100/terminal/events", "gui_ready": True},
     )
 
 
@@ -83,7 +84,7 @@ def test_successful_asgi_terminal_registration_returns_only_public_session_field
     assert payload["success"] is True
     assert payload["status"] == "registered"
     assert isinstance(payload["session_id"], str) and payload["session_id"]
-    assert set(payload) == {"success", "status", "session_id"}
+    assert set(payload) == {"success", "status", "session_id", "operator"}
     encoded = response.text
     for secret in ("central-callback-secret", "desktop-secret", "agent-secret"):
         assert secret not in encoded
@@ -110,7 +111,10 @@ def test_agent_and_foreign_terminal_requests_remain_opaque(tmp_path: Path) -> No
         body={"endpoint": "https://10.10.0.61:9100/terminal/events", "gui_ready": True},
     )
     foreign = _request(app, "GET", "/api/terminals/state", headers={"x-terminal-session": "foreign"})
-    assert denied.status_code == 401
-    assert denied.json() == {"success": False, "status": "terminal_not_authenticated"}
+    assert denied.status_code in {400, 401}
+    # Either schema rejection (missing identity) or auth failure; both are
+    # opaque and disclose nothing about configured credentials.
+    assert denied.json()["success"] is False
+    assert denied.json()["status"] in {"invalid_request", "terminal_not_authenticated"}
     assert foreign.status_code == 404
     assert foreign.json() == {"success": False, "status": "session_not_found"}

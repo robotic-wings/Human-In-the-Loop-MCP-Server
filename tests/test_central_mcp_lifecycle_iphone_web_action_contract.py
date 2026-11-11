@@ -56,7 +56,7 @@ def _components(tmp_path: Path, *, route_mode: str = "both") -> tuple[Any, Brows
     )
     registration = DesktopRegistrationStateService(
         registry=registry, clock=clock,
-        registered_credentials={"desktop-secret": {"device_id": "desktop-61", "terminal_platform": "windows"}},
+        operator_directory={"desktop-61": {"password": "desktop-secret", "devices": ["desktop-61"], "primary": True}},
         device_state=lambda _device_id: [],
     )
     lifecycle_path = tmp_path / "lifecycle.sqlite3"
@@ -105,7 +105,7 @@ def _restart_components(tmp_path: Path, *, clock: FakeClock, route_mode: str) ->
     registry = TerminalRegistry(database_path=tmp_path / "registry.sqlite3", clock=clock)
     registration = DesktopRegistrationStateService(
         registry=registry, clock=clock,
-        registered_credentials={"desktop-secret": {"device_id": "desktop-61", "terminal_platform": "windows"}},
+        operator_directory={"desktop-61": {"password": "desktop-secret", "devices": ["desktop-61"], "primary": True}},
         device_state=lambda _device_id: [],
     )
     lifecycle_path = tmp_path / "lifecycle.sqlite3"
@@ -165,13 +165,15 @@ def _create(app: Any, request_id: str = "create") -> dict[str, object]:
 
 def _desktop_session(app: Any) -> str:
     response = _request(app, "POST", "/api/terminals/register", body={
+        "callsign": "desktop-61", "password": "desktop-secret", "device_id": "desktop-61", "terminal_platform": "windows",
         "endpoint": "https://10.10.0.61:9100/terminal/events", "gui_ready": True,
     }, bearer=None)
     # The registration API deliberately uses a distinct Terminal credential.
     if response.status_code != 201:
         async def run() -> httpx.Response:
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://central.example.test") as client:
-                return await client.post("/api/terminals/register", headers={"authorization": "Terminal desktop-secret"}, json={
+                return await client.post("/api/terminals/register", json={
+                    "callsign": "desktop-61", "password": "desktop-secret", "device_id": "desktop-61", "terminal_platform": "windows",
                     "endpoint": "https://10.10.0.61:9100/terminal/events", "gui_ready": True,
                 })
         response = asyncio.run(run())

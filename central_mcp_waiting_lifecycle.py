@@ -1859,13 +1859,19 @@ class Application:
             await self._send(send, 404, self._error("not_found")); return
         if method == "POST" and path == "/api/terminals/register":
             body = await self._body(receive)
-            credential = self._terminal_credential(headers)
-            if body is None or credential is None:
-                await self._send(send, 401, self._terminal_error("terminal_not_authenticated")); return
-            endpoint, gui_ready = body.get("endpoint"), body.get("gui_ready")
-            if not isinstance(endpoint, str) or not isinstance(gui_ready, bool):
+            if body is None:
                 await self._send(send, 400, self._error("invalid_request")); return
-            response = service.register(credential=credential, endpoint=endpoint, gui_ready=gui_ready)
+            callsign = body.get("callsign")
+            password = body.get("password")
+            device_id = body.get("device_id")
+            platform = body.get("terminal_platform", "unknown")
+            endpoint, gui_ready = body.get("endpoint"), body.get("gui_ready")
+            if (not isinstance(callsign, str) or not callsign or not isinstance(password, str)
+                    or not isinstance(device_id, str) or not isinstance(endpoint, str)
+                    or not isinstance(gui_ready, bool) or not isinstance(platform, str)):
+                await self._send(send, 400, self._error("invalid_request")); return
+            response = service.register(callsign=callsign, password=password, device_id=device_id,
+                                         terminal_platform=platform, endpoint=endpoint, gui_ready=gui_ready)
             await self._send(send, 201 if response.get("success") else 401, response); return
         if path not in {"/api/terminals/heartbeat", "/api/terminals/state", "/api/terminals/dnd", "/api/terminals/quiet"}:
             await self._send(send, 404, self._error("not_found")); return
@@ -1882,7 +1888,7 @@ class Application:
             response = service.states(session_id=session)
             context = self._terminal_context(session)
             if response.get("success") and context is not None:
-                device_id, _platform = context
+                device_id, _platform, _operator = context
                 central_states = self.lifecycle.terminal_states(device_id)
                 if central_states:
                     reported = response.get("states")
@@ -1893,12 +1899,14 @@ class Application:
                     }
                     merged.update({str(item["call_id"]): item for item in central_states})
                     response = {**response, "states": [merged[key] for key in sorted(merged)]}
+                if context is not None:
+                    response = {**response, "operator": context[2]}
         elif method == "POST" and path == "/api/terminals/dnd":
             session = self._terminal_session(headers)
             context = self._terminal_context(session) if session is not None else None
             if context is None:
                 await self._send(send, 401, self._terminal_error("session_not_found")); return
-            device_op = self.lifecycle.operator_for_device(context[0])
+            session_operator = context[2]
             body = await self._body(receive)
             dnd = body.get("dnd") if body is not None else None
             message = body.get("message") if body is not None else ""
@@ -1906,20 +1914,20 @@ class Application:
                 await self._send(send, 400, self._error("invalid_request")); return
             if not isinstance(message, str):
                 message = ""
-            response = self.lifecycle.set_dnd(dnd, message, operator_id=device_op)
+            response = self.lifecycle.set_dnd(dnd, message, operator_id=session_operator)
         elif method == "GET" and path == "/api/terminals/dnd":
             session = self._terminal_session(headers)
             context = self._terminal_context(session) if session is not None else None
             if context is None:
                 await self._send(send, 401, self._terminal_error("session_not_found")); return
-            device_op = self.lifecycle.operator_for_device(context[0])
-            response = self.lifecycle.get_dnd(operator_id=device_op)
+            session_operator = context[2]
+            response = self.lifecycle.get_dnd(operator_id=session_operator)
         elif method == "POST" and path == "/api/terminals/quiet":
             session = self._terminal_session(headers)
             context = self._terminal_context(session) if session is not None else None
             if context is None:
                 await self._send(send, 401, self._terminal_error("session_not_found")); return
-            device_op = self.lifecycle.operator_for_device(context[0])
+            session_operator = context[2]
             body = await self._body(receive)
             quiet_window_seconds = body.get("quiet_window_seconds") if body is not None else None
             quiet_mode = body.get("quiet_mode") if body is not None else None
@@ -1927,14 +1935,14 @@ class Application:
                 await self._send(send, 400, self._error("invalid_request")); return
             if quiet_mode not in {"short", "silent"}:
                 await self._send(send, 400, self._error("invalid_request")); return
-            response = self.lifecycle.set_quiet_window(quiet_window_seconds, quiet_mode, operator_id=device_op)
+            response = self.lifecycle.set_quiet_window(quiet_window_seconds, quiet_mode, operator_id=session_operator)
         elif method == "GET" and path == "/api/terminals/quiet":
             session = self._terminal_session(headers)
             context = self._terminal_context(session) if session is not None else None
             if context is None:
                 await self._send(send, 401, self._terminal_error("session_not_found")); return
-            device_op = self.lifecycle.operator_for_device(context[0])
-            response = self.lifecycle.get_quiet_window(operator_id=device_op)
+            session_operator = context[2]
+            response = self.lifecycle.get_quiet_window(operator_id=session_operator)
         else:
             await self._send(send, 404, self._error("not_found")); return
         await self._send(send, self._action_status(response), response)
@@ -1955,7 +1963,7 @@ class Application:
             context = self._terminal_context(session) if session is not None else None
             if context is None:
                 await self._send(send, 401, self._terminal_error("session_not_found")); return
-            device_id, _platform = context
+            device_id, _platform, _operator = context
             body = await self._body(receive)
             draft_version = body.get("draft_version") if body is not None else None
             content = body.get("content") if body is not None else None
@@ -1974,7 +1982,7 @@ class Application:
         context = self._terminal_context(session) if session is not None else None
         if context is None:
             await self._send(send, 401, self._terminal_error("session_not_found")); return
-        device_id, platform = context
+        device_id, platform, _operator = context
         if parts[4] == "heartbeat":
             await self._body(receive)
             response = self.lifecycle.terminal_heartbeat(call_id=parts[3], session_id=session)
@@ -2284,21 +2292,19 @@ class Application:
             view["display_state"] = "handled_on_desktop_complete"
         return view
 
-    def _terminal_context(self, session_id: str | None) -> tuple[str, str] | None:
+    def _terminal_context(self, session_id: str | None) -> tuple[str, str, str] | None:
+        """Session identity: (device_id, terminal_platform, operator_callsign)."""
         service = self._desktop_registration_service
         if service is None or not isinstance(session_id, str):
             return None
         sessions = getattr(service, "_sessions", None)
-        credentials = getattr(service, "_credentials", None)
-        if not isinstance(sessions, Mapping) or not isinstance(credentials, Mapping):
+        if not isinstance(sessions, Mapping):
             return None
-        device_id = sessions.get(session_id)
-        if not isinstance(device_id, str):
-            return None
-        for metadata in credentials.values():
-            if isinstance(metadata, Mapping) and metadata.get("device_id") == device_id:
-                platform = metadata.get("terminal_platform")
-                return device_id, str(platform) if isinstance(platform, str) else "unknown"
+        context = sessions.get(session_id)
+        if isinstance(context, tuple) and len(context) == 3:
+            return context  # device_id, platform, operator
+        if isinstance(context, str):
+            return context, "unknown", self.lifecycle._primary_operator
         return None
 
     def _invited_desktop_id(self, callsign: str | None = None) -> str | None:
@@ -2968,6 +2974,10 @@ def create_app(*, database_path: str | Path, credentials: Mapping[str, str], clo
                max_storage_bytes: int = 1024 * 1024 * 1024) -> Application:
     if deadline_tick_seconds <= 0 or notification_dispatch_tick_seconds <= 0 or terminal_disconnect_seconds <= 0:
         raise ValueError("scheduler tick seconds must be positive")
+    if operator_directory and operator_id == "only-operator":
+        primaries = [c for c, e in operator_directory.items() if isinstance(e, Mapping) and e.get("primary")]
+        if primaries:
+            operator_id = str(primaries[0])
     return Application(
         WaitingLifecycle(
             database_path, clock, notify, ring_timeout_seconds, agent_reconnect_seconds,

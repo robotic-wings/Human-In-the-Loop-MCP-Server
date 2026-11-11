@@ -49,9 +49,9 @@ def _components(tmp_path: Path, *, route_mode: str = "desktop", clock: FakeClock
     service = DesktopRegistrationStateService(
         registry=registry,
         clock=clock,
-        registered_credentials={
-            "desktop-61-secret": {"device_id": "desktop-61", "terminal_platform": "windows"},
-            "desktop-62-secret": {"device_id": "desktop-62", "terminal_platform": "windows"},
+        operator_directory={
+        "desktop-61": {"password": "desktop-61-secret", "devices": ["desktop-61"], "primary": True},
+        "desktop-62": {"password": "desktop-62-secret", "devices": ["desktop-62"]},
         },
         device_state=lambda _device_id: [],
     )
@@ -102,8 +102,10 @@ def _request(app: Any, method: str, path: str, *, body: dict[str, object] | None
 
 def _register(app: Any, suffix: str = "61") -> str:
     registered = _request(
-        app, "POST", "/api/terminals/register", authorization=f"Terminal desktop-{suffix}-secret",
-        body={"endpoint": f"https://10.10.0.{suffix}:9100/terminal/events", "gui_ready": True},
+        app, "POST", "/api/terminals/register",
+        body={"callsign": f"desktop-{suffix}", "password": f"desktop-{suffix}-secret",
+              "device_id": f"desktop-{suffix}", "terminal_platform": "windows",
+              "endpoint": f"https://10.10.0.{suffix}:9100/terminal/events", "gui_ready": True},
     )
     assert registered.status_code == 201
     return str(registered.json()["session_id"])

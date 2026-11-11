@@ -31,7 +31,7 @@ async def no_wait(_: float) -> None:
 class BrowserVerifier:
     def verify(self, token: str | None) -> dict[str, str] | None:
         if token == "operator-session":
-            return {"operator_id": "only-operator", "browser_session_id": "browser-1"}
+            return {"operator_id": "desktop-1", "browser_session_id": "browser-1"}
         return None
 
 

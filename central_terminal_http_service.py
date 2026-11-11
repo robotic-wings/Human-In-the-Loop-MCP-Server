@@ -87,11 +87,15 @@ def _dispatch_desktop_registration(
     if path == "/api/terminals/register" and method == "POST":
         if not _is_gui_ready_body(body, include_endpoint=True):
             return 400, {"success": False, "status": "invalid_request"}
-        credential = _terminal_credential(headers)
-        if credential is None:
-            return 401, {"success": False, "status": "terminal_not_authenticated"}
+        callsign = body.get("callsign") if isinstance(body, dict) else None
+        password = body.get("password") if isinstance(body, dict) else None
+        device_id = body.get("device_id") if isinstance(body, dict) else None
+        platform = body.get("terminal_platform", "unknown") if isinstance(body, dict) else "unknown"
+        if not all(isinstance(v, str) and v for v in (callsign, password, device_id)):
+            return 400, {"success": False, "status": "invalid_request"}
         result = service.register(
-            credential=credential, endpoint=str(body["endpoint"]), gui_ready=bool(body["gui_ready"])
+            callsign=callsign, password=password, device_id=device_id,
+            terminal_platform=str(platform), endpoint=str(body["endpoint"]), gui_ready=bool(body["gui_ready"])
         )
         if not result.get("success"):
             return _registration_failure(result)
@@ -121,9 +125,11 @@ def _terminal_credential(headers: dict[str, str]) -> str | None:
 
 def _is_gui_ready_body(body: dict[str, Any] | None, *, include_endpoint: bool) -> bool:
     required = {"endpoint", "gui_ready"} if include_endpoint else {"gui_ready"}
+    allowed = required | {"callsign", "password", "device_id", "terminal_platform"}
     return (
         isinstance(body, dict)
-        and set(body) == required
+        and set(body) <= allowed
+        and set(body) >= required
         and isinstance(body.get("gui_ready"), bool)
         and (not include_endpoint or isinstance(body.get("endpoint"), str))
     )

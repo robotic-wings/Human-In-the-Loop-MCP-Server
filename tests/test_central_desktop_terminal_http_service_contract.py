@@ -49,8 +49,8 @@ def _registration_service(tmp_path: Path, clock: FakeClock):
     service = DesktopRegistrationStateService(
         registry=registry,
         clock=clock,
-        registered_credentials={
-            "desktop-secret": {"device_id": "desktop-61", "terminal_platform": "windows"},
+        operator_directory={
+            "desktop-61": {"password": "desktop-secret", "devices": ["desktop-61"], "primary": True},
         },
         device_state=lambda device_id: [dict(item) for item in states.get(device_id, [])],
     )
@@ -98,8 +98,9 @@ def _register(app: Any, *, credential: str = "desktop-secret") -> str:
         app,
         "POST",
         "/api/terminals/register",
-        credential=credential,
-        body={"endpoint": "https://10.10.0.61:9100/terminal/events", "gui_ready": True},
+        body={"callsign": "desktop-61", "password": credential, "device_id": "desktop-61",
+              "terminal_platform": "windows",
+              "endpoint": "https://10.10.0.61:9100/terminal/events", "gui_ready": True},
     )
     assert response.status_code == 201
     payload = response.json()
@@ -124,8 +125,11 @@ def test_terminal_register_requires_terminal_credential_and_preconfigured_endpoi
     before = registry.desktop_state("desktop-61")
     body = {"endpoint": "https://10.10.0.61:9100/terminal/events", "gui_ready": True}
 
-    for credential in (None, "agent-secret", "forged-secret"):
-        response = _request(app, "POST", "/api/terminals/register", credential=credential, body=body)
+    for password in ("agent-secret", "forged-secret"):
+        register_body = {"callsign": "desktop-61", "password": password, "device_id": "desktop-61",
+                         "terminal_platform": "windows",
+                         "endpoint": "https://10.10.0.61:9100/terminal/events", "gui_ready": True}
+        response = _request(app, "POST", "/api/terminals/register", body=register_body)
         assert response.status_code == 401
         assert response.json() == {"success": False, "status": "terminal_not_authenticated"}
         assert registry.desktop_state("desktop-61") == before
@@ -134,8 +138,9 @@ def test_terminal_register_requires_terminal_credential_and_preconfigured_endpoi
         app,
         "POST",
         "/api/terminals/register",
-        credential="desktop-secret",
-        body={"endpoint": "https://attacker.invalid/events", "gui_ready": True},
+        body={"callsign": "desktop-61", "password": "desktop-secret", "device_id": "desktop-61",
+              "terminal_platform": "windows",
+              "endpoint": "https://attacker.invalid/events", "gui_ready": True},
     )
     assert mismatch.status_code == 404
     assert mismatch.json() == {"success": False, "status": "endpoint_not_preconfigured"}
@@ -153,7 +158,7 @@ def test_unregistered_device_denial_is_non_disclosing_and_never_creates_endpoint
     service = DesktopRegistrationStateService(
         registry=registry,
         clock=clock,
-        registered_credentials={"unknown-desktop-secret": {"device_id": "unknown-desktop"}},
+        operator_directory={"unknown-desktop": {"password": "unknown-desktop-secret", "devices": ["unknown-desktop"], "primary": True}},
         device_state=lambda _: [],
     )
     app = _app(service)
@@ -162,8 +167,9 @@ def test_unregistered_device_denial_is_non_disclosing_and_never_creates_endpoint
         app,
         "POST",
         "/api/terminals/register",
-        credential="unknown-desktop-secret",
-        body={"endpoint": "https://attacker.invalid/events", "gui_ready": True},
+        body={"callsign": "unknown-desktop", "password": "unknown-desktop-secret",
+              "device_id": "unknown-desktop", "terminal_platform": "windows",
+              "endpoint": "https://attacker.invalid/events", "gui_ready": True},
     )
     assert response.status_code == 404
     assert response.json() == {"success": False, "status": "endpoint_not_preconfigured"}
@@ -187,6 +193,8 @@ def test_heartbeat_then_authoritative_state_read_are_session_bound_inert_and_ver
     assert state.status_code == 200
     assert state.json() == {
         "success": True,
+        "device_id": "desktop-61",
+        "operator": "desktop-61",
         "states": [{"call_id": "call-ringing", "call_state": "ringing", "version": 7}],
     }
     # A state read cannot refresh the device lease; only the heartbeat above can.

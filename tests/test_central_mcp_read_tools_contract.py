@@ -45,8 +45,8 @@ def components(tmp_path: Path) -> tuple[Any, Clock]:
     )
     registration = DesktopRegistrationStateService(
         registry=registry, clock=clock,
-        registered_credentials={
-            "desktop-secret": {"device_id": "desktop-owner", "terminal_platform": "windows"},
+        operator_directory={
+            "desktop-owner": {"password": "desktop-secret", "devices": ["desktop-owner"], "primary": True},
         }, device_state=lambda _device: [],
     )
 
@@ -72,6 +72,7 @@ def components(tmp_path: Path) -> tuple[Any, Clock]:
         database_path=lifecycle_path, credentials={"agent-a": "agent-secret", "agent-b": "agent-b-secret"},
         clock=clock, notify=router.enqueue, wait=no_wait, route_admission=router.validate_route,
         notification_router=router, desktop_registration_service=registration,
+        operator_directory={"desktop-owner": {"password": "desktop-secret", "devices": ["desktop-owner"], "primary": True}},
     )
     return app, clock
 
@@ -118,12 +119,14 @@ def create_task(app: Any, request_id: str = "task-create") -> dict[str, object]:
 
 def terminal_session(app: Any) -> str:
     response = request(app, "POST", "/api/terminals/register", body={
+        "callsign": "desktop-owner", "password": "desktop-secret", "device_id": "desktop-owner", "terminal_platform": "windows",
         "endpoint": "https://desktop.test/events", "gui_ready": True,
     })
     if response.status_code != 201:
         async def register() -> httpx.Response:
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://central.test") as client:
-                return await client.post("/api/terminals/register", headers={"authorization": "Terminal desktop-secret"}, json={
+                return await client.post("/api/terminals/register", json={
+                    "callsign": "desktop-owner", "password": "desktop-secret", "device_id": "desktop-owner", "terminal_platform": "windows",
                     "endpoint": "https://desktop.test/events", "gui_ready": True,
                 })
         response = asyncio.run(register())

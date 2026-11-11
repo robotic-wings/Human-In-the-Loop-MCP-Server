@@ -46,8 +46,8 @@ def components(tmp_path: Path, clock: Clock) -> tuple[Any, list[dict[str, object
     )
     registration = DesktopRegistrationStateService(
         registry=registry, clock=clock,
-        registered_credentials={
-            "desktop-secret": {"device_id": "desktop-owner", "terminal_platform": "windows"},
+        operator_directory={
+            "desktop-owner": {"password": "desktop-secret", "devices": ["desktop-owner"], "primary": True},
         }, device_state=lambda _device: [],
     )
     notifications: list[dict[str, object]] = []
@@ -55,6 +55,7 @@ def components(tmp_path: Path, clock: Clock) -> tuple[Any, list[dict[str, object
         database_path=tmp_path / "lifecycle.sqlite3", credentials={"agent-a": "agent-secret"},
         clock=clock, notify=notifications.append, wait=no_wait,
         desktop_registration_service=registration,
+        operator_directory={"desktop-owner": {"password": "desktop-secret", "devices": ["desktop-owner"], "primary": True}},
     )
     return app, notifications
 
@@ -74,6 +75,7 @@ def request(app: Any, method: str, path: str, *, body: dict[str, object] | None 
 
 def register_terminal(app: Any) -> str:
     response = request(app, "POST", "/api/terminals/register", body={
+        "callsign": "desktop-owner", "password": "desktop-secret", "device_id": "desktop-owner", "terminal_platform": "windows",
         "endpoint": "https://desktop.test/events", "gui_ready": True,
     }, authorization="Terminal desktop-secret")
     assert response.status_code == 201, response.text

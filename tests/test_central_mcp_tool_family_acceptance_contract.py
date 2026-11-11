@@ -92,8 +92,7 @@ def _register_terminal(base_url: str) -> str:
     with httpx.Client(base_url=base_url, timeout=8) as client:
         response = client.post(
             "/api/terminals/register",
-            headers={"authorization": "Terminal desktop-secret"},
-            json={"endpoint": "http://127.0.0.1:9100/terminal/events", "gui_ready": True},
+            json={"callsign": "desktop-61", "password": "desktop-secret", "device_id": "desktop-61", "terminal_platform": "windows", "endpoint": "http://127.0.0.1:9100/terminal/events", "gui_ready": True},
         )
     assert response.status_code == 201, response.text
     return str(response.json()["session_id"])
