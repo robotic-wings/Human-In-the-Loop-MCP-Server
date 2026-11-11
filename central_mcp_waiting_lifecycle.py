@@ -52,23 +52,23 @@ _HUMAN_LOOP_MANUAL = """HITL MCP Operating Manual (human-in-the-loop toolset)
 
 3. Terminal outcomes (needs_continuation=false ends the round)
 - answered: simple answer, in result.
-- completed / failed: task final report in report; when resubmittable=true you may issue a fresh assign_task_to_human with a revised task_description.
+- completed / failed: task final report in report; when resubmittable=true you may issue a fresh assign_task_to_human with a revised task_description. When feedback_requested=true, call get_feedback_from_user to collect the human's note.
 - declined (human_declined): the human refused THIS task. Do not reissue it unchanged; re-plan or reword.
 - declined (do_not_disturb): "message" — DND is on. Wait, route around it, or wind down politely; do not re-ring repeatedly.
 - cancelled: the round was cancelled (possibly by your own cancel_interaction).
 - not_accepted (ring_timeout): nobody picked up within the ring window. Retry after retry_after_seconds, or re-plan.
 - disconnected (terminal_disconnected): the human accepted but their terminal went away. Retryable after retry_after_seconds.
-- unreachable (no_available_channel): no notification channel is available; check health_check first.
+- unreachable (no_available_channel): the human could not be reached on any channel; check health_check before retrying.
 - busy: the single line is occupied (possibly by your own unfinished round). Wait retry_after_seconds and call again.
 
 4. Abandonment guard
-- If the human accepted but only heartbeats return for many rounds (accepted with no progress), the call will NOT expire on its own while their terminal is alive. After several stalled rounds, call cancel_interaction with that round's interaction_id/call_id to release the line, then re-plan.
+- If the human accepted but only heartbeats return for many rounds (accepted with no progress), the round will NOT end on its own. After several stalled rounds, call cancel_interaction with that round's interaction_id/call_id to release the line, then re-plan.
 
 5. Result budget and pagination
 - Pass max_result_bytes (>=16384) when creating a call. Oversized results come back with body_omitted_for_size and a result_id; fetch the full body with read_interaction_result (paginate via cursor) and attachments with read_interaction_attachment (paginate via offset_bytes). Never ask the human to resend what the server already holds.
 
 6. Call discipline
-- Idempotency is managed server-side (MCP session + request fingerprint); you need no request_id. After a network drop, re-sending the same call safely replays.
+- Retries are safe: re-sending the same call after a network drop replays its recorded outcome instead of duplicating work. You need no request_id.
 - One call, one thing: ask with input/choice tools, delegate with assign_task_to_human (task_description = a single actionable instruction). Never ask questions through the task tool.
 - Business errors (missing_call_id / session_not_found / invalid_cursor, ...) arrive in structuredContent; protocol errors arrive as JSON-RPC errors.
 """
