@@ -342,3 +342,28 @@ def test_heartbeat_summary_never_resets_cursor(tmp_path: Path) -> None:
     lifecycle.cancel("agent-a", "cancel-r1", iid, cid)
     outcome = lifecycle.continue_call("agent-a", "c-after-cancel", iid, cid, 1)
     assert outcome["status"] == "cancelled"
+
+
+def test_asgi_body_is_assembled_across_chunks(tmp_path: Path) -> None:
+    """Regression: request bodies above one ASGI chunk must not truncate.
+
+    A 21MB attachment upload used to reset the connection because _body
+    read only the first http.request event; any payload over one chunk
+    (normal photos included) hit this.
+    """
+    import asyncio
+    lifecycle_mod = _lifecycle_module()
+
+    async def plan() -> None:
+        events = [
+            {"type": "http.request", "body": b'{"prompt": "hel', "more_body": True},
+            {"type": "http.request", "body": b'lo chunked", "client_timeout_seconds": 2}', "more_body": False},
+        ]
+
+        async def receive() -> dict[str, object]:
+            return events.pop(0) if events else {"type": "http.disconnect"}
+
+        body = await lifecycle_mod.Application._body(receive)
+        assert body == {"prompt": "hello chunked", "client_timeout_seconds": 2}
+
+    asyncio.run(plan())

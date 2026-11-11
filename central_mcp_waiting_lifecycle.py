@@ -2619,9 +2619,19 @@ class Application:
 
     @staticmethod
     async def _body(receive: Any) -> dict[str, object] | None:
-        event = await receive()
-        if event.get("type") != "http.request": return None
-        try: value = json.loads(event.get("body", b""))
+        chunks: list[bytes] = []
+        while True:
+            event = await receive()
+            if event.get("type") != "http.request":
+                if not chunks: return None
+                break
+            chunks.append(bytes(event.get("body", b"")))
+            if not event.get("more_body"):
+                break
+        # ASGI delivers large request bodies as multiple http.request
+        # chunks; reading only the first truncated every payload above one
+        # chunk and reset the connection mid-upload.
+        try: value = json.loads(b"".join(chunks))
         except (TypeError, UnicodeDecodeError, json.JSONDecodeError): return None
         return value if isinstance(value, dict) else None
 
@@ -2657,11 +2667,17 @@ class Application:
 
     @staticmethod
     async def _form_body(receive: Any) -> dict[str, object] | None:
-        event = await receive()
-        if event.get("type") != "http.request":
-            return None
+        chunks: list[bytes] = []
+        while True:
+            event = await receive()
+            if event.get("type") != "http.request":
+                if not chunks: return None
+                break
+            chunks.append(bytes(event.get("body", b"")))
+            if not event.get("more_body"):
+                break
         try:
-            parsed = parse_qs(bytes(event.get("body", b"")).decode("utf-8"), keep_blank_values=True)
+            parsed = parse_qs(b"".join(chunks).decode("utf-8"), keep_blank_values=True)
         except (TypeError, UnicodeDecodeError):
             return None
         return {key: values[-1] for key, values in parsed.items() if values}
