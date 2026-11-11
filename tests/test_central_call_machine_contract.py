@@ -267,3 +267,43 @@ def _noop_wait():
     async def _wait(_seconds: float) -> None:
         return None
     return _wait
+
+
+def test_mcp_session_scoped_request_ids(tmp_path: Path) -> None:
+    """Different MCP sessions must never replay each other's calls.
+
+    initialize assigns an Mcp-Session-Id; request ids namescope by it.
+    Two sessions reusing the same JSON-RPC id with identical payloads
+    each get their own call, while a retry inside one session replays.
+    """
+    lifecycle_mod = _lifecycle_module()
+    app = lifecycle_mod.create_app(
+        database_path=tmp_path / "sess.sqlite3",
+        credentials={"agent-a": "token-a"},
+        clock=lambda: 1_700_000_000.0,
+        notify=lambda _n: None,
+        wait=_noop_wait(),
+        ring_timeout_seconds=60,
+    )
+
+    def call(rid, prompt, session=None):
+        return app._rpc("agent-a", {"jsonrpc": "2.0", "id": rid, "method": "tools/call",
+                                    "params": {"name": "get_user_input",
+                                               "arguments": {"prompt": prompt}}}, session)
+
+    def sc(resp):
+        return resp["result"]["structuredContent"]
+
+    a1 = sc(call(3, "same prompt", session="aaaa1111aaaa2222"))
+    assert a1["status"] == "heartbeat"
+    # 跨会话同 id 同 payload：先结束 a 会话的呼叫，b 会话的请求必须新建而非重放
+    app.lifecycle.cancel("agent-a", "sess-cancel-a", a1["interaction_id"], a1["call_id"])
+    a1_retry = sc(call(3, "same prompt", session="aaaa1111aaaa2222"))
+    assert a1_retry["call_id"] == a1["call_id"], \
+        "same-session retry must replay its round (raw rpc replays the cached heartbeat; the HTTP wait layer upgrades it to the terminal view)"
+    b1 = sc(call(3, "same prompt", session="bbbb2222bbbb3333"))
+    assert b1["status"] == "heartbeat", "fresh session must not replay another session's round"
+    assert b1["call_id"] != a1["call_id"], "distinct sessions must create distinct calls"
+    b1_retry = sc(call(3, "same prompt", session="bbbb2222bbbb3333"))
+    assert b1_retry["call_id"] == b1["call_id"], "same-session retry must replay"
+    app.lifecycle.cancel("agent-a", "sess-cancel-b", b1["interaction_id"], b1["call_id"])
