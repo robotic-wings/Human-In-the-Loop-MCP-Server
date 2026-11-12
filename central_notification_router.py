@@ -177,6 +177,13 @@ class NotificationRouter:
         now = self._clock()
         with self._store.connection() as conn:
             for channel in self._CHANNELS.get(self._route_mode, ()):
+                if channel == "bark" and event.get("mobile_eligible") is False:
+                    # Multi-operator routing: a round addressed to an
+                    # operator without a mobile channel must never push to
+                    # the (single, primary-operator) Bark device. An absent
+                    # flag keeps the historical enqueue behavior for
+                    # hand-built legacy events.
+                    continue
                 payload = None
                 if channel == "bark" and self._web_base_url:
                     call_id = str(event["call_id"])

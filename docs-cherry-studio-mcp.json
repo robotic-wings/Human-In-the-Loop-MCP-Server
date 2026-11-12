@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "hitl": {
+      "type": "streamable-http",
+      "url": "https://10.10.0.1:9443/mcp",
+      "headers": {
+        "Authorization": "Bearer agent-secret"
+      },
+      "timeout": 300000
+    }
+  }
+}

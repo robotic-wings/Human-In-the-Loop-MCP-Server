@@ -219,6 +219,11 @@ class WaitingLifecycle:
                     notification = {
                         "call_id": call_id, "ring_deadline": deadline,
                         "title": caller_id, "body": " ".join(short_title.split())[:200],
+                        # Per-operator mobile routing: the target operator's
+                        # mobile flag decides whether this round may push to
+                        # the phone. The notification router refuses to push
+                        # Bark for a mobile-ineligible round.
+                        "mobile_eligible": bool(mobile_eligible),
                     }
                     if degraded:
                         notification["degraded"] = True
@@ -1207,7 +1212,13 @@ class WaitingLifecycle:
                         body = json.loads(row["body_json"])
                     except (TypeError, ValueError):
                         continue
-                    if body.get("needs_continuation") is not False:
+                    if body.get("needs_continuation") is not False and body.get("status") != "in_progress":
+                        # Terminal outcomes always flow. An ``in_progress``
+                        # submission is a human progress report (报告进度):
+                        # a detached delivery agent parks on ONE signal and
+                        # must be woken mid-round so it can surface progress
+                        # and keep waiting. Every other needs_continuation
+                        # event (accept → "opened") stays out of the feed.
                         continue
                     if (row["ack_status"] == "undeliverable") != undeliverable:
                         continue
