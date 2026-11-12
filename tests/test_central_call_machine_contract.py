@@ -459,3 +459,51 @@ def test_operator_signed_session_login_roundtrip(tmp_path: Path) -> None:
     # expired token rejected
     expired = app._mint_operator_session("kefan")
     del forged
+
+
+def test_outcome_feed_and_delivery_metadata(tmp_path: Path) -> None:
+    """Terminal-outcome feed: global seq, caller isolation, delivery column, ack."""
+    import json as _json
+    lifecycle_mod = _lifecycle_module()
+    app = lifecycle_mod.create_app(
+        database_path=tmp_path / "feed.sqlite3",
+        credentials={"agent-a": "token-a", "agent-b": "token-b"},
+        clock=lambda: 1_700_000_000.0,
+        notify=lambda _n: None,
+        wait=_noop_wait(),
+        ring_timeout_seconds=60,
+        operator_directory={
+            "kefan": {"password": "pw", "devices": [], "mobile": True, "primary": True},
+        },
+    )
+    lifecycle = app.lifecycle
+    created = lifecycle.create(
+        "agent-a", "feed-1", {"tool": "get_user_input", "prompt": "hi"},
+        operator_callsign="kefan",
+        delivery={"kind": "chidori-detached", "agent": "spike"},
+    )
+    assert created["status"] == "heartbeat"
+    lifecycle._human_action(created["call_id"], "opened", "accepted", None,
+                            {"handled_on": "desktop", "human_action": True})
+    lifecycle.finish(call_id=created["call_id"], status="answered", result={"user_input": "yes"})
+
+    # busy line blocks a second call from the same caller until answered above;
+    # cross-caller scoping: agent-b sees nothing
+    feed_b = lifecycle.outcome_feed(0, 10, caller_id="agent-b")
+    assert feed_b == []
+    feed_a = lifecycle.outcome_feed(0, 10, caller_id="agent-a")
+    assert len(feed_a) == 1
+    entry = feed_a[0]
+    assert entry["call_id"] == created["call_id"]
+    assert entry["delivery"] == {"kind": "chidori-detached", "agent": "spike"}
+    assert entry["operator"] == "kefan"
+    assert entry["tool"] == "get_user_input"
+    assert entry["outcome"]["status"] == "answered"
+    seq = entry["seq"]
+    # cursor semantics: after=seq yields nothing new
+    assert lifecycle.outcome_feed(seq, 10, caller_id="agent-a") == []
+    # ack undeliverable hides it from the default feed, surfaces with flag
+    lifecycle.ack_delivery(seq, "undeliverable")
+    assert lifecycle.outcome_feed(0, 10, caller_id="agent-a") == []
+    flagged = lifecycle.outcome_feed(0, 10, caller_id="agent-a", undeliverable=True)
+    assert len(flagged) == 1 and flagged[0]["seq"] == seq
