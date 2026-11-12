@@ -19,7 +19,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import httpx
 
@@ -290,22 +290,79 @@ def scan_ringtones(directory: str) -> list[str]:
     return sorted(entry.name for entry in path.glob("*.mp3") if entry.is_file())
 
 
+def preferences_file(config_path: str) -> str:
+    """Panel preferences live beside the config as preferences.json."""
+    return str(Path(config_path).with_name("preferences.json"))
+
+
+def load_preferences(prefs_file: str) -> dict[str, str]:
+    """Load panel preferences, migrating the legacy terminal-state.json."""
+    path = Path(prefs_file)
+    legacy = path.with_name("terminal-state.json")
+    source = path if path.exists() else (legacy if legacy.exists() else None)
+    if source is None:
+        return {}
+    try:
+        data = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    if isinstance(data, str):
+        data = {"short_ringtone_path": data}
+    if not isinstance(data, dict):
+        return {}
+    prefs = {str(k): str(v) for k, v in data.items()
+             if isinstance(k, str) and isinstance(v, str) and v}
+    if source == legacy and prefs:
+        save_preferences(prefs_file, prefs)
+        try:
+            legacy.unlink()
+        except OSError:
+            pass
+    return prefs
+
+
+def save_preferences(prefs_file: str, prefs: Mapping[str, str]) -> None:
+    target = Path(prefs_file)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(prefs), encoding="utf-8")
+
+
 def save_short_ringtone(state_file: str, path: str) -> None:
-    """Persist the chosen short ringtone path to a local JSON state file."""
-    state = Path(state_file)
-    state.parent.mkdir(parents=True, exist_ok=True)
-    state.write_text(json.dumps({"short_ringtone_path": path}), encoding="utf-8")
+    """Persist the chosen short ringtone into the preferences file."""
+    prefs = load_preferences(state_file)
+    prefs["short_ringtone_path"] = path
+    save_preferences(state_file, prefs)
 
 
 def load_short_ringtone(state_file: str) -> str:
-    """Read the chosen short ringtone path, or return '' when absent/invalid."""
-    try:
-        data = json.loads(Path(state_file).read_text(encoding="utf-8"))
-    except (OSError, ValueError, json.JSONDecodeError):
-        return ""
-    if isinstance(data, dict) and isinstance(data.get("short_ringtone_path"), str):
-        return data["short_ringtone_path"]
-    return ""
+    """Read the chosen short ringtone from preferences, '' when absent."""
+    return load_preferences(state_file).get("short_ringtone_path", "")
+
+
+class StartupRingtoneSelection(NamedTuple):
+    """Ringtone paths a terminal process starts with, resolved once.
+
+    ``preferences.json`` is the source of truth once a pick exists; the
+    config's ``ringtone_path`` is bootstrap-only. The panel preselection
+    and the player MUST agree, which is why both read from here.
+    """
+
+    long_ringtone_path: str
+    panel_ringtone_path: str
+    short_ringtone_path: str
+
+
+def startup_ringtone_selection(config: "DesktopTerminalConfig", prefs_file: str) -> StartupRingtoneSelection:
+    """Resolve effective ringtones from preferences, falling back to config.
+
+    Pinned by the ringtone startup contract: the panel preselection equals
+    the saved long-ringtone preference (not the config bootstrap), so a
+    restart neither displays nor re-saves the default behind the user's back.
+    """
+    prefs = load_preferences(prefs_file)
+    long_ringtone = prefs.get("long_ringtone_path") or config.ringtone_path
+    short_ringtone = config.short_ringtone_path or prefs.get("short_ringtone_path", "")
+    return StartupRingtoneSelection(long_ringtone, long_ringtone, short_ringtone)
 
 
 class _PreviewControls:
@@ -386,6 +443,10 @@ def build_settings_panel(root: Any, ring: Any, central: Any, ringtones_dir: str,
     def on_ringtone_change(*_args: object) -> None:
         ring.set_ringtone(os.path.join(ringtones_dir, ringtone_var.get()))
         previews.channel_changed("long")
+        if short_state_file:
+            prefs = load_preferences(short_state_file)
+            prefs["long_ringtone_path"] = os.path.join(ringtones_dir, ringtone_var.get())
+            save_preferences(short_state_file, prefs)
 
     def on_short_ringtone_change(*_args: object) -> None:
         if callable(set_short):
@@ -1082,12 +1143,13 @@ def main(argv: list[str] | None = None) -> None:
     central = CentralHttpDesktopClient(config)
     holder: dict[str, DesktopTerminalClient] = {}
     presenter = TkPresentation(root, lambda: holder["client"])
-    short_state_file = str(Path(args.config).with_name("terminal-state.json"))
-    short_ringtone_path = config.short_ringtone_path or load_short_ringtone(short_state_file)
-    ring = RingtonePlayer(ringtone_path=config.ringtone_path, ringtone_alt_path=config.ringtone_alt_path, bell=root.bell, short_ringtone_path=short_ringtone_path)
+    prefs_file = preferences_file(args.config)
+    short_state_file = prefs_file
+    selection = startup_ringtone_selection(config, prefs_file)
+    ring = RingtonePlayer(ringtone_path=selection.long_ringtone_path, ringtone_alt_path=config.ringtone_alt_path, bell=root.bell, short_ringtone_path=selection.short_ringtone_path)
     client = DesktopTerminalClient(config={"callsign": config.callsign, "operator_password": config.operator_password, "device_id": config.device_id, "terminal_credential": config.terminal_credential, "callback_credential": config.callback_credential}, central=central, listener=_TerminalListener(), gui_capability=lambda: True, ring=ring, presenter=presenter)
     holder["client"] = client
-    build_settings_panel(root, ring, central, config.ringtones_dir, scan_ringtones(config.ringtones_dir), config.ringtone_path, tk, short_ringtone_path, short_state_file)
+    build_settings_panel(root, ring, central, config.ringtones_dir, scan_ringtones(config.ringtones_dir), selection.panel_ringtone_path, tk, selection.short_ringtone_path, short_state_file)
     if config.listener_scheme == "https" and (not config.listener_tls_cert_file or not config.listener_tls_key_file):
         raise SystemExit("desktop terminal unavailable: HTTPS listener requires listener_tls_cert_file and listener_tls_key_file")
     server = uvicorn.Server(uvicorn.Config(
