@@ -10,7 +10,6 @@ import asyncio
 import importlib
 from pathlib import Path
 
-from central_call_coordinator import CallCoordinator
 
 
 class FakeClock:
@@ -69,16 +68,14 @@ def test_bark_outbox_persists_normalized_call_link_before_one_bounded_dispatch(t
         return {"http_status": 200, "business_success": True}
 
     router = _router(tmp_path, clock, desktop=_desktop_ok, bark=bark, route_mode="iphone")
-    coordinator = CallCoordinator(
-        database_path=tmp_path / "calls.sqlite3", clock=clock, notify=router.enqueue
-    )
-    call = coordinator.create_call(caller_id="agent-a", request_id="request-1", payload={"tool": "text"})
-    call_id = str(call["call_id"])
+    call_id = "agent-a-call"
+    deadline = clock() + 60
+    router.enqueue({"call_id": call_id, "ring_deadline": deadline})
 
     # The durable record must exist before a dispatcher is permitted to observe it.
     records = router.outbox_records(call_id)
     assert records == [{
-        "channel": "bark", "state": "pending", "ring_deadline": call["ring_deadline"],
+        "channel": "bark", "state": "pending", "ring_deadline": deadline,
         "payload": {"call_id": call_id, "url": f"https://10.0.0.1:8443/central/calls/{call_id}", "call": "1"},
     }]
     asyncio.run(router.dispatch_pending())

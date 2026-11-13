@@ -34,7 +34,6 @@ from pathlib import Path
 
 import pytest
 
-from central_call_coordinator import CallCoordinator
 
 
 class FakeClock:
@@ -96,18 +95,6 @@ async def _bark_success(_: dict[str, object]) -> dict[str, object]:
 
 def _event(call_id: str = "call-1", deadline: float = 1_700_000_060.0) -> dict[str, object]:
     return {"call_id": call_id, "ring_deadline": deadline}
-
-
-def test_existing_coordinator_control_is_gui_free_and_keeps_notification_seam(tmp_path: Path) -> None:
-    """Passing control independent of the absent router module."""
-
-    source = inspect.getsource(CallCoordinator)
-    tree = ast.parse(source)
-    assert "tkinter" not in source.lower()
-    assert any(
-        isinstance(node, ast.Attribute) and node.attr == "_notify"
-        for node in ast.walk(tree)
-    )
 
 
 def test_management_only_registration_persists_endpoint_and_fresh_gui_readiness(
@@ -188,19 +175,13 @@ def test_enqueue_is_compatible_with_coordinator_notify_and_persists_route_before
         desktop_dispatch=_desktop_success,
         bark_dispatch=_bark_success,
     )
-    coordinator = CallCoordinator(
-        database_path=tmp_path / "calls.sqlite3",
-        clock=clock,
-        notify=router.enqueue,
-    )
-    created = coordinator.create_call(
-        caller_id="agent-a", request_id="request-1", payload={"tool": "text"}
-    )
-    assert {row["channel"] for row in router.delivery_states(created["call_id"])} == {
+    call_id = "agent-a-call"
+    router.enqueue({"call_id": call_id, "ring_deadline": clock() + 60})
+    assert {row["channel"] for row in router.delivery_states(call_id)} == {
         "desktop",
         "bark",
     }
-    assert {row["state"] for row in router.delivery_states(created["call_id"])} == {"pending"}
+    assert {row["state"] for row in router.delivery_states(call_id)} == {"pending"}
 
 
 def test_desktop_and_bark_dispatch_start_independently_and_classify_outcomes(

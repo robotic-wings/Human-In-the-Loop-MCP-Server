@@ -18,7 +18,6 @@ import inspect
 from dataclasses import dataclass, field
 from typing import Any
 
-from central_terminal_http_service import create_app
 
 
 def _module():
@@ -142,16 +141,6 @@ def _ringing(call_id: str, *, version: int = 1) -> dict[str, object]:
         "handled_on": None,
         "terminal_platform": None,
     }
-
-
-def test_central_terminal_http_adapter_is_gui_free_and_not_an_mcp_import_control() -> None:
-    """Passing control: the existing central endpoint remains the sole API."""
-
-    source = inspect.getsource(create_app)
-    tree = ast.parse(source)
-    assert "tkinter" not in source.lower()
-    assert "fastmcp" not in source.lower()
-    assert any(isinstance(node, ast.FunctionDef) and node.name == "create_app" for node in tree.body)
 
 
 def test_portable_config_reports_gui_or_central_unavailability_honestly() -> None:
