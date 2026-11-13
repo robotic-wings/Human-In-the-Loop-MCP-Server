@@ -100,6 +100,45 @@ def ack(seq: int, status: str) -> None:
     post_json(f"{CENTRAL}/api/agent/outcomes/ack", {"seq": seq, "status": status}, token=TOKEN)
 
 
+def process_entry(entry: dict, *, deliver_fn, ack_fn, save_fn, sleep_fn,
+                  max_attempts: int = 60) -> str:
+    """Deliver one entry and advance the cursor; returns the terminal status.
+
+    At-least-once by construction: the cursor is only advanced after a send
+    succeeds or a definitive failure. A crash before ``save_fn`` re-reads the
+    entry on restart, so a human answer is never silently dropped. A definitive
+    HTTP status (agent gone / run terminal) short-circuits to undeliverable
+    without a retry; anything else backs off for at most ``max_attempts``.
+    """
+    seq = entry["seq"]
+    if select_target(entry) is None:
+        save_fn(seq)
+        return "skipped"
+    delivered = False
+    attempt = 0
+    while not delivered:
+        try:
+            delivered = deliver_fn(entry)
+        except urllib.error.HTTPError as exc:
+            if classify_http_error(exc.code) == "definitive":
+                break
+            attempt += 1
+            if attempt > max_attempts:
+                break
+            sleep_fn(min(5.0, 0.5 * attempt))
+        except Exception:
+            attempt += 1
+            if attempt > max_attempts:
+                break
+            sleep_fn(min(5.0, 0.5 * attempt))
+    try:
+        ack_fn(seq, "delivered" if delivered else "undeliverable")
+    except Exception:
+        pass
+    save_fn(seq)
+    return "delivered" if delivered else "undeliverable"
+
+
 def main() -> None:
     print(f"hitl-postman: start {CENTRAL} -> {CHIDORI} poll={POLL_SECONDS}s", flush=True)
     while True:
@@ -107,37 +146,21 @@ def main() -> None:
         try:
             data = get_json(f"{CENTRAL}/api/agent/outcomes?after={cursor}&limit=50")
             for entry in data.get("outcomes", []):
-                seq = entry["seq"]
-                if select_target(entry) is None:
-                    save_cursor(seq)
-                    continue
-                delivered = False
-                attempt = 0
-                while not delivered:
-                    try:
-                        delivered = deliver(entry)
-                    except urllib.error.HTTPError as exc:
-                        if classify_http_error(exc.code) == "definitive":
-                            print(f"definitive {exc.code} for {select_target(entry)}: undeliverable", flush=True)
-                            break
-                        attempt += 1
-                        if attempt > 60:
-                            print(f"giving up on {select_target(entry)} after {attempt} attempts", flush=True)
-                            break
-                        time.sleep(min(5.0, 0.5 * attempt))
-                    except Exception as exc:
-                        attempt += 1
-                        if attempt > 60:
-                            print(f"giving up on {select_target(entry)} after {attempt} attempts: {exc}", flush=True)
-                            break
-                        time.sleep(min(5.0, 0.5 * attempt))
                 try:
-                    ack(seq, "delivered" if delivered else "undeliverable")
+                    status = process_entry(
+                        entry,
+                        deliver_fn=deliver,
+                        ack_fn=ack,
+                        save_fn=save_cursor,
+                        sleep_fn=time.sleep,
+                    )
                 except Exception as exc:
-                    print(f"ack fail seq={seq}: {exc}", flush=True)
-                if delivered:
-                    print(f"delivered seq={seq} -> {select_target(entry)} call={entry['call_id'][:8]}", flush=True)
-                save_cursor(seq)
+                    print(f"entry {entry.get('seq')} failed: {exc}", flush=True)
+                    continue
+                if status == "delivered":
+                    print(f"delivered seq={entry['seq']} -> {select_target(entry)} call={entry['call_id'][:8]}", flush=True)
+                elif status == "undeliverable":
+                    print(f"undeliverable seq={entry['seq']}", flush=True)
         except Exception as exc:
             print(f"poll fail: {exc}", flush=True)
         time.sleep(POLL_SECONDS)

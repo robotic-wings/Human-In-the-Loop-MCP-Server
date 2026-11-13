@@ -50,3 +50,102 @@ def test_cursor_is_atomic_on_disk(tmp_path, monkeypatch) -> None:
     # corrupt content degrades to 0 rather than crashing the loop
     (tmp_path / "postman.cursor").write_text("not-a-number")
     assert m.load_cursor() == 0
+
+
+# ── delivery loop: at-least-once + cursor/ack ordering ────────────
+
+def _entry(seq: int = 1) -> dict:
+    return {
+        "seq": seq, "call_id": f"call-{seq}", "operator": "NIGHTHAWK",
+        "delivery": {"kind": "chidori-detached", "agent": "probe"},
+        "outcome": {"call_state": "completed", "needs_continuation": False},
+    }
+
+
+def _probe(max_attempts=60):
+    """Injected callbacks that record every send/ack/save/sleep."""
+    calls = {"deliver": [], "ack": [], "save": [], "sleep": []}
+
+    def deliver_fn(entry):
+        calls["deliver"].append(entry["seq"])
+        return calls["deliver_result"]
+
+    def ack_fn(seq, status):
+        calls["ack"].append((seq, status))
+
+    def save_fn(seq):
+        calls["save"].append(seq)
+
+    def sleep_fn(seconds):
+        calls["sleep"].append(seconds)
+
+    return calls, deliver_fn, ack_fn, save_fn, sleep_fn
+
+
+def test_delivery_success_acks_then_saves_cursor():
+    m = _module()
+    calls, deliver_fn, ack_fn, save_fn, sleep_fn = _probe()
+    calls["deliver_result"] = True
+    status = m.process_entry(_entry(7), deliver_fn=deliver_fn, ack_fn=ack_fn,
+                             save_fn=save_fn, sleep_fn=sleep_fn)
+    assert status == "delivered"
+    assert calls["ack"] == [(7, "delivered")]
+    assert calls["save"] == [7]
+    assert calls["sleep"] == []
+
+
+def test_definitive_404_is_undeliverable_without_retry():
+    m = _module()
+    calls, deliver_fn, ack_fn, save_fn, sleep_fn = _probe()
+    def deliver_404(entry):
+        calls["deliver"].append(entry["seq"])
+        raise _http_error(404)
+    status = m.process_entry(_entry(3), deliver_fn=deliver_404, ack_fn=ack_fn,
+                             save_fn=save_fn, sleep_fn=sleep_fn)
+    assert status == "undeliverable"
+    assert calls["ack"] == [(3, "undeliverable")]
+    assert calls["save"] == [3]
+    assert calls["sleep"] == [], "a definitive status must not retry"
+
+
+def test_connection_error_retries_bounded_then_undeliverable():
+    m = _module()
+    calls, deliver_fn, ack_fn, save_fn, sleep_fn = _probe()
+    def deliver_down(entry):
+        calls["deliver"].append(entry["seq"])
+        raise ConnectionError("chidori restarting")
+    status = m.process_entry(_entry(1), deliver_fn=deliver_down, ack_fn=ack_fn,
+                             save_fn=save_fn, sleep_fn=sleep_fn, max_attempts=3)
+    assert status == "undeliverable"
+    assert len(calls["deliver"]) == 4, "1 initial + 3 retries"
+    assert calls["ack"] == [(1, "undeliverable")]
+    assert calls["save"] == [1]
+
+
+def test_non_detached_entry_is_skipped_without_send():
+    m = _module()
+    calls, deliver_fn, ack_fn, save_fn, sleep_fn = _probe()
+    entry = {"seq": 5, "call_id": "c", "delivery": None, "outcome": {}}
+    status = m.process_entry(entry, deliver_fn=deliver_fn, ack_fn=ack_fn,
+                             save_fn=save_fn, sleep_fn=sleep_fn)
+    assert status == "skipped"
+    assert calls["deliver"] == [] and calls["ack"] == []
+    assert calls["save"] == [5]
+
+
+def test_ack_failure_does_not_drop_the_outcome():
+    m = _module()
+    calls, deliver_fn, ack_fn, save_fn, sleep_fn = _probe()
+    calls["deliver_result"] = True
+    def ack_fails(seq, status):
+        calls["ack"].append((seq, status))
+        raise ConnectionError("central briefly down")
+    status = m.process_entry(_entry(9), deliver_fn=deliver_fn, ack_fn=ack_fails,
+                             save_fn=save_fn, sleep_fn=sleep_fn)
+    assert status == "delivered", "delivery succeeded even though the ack failed"
+    assert calls["save"] == [9], "cursor still advances so the outcome is not re-sent"
+
+
+def _http_error(code):
+    import urllib.error
+    return urllib.error.HTTPError("http://x", code, "reason", None, None)
