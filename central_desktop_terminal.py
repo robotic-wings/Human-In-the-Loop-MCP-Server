@@ -290,6 +290,18 @@ def scan_ringtones(directory: str) -> list[str]:
     return sorted(entry.name for entry in path.glob("*.mp3") if entry.is_file())
 
 
+def _guess_media_type(filename: str) -> str:
+    """Best-effort media type from a filename extension, octet-stream otherwise.
+
+    The central stores whatever type the terminal declares; an image attached
+    as octet-stream reaches the agent with the wrong type. Guess a real one so
+    photos keep their MIME type across the round trip.
+    """
+    import mimetypes
+    guessed, _encoding = mimetypes.guess_type(filename)
+    return guessed if isinstance(guessed, str) and guessed else "application/octet-stream"
+
+
 def preferences_file(config_path: str) -> str:
     """Panel preferences live beside the config as preferences.json."""
     return str(Path(config_path).with_name("preferences.json"))
@@ -740,7 +752,7 @@ class TkPresentation:
         payload = state.get("payload")
         payload = dict(payload) if isinstance(payload, Mapping) else {}
         tool = str(payload.get("tool") or payload.get("interaction_type") or "text").lower()
-        prompt = payload.get("prompt") or payload.get("message") or payload.get("task_description") or "Please complete this request"
+        prompt = payload.get("prompt") or payload.get("message") or payload.get("task_description") or "请完成此请求"
         tk.Label(dialog, text=str(prompt), wraplength=620, justify="left").pack(padx=12, pady=(12, 6), anchor="w")
         error = tk.StringVar(value="")
         build_result = self._response_controls(dialog, tool, payload, tk)
@@ -757,7 +769,7 @@ class TkPresentation:
                 selected = Path(path)
                 uploaded = central.upload_attachment(
                     call_id=call_id, filename=selected.name,
-                    media_type="application/octet-stream", content=selected.read_bytes(),
+                    media_type=_guess_media_type(selected.name), content=selected.read_bytes(),
                 )
                 attachment_id = uploaded.get("attachment_id")
                 if uploaded.get("success") and isinstance(attachment_id, str):
@@ -770,14 +782,14 @@ class TkPresentation:
         def submit() -> None:
             result = build_result()
             if result is None:
-                error.set("Please complete the required response before submitting.")
+                error.set("请先完成必填项再提交。")
                 return
             response = self._client_ref()._central.submit(call_id, uuid.uuid4().hex, result, attachment_ids)
             if response.get("success"):
                 self._calls.pop(call_id, None)
                 dialog.destroy()
             else:
-                error.set("The central service did not accept this response. Refresh or retry.")
+                error.set("中央服务未接受此回复，请重试。")
 
         def cancel() -> None:
             self._client_ref()._central.cancel(call_id=call_id, operation_id=uuid.uuid4().hex)
@@ -788,9 +800,12 @@ class TkPresentation:
             response = self._client_ref()._central.submit(call_id, uuid.uuid4().hex, build_progress(), attachment_ids)
             if response.get("success"):
                 error.set("进度已上报")
+                error_label.config(fg="green")
             else:
                 error.set("进度上报失败，请重试。")
-        tk.Label(dialog, textvariable=error, fg="firebrick", justify="left").pack(padx=12, anchor="w")
+                error_label.config(fg="firebrick")
+        error_label = tk.Label(dialog, textvariable=error, fg="firebrick", justify="left")
+        error_label.pack(padx=12, anchor="w")
         button_bar = tk.Frame(dialog)
         button_bar.pack(fill="x", padx=12, pady=(8, 12))
         if build_progress is not None:
@@ -804,22 +819,22 @@ class TkPresentation:
         required = bool(payload.get("required", True))
         if "confirm" in tool:
             value = tk.StringVar(value="")
-            tk.Label(dialog, text="Choose a confirmation result").pack(padx=12, pady=(6, 0), anchor="w")
-            tk.Radiobutton(dialog, text="Yes, confirm", variable=value, value="true").pack(padx=20, anchor="w")
-            tk.Radiobutton(dialog, text="No, do not confirm", variable=value, value="false").pack(padx=20, anchor="w")
+            tk.Label(dialog, text="选择确认结果").pack(padx=12, pady=(6, 0), anchor="w")
+            tk.Radiobutton(dialog, text="确认", variable=value, value="true").pack(padx=20, anchor="w")
+            tk.Radiobutton(dialog, text="不确认", variable=value, value="false").pack(padx=20, anchor="w")
             return lambda: {"confirmed": value.get() == "true"} if value.get() else None
         if "info" in tool or "acknowledge" in tool:
             value = tk.BooleanVar(value=False)
-            tk.Checkbutton(dialog, text="I have read and acknowledge this information", variable=value).pack(padx=12, pady=8, anchor="w")
+            tk.Checkbutton(dialog, text="我已阅读并知悉此信息", variable=value).pack(padx=12, pady=8, anchor="w")
             return lambda: {"acknowledged": True} if value.get() else None
         if "feedback" in tool:
-            box = TkPresentation._labelled_text(dialog, tk, "Feedback")
+            box = TkPresentation._labelled_text(dialog, tk, "反馈")
             return lambda: TkPresentation._text_result("feedback", box, required)
         if "task" in tool or "assign" in tool:
             status = tk.StringVar(value="completed")
-            tk.Label(dialog, text="Task status").pack(padx=12, pady=(6, 0), anchor="w")
+            tk.Label(dialog, text="任务状态").pack(padx=12, pady=(6, 0), anchor="w")
             tk.OptionMenu(dialog, status, "completed", "failed").pack(padx=12, anchor="w")
-            report = TkPresentation._labelled_text(dialog, tk, "Task report")
+            report = TkPresentation._labelled_text(dialog, tk, "任务报告")
             def task_result() -> dict[str, object] | None:
                 text = report.get("1.0", "end-1c")
                 return {"status": status.get(), "report": text} if text or not required else None
@@ -830,7 +845,7 @@ class TkPresentation:
         choices = payload.get("choices") or payload.get("options")
         if ("choice" in tool or "select" in tool or isinstance(choices, list)) and isinstance(choices, list):
             multiple = bool(payload.get("multiple") or payload.get("allow_multiple"))
-            tk.Label(dialog, text="Choose one or more options" if multiple else "Choose one option").pack(padx=12, pady=(6, 0), anchor="w")
+            tk.Label(dialog, text="选择一个或多个选项" if multiple else "选择一个选项").pack(padx=12, pady=(6, 0), anchor="w")
             normalized = [
                 (str(item.get("value", item.get("label", ""))), str(item.get("label", item.get("value", ""))))
                 if isinstance(item, Mapping) else (str(item), str(item)) for item in choices
@@ -850,9 +865,9 @@ class TkPresentation:
         multiline = "multiline" in tool or "long" in tool or bool(payload.get("multiline"))
         numeric = "number" in tool or str(payload.get("input_type", "")).lower() == "number"
         if multiline:
-            box = TkPresentation._labelled_text(dialog, tk, "Enter your complete response")
+            box = TkPresentation._labelled_text(dialog, tk, "请输入完整回复")
             return lambda: TkPresentation._text_result("user_input", box, required)
-        label = "Enter a number" if numeric else "Enter your response"
+        label = "请输入数字" if numeric else "请输入回复"
         tk.Label(dialog, text=label).pack(padx=12, pady=(6, 0), anchor="w")
         entry = tk.Entry(dialog, width=70)
         entry.pack(padx=12, pady=(0, 8), fill="x")

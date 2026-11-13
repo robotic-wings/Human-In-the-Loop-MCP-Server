@@ -39,6 +39,9 @@ class FakeWidget:
     def columnconfigure(self, *_args: object, **_kwargs: object) -> None:
         return None
 
+    def config(self, *_args: object, **_kwargs: object) -> "FakeWidget":
+        return self
+
 
 
 class FakeStringVar:
