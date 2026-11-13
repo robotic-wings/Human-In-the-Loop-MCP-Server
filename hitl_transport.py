@@ -134,6 +134,15 @@ class Application(McpRpcMixin):
                             outcome = dict(outcome)
                             outcome["next_after_event_seq"] = eseq if isinstance(eseq, int) and eseq >= 0 else hint
                         result["result"]["content"] = [{"type": "text", "text": self._rpc_summary(str(params.get("name", "")), outcome, hint)}]
+            # Arm the agent-reconnect grace whenever the round is now
+            # accepted/in_progress and the agent is about to receive a
+            # resumable heartbeat. If the client aborts mid-round (e.g. the
+            # operator types over a parked call) and never re-polls, the
+            # round settles cleanly as agent_disconnected instead of holding
+            # the busy line indefinitely.
+            delivered_sc = result.get("result", {}).get("structuredContent")
+            if isinstance(delivered_sc, dict) and delivered_sc.get("needs_continuation") is True:
+                self.lifecycle.response_delivered(caller, delivered_sc)
             headers: list[tuple[bytes, bytes]] | None = None
             if isinstance(body, Mapping) and body.get("method") == "initialize" and session_token is None:
                 headers = [(b"mcp-session-id", uuid.uuid4().hex.encode("ascii"))]

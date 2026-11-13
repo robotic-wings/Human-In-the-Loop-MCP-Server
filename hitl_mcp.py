@@ -70,7 +70,9 @@ def _interactive_schema(properties: Mapping[str, object]) -> dict[str, object]:
         },
         "interaction_id": {
             "type": "string",
-            "description": "Continuation: the interaction_id from the previous response of this round.",
+            "description": "Continuation: the interaction_id from the previous response of this round. "
+                           "On continuation, pass ONLY interaction_id + call_id + after_event_seq "
+                           "(plus client_timeout_seconds); do NOT repeat the task/prompt/message fields.",
         },
         "call_id": {
             "type": "string",
@@ -138,12 +140,14 @@ _MCP_TOOLS = (
          "task_description": {"type": "string", "description": "One actionable instruction for the operator."}})},
     {"name": "read_interaction_result", "kind": "read",
      "description": "Read the full body of a saved result (pagination via cursor) when a response came "
-                    "back with body_omitted_for_size.",
+                    "back with body_omitted_for_size. result_id ALONE is enough (it is globally "
+                    "unique); interaction_id is optional and only needed for cursorless whole-body reads.",
      "inputSchema": {"type": "object", "properties": {
          "interaction_id": {"type": "string"}, "result_id": {"type": "string"},
          "cursor": {"type": "string"}, "max_result_bytes": {"type": "integer"}}}},
     {"name": "read_interaction_attachment", "kind": "read",
-     "description": "Read one byte chunk of a saved attachment (pagination via offset_bytes).",
+     "description": "Read one byte chunk of a saved attachment (pagination via offset_bytes). "
+                    "attachment_id ALONE is enough (it is globally unique); interaction_id is optional.",
      "inputSchema": {"type": "object", "properties": {
          "interaction_id": {"type": "string"}, "attachment_id": {"type": "string"},
          "offset_bytes": {"type": "integer"}, "max_result_bytes": {"type": "integer"}}}},
@@ -320,8 +324,10 @@ class McpRpcMixin:
     def _rpc_read_tool(self, caller: str, name: str, arguments: Mapping[str, object]) -> dict[str, object]:
         if name == "read_interaction_result":
             interaction_id = arguments.get("interaction_id")
-            if not isinstance(interaction_id, str) or not interaction_id:
-                raise _RpcError(-32602, "Invalid params")
+            result_id = arguments.get("result_id")
+            if (not isinstance(interaction_id, str) or not interaction_id) and \
+               (not isinstance(result_id, str) or not result_id):
+                raise _RpcError(-32602, "Invalid params: interaction_id or result_id is required")
             return self.lifecycle.read_interaction_result(
                 caller, interaction_id,
                 result_id=arguments.get("result_id"),
@@ -331,8 +337,8 @@ class McpRpcMixin:
         if name == "read_interaction_attachment":
             interaction_id = arguments.get("interaction_id")
             attachment_id = arguments.get("attachment_id")
-            if not isinstance(interaction_id, str) or not interaction_id or not isinstance(attachment_id, str) or not attachment_id:
-                raise _RpcError(-32602, "Invalid params")
+            if not isinstance(attachment_id, str) or not attachment_id:
+                raise _RpcError(-32602, "Invalid params: attachment_id is required")
             return self.lifecycle.read_interaction_attachment(
                 caller, interaction_id, attachment_id,
                 offset_bytes=arguments.get("offset_bytes", 0),
@@ -420,13 +426,20 @@ class McpRpcMixin:
             return summary
         if result is not None:
             summary = f"{name}: {status}. Result: {json.dumps(result, ensure_ascii=False)}"
+            # A terminal round still needs its round ids for follow-ups
+            # (read_interaction_result / read_interaction_attachment /
+            # get_feedback_from_user / resubmit) — surface them explicitly,
+            # because a round that completes in one shot never exposed them
+            # through a heartbeat.
+            if iid and cid:
+                summary += f" (interaction_id={iid}, call_id={cid})"
             attachments = structured.get("attachments")
             if isinstance(attachments, list) and attachments:
                 listed = ", ".join(
                     f"{a.get('filename', '?')} ({a.get('byte_count', '?')} B, id {str(a.get('attachment_id', ''))[:8]})"
                     for a in attachments if isinstance(a, Mapping))
                 summary += (f" Attachments: {listed}. Fetch their bytes with read_interaction_attachment "
-                            f"(interaction_id + attachment_id, paginate with offset_bytes).")
+                            f"(attachment_id is enough; paginate with offset_bytes).")
             return summary
         detail = ""
         reason = structured.get("reason")
