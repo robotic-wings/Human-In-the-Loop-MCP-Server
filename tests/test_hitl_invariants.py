@@ -140,6 +140,9 @@ def _decline(central, call):
 
 def _ring_timeout(central, call):
     central.clock.advance(61)
+    # The deadline scheduler settles idle ringing calls; a read path triggers
+    # the same _settle_due here so the terminal event is materialized.
+    central.agent_continue("settle", call, after=0)
 
 
 def _agent_cancel(central, call):
@@ -185,3 +188,85 @@ def test_never_two_active_rounds_per_operator(tmp_path):
         second = central.agent_create(f"no-double-{i}-b")
         assert second["status"] == "busy"
         central.agent_cancel(f"cancel-{i}", created)
+
+
+# ── I1: identity / idempotency ────────────────────────────────────
+
+def test_idempotency_is_exact_across_all_operations(tmp_path):
+    """Same key + same args replays; same key + different args conflicts."""
+    central = Central(tmp_path)
+    term = central.terminal_login("NIGHTHAWK")
+    call = central.agent_create("idem")
+
+    # create: replay vs conflict
+    assert central.agent_create("idem")["call_id"] == call["call_id"]
+    assert central.agent_create("idem", args={"task_description": "other"})["status"] == "request_conflict"
+
+    # continue: replay returns the identical event, a changed cursor conflicts
+    read1 = central.agent_continue("cont-1", call, after=0)
+    read2 = central.agent_continue("cont-1", call, after=0)
+    assert read1 == read2
+    assert central.agent_continue("cont-1", call, after=1)["status"] == "request_conflict"
+
+    # submit: replay is idempotent, changed payload conflicts
+    term.ringed(call).accept()
+    sub1 = term.submit({"status": "completed", "report": "a"}, submission_id="sub-idem")
+    sub2 = term.submit({"status": "completed", "report": "a"}, submission_id="sub-idem")
+    assert sub1["event_seq"] == sub2["event_seq"]
+
+    # cancel: replay is idempotent
+    call2 = central.agent_create("idem-cancel")
+    c1 = central.agent_cancel("cancel-1", call2)
+    c2 = central.agent_cancel("cancel-1", call2)
+    assert c1["call_id"] == c2["call_id"] and c2["status"] == "cancelled"
+
+
+# ── I6: delivery feed completeness ────────────────────────────────
+
+def _delivery_endings():
+    """Each (name, finisher) ends a delivery-intent round a distinct way."""
+    def submit(central, call):
+        term = central.terminal_login("NIGHTHAWK")
+        term.ringed(call).accept()
+        term.submit({"status": "completed", "report": "done"})
+
+    return [
+        ("completed", submit),
+        ("declined", _decline),
+        ("human-cancelled", _human_cancel),
+        ("agent-cancelled", _agent_cancel),
+        ("ring-timeout", _ring_timeout),
+    ]
+
+
+def test_every_terminal_outcome_is_in_the_feed_exactly_once(tmp_path):
+    for name, finish in _delivery_endings():
+        central = Central(tmp_path, ring_timeout_seconds=60)
+        call = central.agent_create(f"feed-{name}",
+                                    delivery={"kind": "chidori-detached", "agent": "probe"})
+        finish(central, call)
+
+        feed = central.outcomes()
+        mine = [e for e in feed if e["call_id"] == call["call_id"]]
+        terminal = [e for e in mine if e["outcome"].get("needs_continuation") is False]
+        assert len(terminal) == 1, (name, mine)
+        assert terminal[0]["delivery"] == {"kind": "chidori-detached", "agent": "probe"}
+        # seq strictly increasing, exactly one entry carries the delivery
+        seqs = [e["seq"] for e in mine]
+        assert seqs == sorted(seqs), name
+
+
+def test_progress_appears_in_feed_exactly_once_before_terminal(tmp_path):
+    central = Central(tmp_path)
+    call = central.agent_create("feed-progress",
+                                delivery={"kind": "chidori-detached", "agent": "probe"})
+    term = central.terminal_login("NIGHTHAWK")
+    term.ringed(call).accept()
+    term.submit({"status": "in_progress", "progress": "half"}, submission_id="p1")
+    term.submit({"status": "completed", "report": "done"}, submission_id="p2")
+
+    feed = central.outcomes()
+    mine = [e for e in feed if e["call_id"] == call["call_id"]]
+    statuses = [e["outcome"]["status"] for e in mine]
+    assert statuses == ["in_progress", "completed"], mine
+    assert mine[0]["outcome"]["progress"] == "half"

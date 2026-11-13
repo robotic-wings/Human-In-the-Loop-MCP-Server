@@ -62,11 +62,11 @@
 
 | 不变量 | 属性测试 | 状态 |
 |---|---|---|
-| I1 幂等 | 见 F 组 | 部分（缺跨化身唯一性的专门测试） |
+| I1 幂等 | test_idempotency_is_exact_across_all_operations | 已钉（核心幂等；request_id 跨化身唯一性属 hitl.ts 侧，不在核心测试范围） |
 | I2 归属 | test_hitl_rewrite_spec.py | 已钉 |
 | I3 保活 | test_hitl_rewrite_spec.py（mobile/desktop/agent 三分支） | 已钉 |
-| I4 结算完备 | 本次新增 | **新增** |
-| I5 忙线 | 本次新增 | **新增** |
-| I6 投递 | G 组 + progress feed 合同 | 部分 |
+| I4 结算完备 | test_settlement_is_complete_and_deterministic | 已钉 |
+| I5 忙线 | test_busy_line_released_by_every_ending / test_never_two_active_rounds_per_operator | 已钉 |
+| I6 投递 | test_every_terminal_outcome_is_in_the_feed_exactly_once / test_progress_appears_in_feed_exactly_once_before_terminal | 已钉 |
 | I7 路由 | mobile_eligibility 合同 | 已钉 |
 | I8 附件 | test_hitl_attachment_continuation_fixes.py | 已钉 |
