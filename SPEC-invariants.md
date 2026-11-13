@@ -28,6 +28,7 @@
 - mobile 归属：**无 owner lease**（浏览器无状态，人可能离线打字）。
 - agent lease：向 agent 投递 resumable heartbeat 时刷新，过期 → `agent_disconnected`。
 - **mobile 归属的轮次绝不因 owner lease 过期而结算**（尤其不会 `terminal_disconnected`）。
+- 时钟异常（回拨或 >1h 前跳）只作废**依赖 deadline 的**结算；mobile 轮次无 deadline，不因时钟异常被结算。
 
 ## I4 结算完备性与确定性（Settlement Completeness & Determinism）
 

@@ -1308,6 +1308,12 @@ class WaitingLifecycle:
             body["human_action"] = False
             conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call["call_id"], seq, self._dump(body)))
         for call in conn.execute("SELECT * FROM lifecycle_calls WHERE call_state IN ('accepted', 'in_progress')").fetchall():
+            if call["handled_on"] == _MOBILE:
+                # A clock jump invalidates *deadline-based* settlement. A
+                # mobile round has no owner-channel lease and, if the agent
+                # never polled, no agent lease either — it is stateless and
+                # must not be settled by a clock anomaly it does not depend on.
+                continue
             _, seq = self._machine.transition(conn, call["call_id"], "clock_expire", reason="clock_anomaly")
             body = self._terminal(call["interaction_id"], call["call_id"], "disconnected", "clock_anomaly", seq)
             body["human_action"] = False

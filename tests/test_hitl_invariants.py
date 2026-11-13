@@ -270,3 +270,32 @@ def test_progress_appears_in_feed_exactly_once_before_terminal(tmp_path):
     statuses = [e["outcome"]["status"] for e in mine]
     assert statuses == ["in_progress", "completed"], mine
     assert mine[0]["outcome"]["progress"] == "half"
+
+
+def test_mobile_round_survives_a_clock_jump(tmp_path):
+    """I3/I4: a stateless mobile round must not be settled by a clock anomaly."""
+    central = Central(tmp_path)
+    call = central.agent_create("mobile-clock-jump")
+    _accept(central, call, "mobile")
+
+    # A >1h forward jump trips the clock-anomaly guard.
+    central.clock.advance(4000)
+    outcome = central.agent_continue("settle", call, after=0)
+
+    assert outcome["call_state"] in ("accepted", "in_progress"), outcome
+    assert outcome.get("reason") != "clock_anomaly"
+    events = _events(central, str(call["call_id"]))
+    assert _terminal_events(events) == [], _terminal_events(events)
+
+
+def test_desktop_round_settles_on_clock_jump(tmp_path):
+    """The clock-anomaly guard still protects deadline-bearing desktop rounds."""
+    central = Central(tmp_path)
+    term = central.terminal_login("NIGHTHAWK")
+    call = central.agent_create("desktop-clock-jump")
+    term.ringed(call).accept()
+
+    central.clock.advance(4000)
+    outcome, _ = central.agent_follow(call, prefix="settle")
+    assert outcome["call_state"] == "disconnected"
+    assert outcome["reason"] == "clock_anomaly"
