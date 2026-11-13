@@ -22,7 +22,7 @@ import urllib.request
 
 CENTRAL = os.environ.get("HITL_CENTRAL", "https://10.10.0.1:9443").rstrip("/")
 TOKEN = os.environ.get("HITL_TOKEN", "")
-CHIDORI = os.environ.get("CHIDORI_URL", "http://127.0.0.1:8080")
+CHIDORI = os.environ.get("CHIDORI_URL", "http://10.10.0.1:8080")
 CHIDORI_TOKEN = os.environ.get("CHIDORI_API_KEY", "")
 POLL_SECONDS = float(os.environ.get("HITL_POLL_SECONDS", "5"))
 CURSOR_FILE = os.environ.get("HITL_CURSOR_FILE", "/var/lib/hitl-central/postman.cursor")
