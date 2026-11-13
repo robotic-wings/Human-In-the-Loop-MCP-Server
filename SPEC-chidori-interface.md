@@ -36,12 +36,12 @@ MCP 传输层（已实现）继续服务不受控 harness（Claude Code、Codex�
 中央服务（不变的人类侧：桌面响铃 / 手机网页 / DND / 勿扰 / 多操作员）
   │ 呼叫轮次按现有状态机推进；每次到达终局 → 追加到结果流
   ▼
-hitl-postman（detached bridge agent，同台 chidori serve）
+hitl_postman（Python systemd 桥，同台 chidori serve）
   │ 循环：GET 中央 /api/agent/outcomes?after=<cursor>   ← 新增：终局结果流
   │ 对每条 {call_id, target_agent, outcome}：
   │   POST chidori:/agents/detached/<target>/send
   │        {name: "hitl:<call_id>", payload: outcome, from: {kind:"human", id: callsign}}
-  │ 游标持久化在 chidori.memory，重启续传
+  │ 游标落本地文件，重启续传
 ```
 
 ### 职责划分（与 AGENTS.md 愿景一致）
@@ -50,8 +50,8 @@ hitl-postman（detached bridge agent，同台 chidori serve）
   `callsign`（照抄 MCP 路径的穿参）；② `lifecycle_calls` 加 `delivery_json` 列
   （创建时随请求写入）；③ 新增**传输中立**的"终局结果流"只读端点。不知道
   Chidori 的存在，不投递，不回调。MCP 层零改动。
-- **Chidori 传输层 = 两个 TS 文件**：工具模块（`hitl.ts`，消费者 import）+
-  投递桥（`hitl-postman.ts`，detached agent）。Chidori 特有的知识全部在这层。
+- **Chidori 传输层 = 一个 TS 工具模块 + 一个 Python 服务**：`hitl.ts`（消费者 import）+
+  投递桥（`hitl_postman.py`，systemd 服务）。Chidori 特有的知识全部在这层。
 - **人侧零改动**。
 
 ## 4. 交付物
@@ -87,11 +87,11 @@ const hitl = makeHitlTools({
    cancelled/not_accepted/declined 同为正常返回值，由 LLM 决策后续——
    与 MCP 层的语义完全一致。
 
-### 4.2 `hitl-postman.ts`（投递桥，detached agent）
+### 4.2 `hitl_postman.py`（投递桥，systemd 服务）
 
-- keep_alive detached agent；主循环 `chidori.alarm(poll_seconds)` 驱动。
+- systemd 服务；主循环 sleep(poll_seconds) 驱动。
 - 每轮：GET `/api/agent/outcomes?after=<cursor>&limit=100`（agent Bearer）→
-  逐条 send 到目标 agent → 成功后推进游标（`chidori.memory` 持久化）。
+  逐条 send 到目标 agent → 成功后推进游标（本地文件持久化）。
 - 投递幂等：信号名 `hitl:<call_id>` 全局唯一；目标 agent 每个呼叫恰好监听一次。
   Chidori 侧 409（terminal）或重复投递均安全（mailbox 只会被消费一次）。
 - **投递失败（目标 agent 已注销 / 连续 5 次 4xx）**：标记该条 `undeliverable`
@@ -106,7 +106,7 @@ const hitl = makeHitlTools({
   ...]`，`outcome` 为该呼叫终局事件的完整结构化结果（answered/completed/
   declined/cancelled/not_accepted/disconnected/unreachable）+ `next_after`。
 - 实现要点：`seq` 取自 `lifecycle_events` 全局单调序（按 event rowid 派生即可，
-  不引入新表）；只暴露**终局**事件（needs_continuation=false 的那批）；
+  不引入新表）；暴露**终局**事件（needs_continuation=false）和**进度**事件（status=in_progress 的进度报告，用于唤醒挂起中的 agent）；
   每条附该呼叫的 `delivery` 元数据（`delivery_json` 列）。
   游标语义 = 至少一次投递 + 幂等消费（两将军纪律：事实在日志里，流只是读视图）。
   投递失败标记由 postman 回写（`POST /api/agent/outcomes/ack`）——中央侧回写，
