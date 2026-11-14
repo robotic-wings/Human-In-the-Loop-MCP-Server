@@ -78,7 +78,8 @@ SETTLEMENT_CASES = [
     ("ringing-unanswered", None, False, False, 400, "not_accepted", "ring_timeout"),
     ("desktop-accepted-no-agent", "desktop", False, False, 181, "disconnected", "terminal_disconnected"),
     ("mobile-accepted-no-agent", "mobile", False, False, 400, None, None),  # stays active
-    ("desktop-accepted-agent-polled", "desktop", True, False, 31, "disconnected", "agent_disconnected"),
+    ("desktop-accepted-agent-polled", "desktop", True, False, 31, None, None),  # terminal alive: agent lease must NOT settle
+    ("desktop-accepted-agent-polled-terminal-gone", "desktop", True, False, 181, "disconnected", "terminal_disconnected"),
     ("mobile-accepted-agent-polled", "mobile", True, False, 31, "disconnected", "agent_disconnected"),
     ("desktop-in-progress", "desktop", False, True, 181, "disconnected", "terminal_disconnected"),
     ("mobile-in-progress", "mobile", False, True, 400, None, None),  # no lease, stays active

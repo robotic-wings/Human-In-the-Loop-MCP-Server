@@ -53,7 +53,7 @@
 **B. agent lease（`agent_lease_deadline`）** —— 只对 inline/长轮询 agent 存在
 
 - 由「向 agent 投递一个 resumable heartbeat」刷新（即 `response_delivered` 的语义，统一为一条规则）。
-- 过期 → `disconnected`（reason `agent_disconnected`）。
+- 过期 → `disconnected`（reason `agent_disconnected`）——**仅 mobile 轮次**。desktop 轮次的结算权在归属通道 lease：只要桌面终端还活着，agent lease 过期不能结算轮次（慢 agent ≠ 弃轮），否则活人正在做的工作会被 agent 的一次慢轮询误杀。
 - **detached 投递（chidori）没有 agent lease**：agent 不在轮询，投递活性由 postman 的 ack/undeliverable 表达，与轮次结算解耦。
 
 ### 2.4 结算（Settlement）—— 一张确定性规则表
@@ -65,7 +65,7 @@
 | ringing | now ≥ `ring_deadline` | `ring_expire` → not_accepted |
 | ringing | 无可用通道（create 时判） | `unreachable` |
 | accepted / in_progress | `owner_channel=desktop` 且 now ≥ `owner_lease_deadline` | `disconnect` → disconnected (terminal_disconnected) |
-| accepted / in_progress | 有 `agent_lease_deadline` 且 now ≥ 它 | `disconnect` → disconnected (agent_disconnected) |
+| accepted / in_progress | `owner_channel=mobile` 且 有 `agent_lease_deadline` 且 now ≥ 它 | `disconnect` → disconnected (agent_disconnected) |
 | 任意 | clock 回拨异常 | `clock_expire`（沿用现有语义） |
 
 结算由周期调度器驱动（沿用现有 deadline scheduler），并幂等：重放不重复结算。

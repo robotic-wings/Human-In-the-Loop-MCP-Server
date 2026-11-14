@@ -10,8 +10,10 @@ call — and it is written around one explicit model (see SPEC-refactor.md):
     ONLY for the desktop channel — a desktop terminal that stops heartbeating
     is gone. A mobile browser is stateless and has no such lease.
   - the *agent lease* (``agent_reconnect_deadline``), armed whenever a
-    resumable heartbeat is delivered to the agent. Expiry means the agent
-    abandoned the round.
+    resumable heartbeat is delivered to the agent. Its expiry settles only a
+    mobile round (``agent_disconnected``); on the desktop the owner-channel
+    lease is the settlement authority, so a live terminal overrides the agent
+    lease and the human's work is never discarded on the agent's account.
 * **Settlement** is one deterministic rule table (``_settle_due``), not a set
   of scattered per-field branches.
 
@@ -890,9 +892,45 @@ class WaitingLifecycle:
 
     def accept(self, *, call_id: str, device_id: str, handled_on: str,
                terminal_platform: str) -> dict[str, object]:
-        del device_id
-        return self._human_action(call_id, "opened", "accepted", None,
-                                  {"handled_on": handled_on, "terminal_platform": terminal_platform, "human_action": True})
+        """Accept a ringing call and establish ownership, exactly as the
+        production accept paths (``terminal_action`` / ``browser_action``) do:
+        the owner channel and its lease are written onto the call row, not
+        merely stamped onto the opened event. ``device_id`` names the owning
+        session."""
+        channel = handled_on if handled_on in (_DESKTOP, _MOBILE) else _DESKTOP
+        session_id = device_id
+        platform = terminal_platform if channel == _DESKTOP else "ios"
+        owner_id = device_id if channel == _DESKTOP else _MOBILE
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._settle_due(conn)
+                call = conn.execute("SELECT * FROM lifecycle_calls WHERE call_id=?", (call_id,)).fetchone()
+                if call is None:
+                    return self._error("session_not_found")
+                if call["call_state"] != "ringing":
+                    event = conn.execute(
+                        "SELECT body_json FROM lifecycle_events WHERE call_id=? ORDER BY event_seq DESC LIMIT 1",
+                        (call_id,),
+                    ).fetchone()
+                    return self._load(event["body_json"]) if event is not None else self._error("expired")
+                columns = self._accept_columns(channel, owner_id, session_id, platform, self._clock())
+                _, seq = self._machine.transition(conn, call_id, "accept", reason=None, columns=columns)
+                self._record_accept(conn, str(call["operator_callsign"]) if call["operator_callsign"] else None)
+                outcome = {
+                    "success": True, "status": "opened", "call_state": "accepted",
+                    "human_action": True, "needs_continuation": True,
+                    "interaction_id": call["interaction_id"], "call_id": call_id,
+                    "event_seq": seq, "owner_device_id": owner_id,
+                    "owner_session_id": session_id, "handled_on": channel,
+                    "terminal_platform": platform,
+                }
+                conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call_id, seq, self._dump(outcome)))
+                conn.commit()
+                return outcome
+            except BaseException:
+                conn.rollback()
+                raise
 
     def finish(self, *, call_id: str, status: str, result: Mapping[str, object]) -> dict[str, object]:
         return self._human_action(call_id, status, status, None, dict(result))
@@ -1266,9 +1304,11 @@ class WaitingLifecycle:
 
         * ringing + ring_deadline passed → ring_expire (not_accepted)
         * accepted/in_progress + owner-channel lease passed → terminal_disconnected
-        * accepted/in_progress + agent lease passed → agent_disconnected
-        (earlier of the two wins; the owner lease exists only on the desktop
-        channel, so a mobile round is never settled by it.)
+          (desktop only — a live terminal keeps the round open regardless of
+          the agent lease, so a slow agent never discards the human's work)
+        * accepted/in_progress + mobile + agent lease passed → agent_disconnected
+          (mobile has no owner lease, so the agent lease is its only liveness
+          signal)
         """
         now = self._clock()
         if self._clock_high_water is not None and (
@@ -1284,20 +1324,32 @@ class WaitingLifecycle:
             _, seq = self._machine.transition(conn, call["call_id"], "ring_expire", reason="ring_timeout", bump_version=False)
             body = self._terminal(call["interaction_id"], call["call_id"], "not_accepted", "ring_timeout", seq)
             conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call["call_id"], seq, self._dump(body)))
+        # Desktop: the owner-channel lease is the liveness authority. A live
+        # terminal means the human is present, so the round must NOT settle
+        # just because the agent stopped polling — a slow turn or a compacted
+        # context is not an abandonment. Only the terminal's expiry settles a
+        # desktop round, so the human's work is never discarded on the
+        # agent's account.
         for call in conn.execute(
             "SELECT * FROM lifecycle_calls WHERE call_state IN ('accepted', 'in_progress') "
-            "AND ((terminal_disconnect_deadline IS NOT NULL AND terminal_disconnect_deadline<=?) "
-            "OR (agent_reconnect_deadline IS NOT NULL AND agent_reconnect_deadline<=?))",
-            (now, now),
+            "AND terminal_disconnect_deadline IS NOT NULL AND terminal_disconnect_deadline<=?",
+            (now,),
         ).fetchall():
-            terminal_due = call["terminal_disconnect_deadline"] is not None and call["terminal_disconnect_deadline"] <= now
-            agent_due = call["agent_reconnect_deadline"] is not None and call["agent_reconnect_deadline"] <= now
-            if agent_due and (not terminal_due or call["agent_reconnect_deadline"] < call["terminal_disconnect_deadline"]):
-                reason = "agent_disconnected"
-            else:
-                reason = "terminal_disconnected"
-            _, seq = self._machine.transition(conn, call["call_id"], "disconnect", reason=reason)
-            body = self._terminal(call["interaction_id"], call["call_id"], "disconnected", reason, seq)
+            _, seq = self._machine.transition(conn, call["call_id"], "disconnect", reason="terminal_disconnected")
+            body = self._terminal(call["interaction_id"], call["call_id"], "disconnected", "terminal_disconnected", seq)
+            body["human_action"] = False
+            conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call["call_id"], seq, self._dump(body)))
+
+        # Mobile: stateless, no owner lease. The agent lease is the only
+        # liveness signal, so a mobile round whose agent stopped polling
+        # settles as agent_disconnected.
+        for call in conn.execute(
+            "SELECT * FROM lifecycle_calls WHERE call_state IN ('accepted', 'in_progress') "
+            "AND handled_on=? AND agent_reconnect_deadline IS NOT NULL AND agent_reconnect_deadline<=?",
+            (_MOBILE, now),
+        ).fetchall():
+            _, seq = self._machine.transition(conn, call["call_id"], "disconnect", reason="agent_disconnected")
+            body = self._terminal(call["interaction_id"], call["call_id"], "disconnected", "agent_disconnected", seq)
             body["human_action"] = False
             conn.execute("INSERT INTO lifecycle_events VALUES (?, ?, ?)", (call["call_id"], seq, self._dump(body)))
 

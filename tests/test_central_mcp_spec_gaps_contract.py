@@ -169,7 +169,7 @@ def test_declined_result_is_not_retryable(tmp_path: Path) -> None:
     assert response.json()["retryable"] is False
 
 
-def test_settlement_uses_earliest_disconnect_deadline(tmp_path: Path) -> None:
+def test_desktop_settlement_ignores_agent_lease(tmp_path: Path) -> None:
     clock = Clock()
     app = make_app(tmp_path, clock)
     ringing = app.lifecycle.create("agent-a", "r1", {"tool": "text"})
@@ -182,8 +182,10 @@ def test_settlement_uses_earliest_disconnect_deadline(tmp_path: Path) -> None:
         )
     clock.advance(200)
 
+    # A desktop round settles on the terminal lease alone: an earlier agent
+    # deadline must NOT settle a round the human's terminal still owns.
     result = app.lifecycle.continue_call("agent-a", "r2", ringing["interaction_id"], ringing["call_id"], after=1)
-    assert result["reason"] == "agent_disconnected"
+    assert result["reason"] == "terminal_disconnected"
 
 
 def test_health_check_reports_desktop_online_and_bark_config(tmp_path: Path) -> None:

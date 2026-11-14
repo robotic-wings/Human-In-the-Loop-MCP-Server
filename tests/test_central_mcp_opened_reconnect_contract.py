@@ -75,7 +75,7 @@ def continuation(call: dict[str, object], request_id: str, after: int = 0) -> di
 
 def accept_and_read_opened(app: Any, call: dict[str, object], request_id: str = "read-opened") -> dict[str, object]:
     accepted = app.lifecycle.accept(
-        call_id=str(call["call_id"]), device_id="desktop-1", handled_on="desktop", terminal_platform="windows"
+        call_id=str(call["call_id"]), device_id="mobile-1", handled_on="iphone_web", terminal_platform="ios"
     )
     assert accepted["status"] == "opened"
     opened = post(app, continuation(call, request_id))
@@ -166,4 +166,4 @@ def test_opened_expiry_survives_restart_releases_busy_and_rejects_late_finalizat
     next_call = create(restarted, "next-call")
     assert next_call["status"] == "heartbeat"
     assert len(notifications) == 1
-    assert restarted_notifications == [{"call_id": next_call["call_id"], "ring_deadline": clock() + 120, "title": "agent-a", "body": "Human-in-the-Loop request", "mobile_eligible": False}]
+    assert restarted_notifications == [{"call_id": next_call["call_id"], "ring_deadline": clock() + 120, "title": "agent-a", "body": "Human-in-the-Loop request", "mobile_eligible": False, "degraded": True, "quiet_mode": "short"}]

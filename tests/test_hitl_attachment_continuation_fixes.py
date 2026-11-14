@@ -123,10 +123,18 @@ def test_aborted_round_settles_cleanly(tmp_path: Path) -> None:
         ).fetchone()
     assert row[0] is not None, "opened heartbeat must arm the agent-reconnect deadline"
 
+    # A live desktop terminal keeps the round open: the agent's reconnect
+    # deadline must NOT settle a round the human's terminal still owns.
     central.clock.advance(31)
-    outcome, _ = central.agent_follow(call, prefix="regress-after")
+    outcome = central.agent_continue("regress-check", call, after=1)
+    assert outcome["call_state"] == "accepted", outcome
+    assert outcome["needs_continuation"] is True
+
+    # Only the terminal lease (180s) settles a desktop round.
+    central.clock.advance(150)  # total 181 > 180
+    outcome, _ = central.agent_follow(call, after=1, prefix="regress-after")
     assert outcome["status"] == "disconnected"
-    assert outcome["reason"] == "agent_disconnected"
+    assert outcome["reason"] == "terminal_disconnected"
     # busy line released
     assert central.agent_create("regress-next")["call_state"] == "ringing"
 

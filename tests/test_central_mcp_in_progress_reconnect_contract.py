@@ -79,7 +79,7 @@ def continuation(call: dict[str, object], request_id: str, after: int) -> dict[s
 
 def accept_and_read_opened(app: Any, call: dict[str, object]) -> None:
     accepted = app.lifecycle.accept(
-        call_id=str(call["call_id"]), device_id="desktop-1", handled_on="desktop", terminal_platform="windows"
+        call_id=str(call["call_id"]), device_id="mobile-1", handled_on="iphone_web", terminal_platform="ios"
     )
     assert accepted["status"] == "opened"
     opened = post(app, continuation(call, "opened", 0))
