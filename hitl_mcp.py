@@ -24,6 +24,7 @@ _HUMAN_LOOP_MANUAL = """HITL MCP Operating Manual (human-in-the-loop toolset)
 - The cursor only moves forward: whenever a response contains an event_seq, adopt it; when it is a plain heartbeat (no event), keep your current value exactly. Resetting to an old value re-drains old events forever and hides later ones (accept, progress, cancel) from you.
 - Each call already parks server-side for nearly client_timeout_seconds, so there is no need to re-call quickly; and while a round is open (needs_continuation=true) never report the task as done, failed, or abandoned — either keep waiting or end it explicitly with cancel_interaction.
 - opened (human accepted) and in_progress (human working, may carry progress reports) both mean "keep waiting": continue the round. Do NOT start a new call (it returns busy).
+- If you lost the interaction_id/call_id of a round you were waiting on (context compaction, session restart), call list_my_interactions: it returns your own open rounds with their handles, so you can resume instead of orphaning the round.
 
 3. Terminal outcomes (needs_continuation=false ends the round)
 - answered: simple answer, in result.
@@ -168,6 +169,12 @@ _MCP_TOOLS = (
      "description": "Return the HITL operating manual (wait model, continuation cursor, outcomes). "
                     "Call this before your first interactive tool call.",
      "inputSchema": {"type": "object"}},
+    {"name": "list_my_interactions", "kind": "readonly",
+     "description": "List your own open (not-yet-settled) human-in-the-loop rounds. Use this to "
+                    "rediscover a round after a context loss or compaction: each entry returns the "
+                    "interaction_id and call_id you need to resume it by calling the same tool with "
+                    "after_event_seq. Only your caller's rounds are ever returned.",
+     "inputSchema": {"type": "object"}},
     {"name": "cancel_interaction", "kind": "control",
      "description": "End one open round (yours or the human's) to release the single line, e.g. when the "
                     "human accepted but has stalled for many rounds.",
@@ -243,7 +250,7 @@ class McpRpcMixin:
         elif kind == "read":
             structured = self._rpc_read_tool(caller, name, arguments)
         else:
-            structured = self._rpc_readonly(name, arguments)
+            structured = self._rpc_readonly(caller, name, arguments)
         after = arguments.get("after_event_seq")
         cursor_hint = after if isinstance(after, int) and not isinstance(after, bool) and after >= 0 else 0
         if isinstance(structured, dict) and structured.get("needs_continuation") and isinstance(structured.get("interaction_id"), str):
@@ -346,7 +353,7 @@ class McpRpcMixin:
             )
         raise _RpcError(-32602, "Invalid params")
 
-    def _rpc_readonly(self, name: str, arguments: Mapping[str, object] | None = None) -> dict[str, object]:
+    def _rpc_readonly(self, caller: str, name: str, arguments: Mapping[str, object] | None = None) -> dict[str, object]:
         if name == "list_operators":
             listing = self.lifecycle.directory_view()
             for entry in listing:
@@ -388,6 +395,9 @@ class McpRpcMixin:
             }
         if name == "get_human_loop_prompt":
             return {"success": True, "status": "ok", "prompt": _HUMAN_LOOP_MANUAL}
+        if name == "list_my_interactions":
+            calls = self.lifecycle.list_open_calls(caller)
+            return {"success": True, "status": "ok", "result": {"interactions": calls}}
         raise _RpcError(-32602, "Invalid params")
 
     @staticmethod

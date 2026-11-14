@@ -468,6 +468,48 @@ class WaitingLifecycle:
         with self._connection() as conn:
             return self._request_row(conn, caller_id, request_id) is not None
 
+    def list_open_calls(self, caller_id: str) -> list[dict[str, object]]:
+        """Enumerate a caller's active (not-yet-settled) rounds.
+
+        This is the rediscovery path: an agent whose context was compacted
+        has lost the ``interaction_id``/``call_id`` it needs to continue a
+        round, and no other server-side handle points back at it. Each entry
+        carries enough to resume (``interaction_id`` + ``call_id``; the
+        continuation cursor is the returned event stream's high-water mark).
+        """
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._settle_due(conn)
+                rows = conn.execute(
+                    "SELECT call_id, interaction_id, call_state, payload_json, operator_callsign, created_at "
+                    "FROM lifecycle_calls WHERE caller_id=? AND call_state IN ('ringing','accepted','in_progress') "
+                    "ORDER BY created_at",
+                    (caller_id,),
+                ).fetchall()
+                result: list[dict[str, object]] = []
+                for row in rows:
+                    tool = None
+                    try:
+                        payload = self._load(row["payload_json"])
+                        if isinstance(payload, dict):
+                            tool = payload.get("tool")
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        tool = None
+                    result.append({
+                        "interaction_id": row["interaction_id"],
+                        "call_id": row["call_id"],
+                        "call_state": row["call_state"],
+                        "tool": tool,
+                        "operator": row["operator_callsign"],
+                        "created_at": row["created_at"],
+                    })
+                conn.commit()
+                return result
+            except BaseException:
+                conn.rollback()
+                raise
+
     def continue_call(self, caller_id: str, request_id: str, interaction_id: str, call_id: str,
                       after: int) -> dict[str, object] | None:
         encoded = self._dump({"interaction_id": interaction_id, "call_id": call_id, "after_event_seq": after})
