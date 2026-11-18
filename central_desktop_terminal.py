@@ -1174,7 +1174,6 @@ def main(argv: list[str] | None = None) -> None:
     ring = RingtonePlayer(ringtone_path=selection.long_ringtone_path, ringtone_alt_path=config.ringtone_alt_path, bell=root.bell, short_ringtone_path=selection.short_ringtone_path)
     client = DesktopTerminalClient(config={"callsign": config.callsign, "operator_password": config.operator_password, "device_id": config.device_id, "terminal_credential": config.terminal_credential, "callback_credential": config.callback_credential}, central=central, listener=_TerminalListener(), gui_capability=lambda: True, ring=ring, presenter=presenter)
     holder["client"] = client
-    build_settings_panel(root, ring, central, config.ringtones_dir, scan_ringtones(config.ringtones_dir), selection.panel_ringtone_path, tk, selection.short_ringtone_path, short_state_file)
     if config.listener_scheme == "https" and (not config.listener_tls_cert_file or not config.listener_tls_key_file):
         raise SystemExit("desktop terminal unavailable: HTTPS listener requires listener_tls_cert_file and listener_tls_key_file")
     server = uvicorn.Server(uvicorn.Config(
@@ -1197,59 +1196,94 @@ def main(argv: list[str] | None = None) -> None:
         run_worker=run_worker,
         schedule_ui=root.after,
     )
-    root.deiconify(); root.title("HITL 操作台")
-    # Closing the console only hides it: the terminal keeps running in the
-    # background (heartbeat, listener and call dialogs are all independent
-    # of the console window's visibility). Launching the terminal again
-    # sends SIGUSR1 and brings the console back; quit for real via
-    # launchctl unload or kill.
+    # The console is ephemeral; the process is permanent. root stays
+    # withdrawn forever and only hosts the event loop. Every surface —
+    # launch, reopen — builds a FRESH Toplevel, because macOS maps new
+    # windows onto the currently active Space (the same property that
+    # makes incoming-call dialogs appear wherever the human is), while
+    # restoring a withdrawn window can never cross Spaces and no
+    # programmatic activation may yank it across. Closing the console
+    # destroys the Toplevel; the heartbeat, listener and call dialogs
+    # are untouched.
+    console_state: dict[str, Any] = {"window": None}
+
+    def _pin_console(*, surface: bool) -> None:
+        """Make the console join every Space (and briefly float above
+        everything while it surfaces). macOS never moves a window across
+        Spaces on its own, so an ordinary window is invisible whenever the
+        human is on another desktop — solved by the public
+        canJoinAllSpaces + moveToActiveSpace collection behaviors, applied
+        to the shared NSApplication's window titled like our console."""
+        try:
+            from AppKit import NSApplication, NSWindowCollectionBehaviorCanJoinAllSpaces
+
+            for candidate in NSApplication.sharedApplication().windows():
+                if candidate is not None and candidate.title() == "HITL 操作台":
+                    candidate.setCollectionBehavior_(NSWindowCollectionBehaviorCanJoinAllSpaces)
+                    candidate.setLevel_(25 if surface else 0)
+        except Exception as error:  # pragma: no cover — best effort
+            print(f"console: pin failed ({error!r})", flush=True)
+
+    def _build_console() -> None:
+        old = console_state.get("window")
+        if old is not None:
+            try:
+                old.destroy()
+            except Exception:
+                pass
+        console = tk.Toplevel(root)
+        console.title("HITL 操作台")
+        console.protocol("WM_DELETE_WINDOW", console.destroy)
+        current = startup_ringtone_selection(config, prefs_file)
+        build_settings_panel(console, ring, central, config.ringtones_dir,
+                              scan_ringtones(config.ringtones_dir),
+                              current.panel_ringtone_path, tk,
+                              current.short_ringtone_path, short_state_file)
+        try:
+            console.attributes("-topmost", True)
+            console.after(400, lambda: console.attributes("-topmost", False))
+        except Exception:
+            pass
+        console.lift()
+        _pin_console(surface=True)
+        console.after(1200, lambda: _pin_console(surface=False))
+        console_state["window"] = console
+        print(f"console: built winfo_id={console.winfo_id()}", flush=True)
+
+    def _console_state() -> object:
+        window = console_state.get("window")
+        if window is None:
+            return "no console window"
+        try:
+            return (window.winfo_ismapped(), window.winfo_rootx(),
+                    window.winfo_rooty(), window.winfo_width(), window.winfo_height())
+        except Exception as error:  # the window was destroyed
+            return repr(error)
+
     reopen = threading.Event()
     signal.signal(signal.SIGUSR1, lambda _signum, _frame: reopen.set())
-    # Symmetric hide signal: withdraw the console without touching the
+    # Symmetric hide signal: close the console without touching the
     # process (mirrors the close button; useful for scripting and tests).
-    signal.signal(signal.SIGUSR2, lambda _signum, _frame: root.after(0, root.withdraw))
+    signal.signal(signal.SIGUSR2, lambda _signum, _frame: root.after(0, _close_console))
 
-    def _surface_console() -> None:
-        # macOS Tk quirk: deiconify() on a withdrawn window maps it, but
-        # does not bring the app forward — the window lands behind whatever
-        # is frontmost (or on another Space) and reads as "did not open".
-        # state("normal") is the canonical restore for BOTH withdrawn and
-        # Dock-minimized windows; the topmost toggle forces it above every
-        # window. Diagnostics go to terminal.log so the restore is
-        # verifiable without a GUI.
-        def _state() -> object:
+    def _close_console() -> None:
+        window = console_state.get("window")
+        if window is not None:
             try:
-                return (root.state(), root.winfo_ismapped(),
-                        root.winfo_rootx(), root.winfo_rooty(),
-                        root.winfo_width(), root.winfo_height())
-            except Exception as error:  # pragma: no cover
-                return repr(error)
-        print(f"console: reopen requested (before {_state()})", flush=True)
-        try:
-            root.state("normal")
-        except Exception:
-            pass
-        root.deiconify(); root.lift()
-        try:
-            root.attributes("-topmost", True)
-            root.after(400, lambda: root.attributes("-topmost", False))
-        except Exception:
-            pass
-        root.after(600, lambda: print(f"console: after surface {_state()}", flush=True))
-        subprocess.Popen(
-            ["osascript", "-e",
-             'tell application "System Events" to set frontmost of every process '
-             'whose name contains "Python" to true'],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+                window.destroy()
+            except Exception:
+                pass
+            console_state["window"] = None
 
     def _watch_reopen() -> None:
         if reopen.is_set():
             reopen.clear()
-            _surface_console()
+            print(f"console: rebuild requested (before {_console_state()})", flush=True)
+            _build_console()
+            root.after(600, lambda: print(f"console: after rebuild {_console_state()}", flush=True))
         root.after(500, _watch_reopen)
 
-    root.protocol("WM_DELETE_WINDOW", root.withdraw)
+    _build_console()
     _watch_reopen()
     try:
         root.mainloop()
