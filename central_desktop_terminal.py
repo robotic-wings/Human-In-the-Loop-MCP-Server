@@ -1205,20 +1205,37 @@ def main(argv: list[str] | None = None) -> None:
     # launchctl unload or kill.
     reopen = threading.Event()
     signal.signal(signal.SIGUSR1, lambda _signum, _frame: reopen.set())
+    # Symmetric hide signal: withdraw the console without touching the
+    # process (mirrors the close button; useful for scripting and tests).
+    signal.signal(signal.SIGUSR2, lambda _signum, _frame: root.after(0, root.withdraw))
 
     def _surface_console() -> None:
         # macOS Tk quirk: deiconify() on a withdrawn window maps it, but
         # does not bring the app forward — the window lands behind whatever
         # is frontmost (or on another Space) and reads as "did not open".
-        # A topmost toggle forces it above every window; the System Events
-        # activation makes the app itself frontmost when permitted.
-        print("console: reopen requested", flush=True)
+        # state("normal") is the canonical restore for BOTH withdrawn and
+        # Dock-minimized windows; the topmost toggle forces it above every
+        # window. Diagnostics go to terminal.log so the restore is
+        # verifiable without a GUI.
+        def _state() -> object:
+            try:
+                return (root.state(), root.winfo_ismapped(),
+                        root.winfo_rootx(), root.winfo_rooty(),
+                        root.winfo_width(), root.winfo_height())
+            except Exception as error:  # pragma: no cover
+                return repr(error)
+        print(f"console: reopen requested (before {_state()})", flush=True)
+        try:
+            root.state("normal")
+        except Exception:
+            pass
         root.deiconify(); root.lift()
         try:
             root.attributes("-topmost", True)
             root.after(400, lambda: root.attributes("-topmost", False))
         except Exception:
             pass
+        root.after(600, lambda: print(f"console: after surface {_state()}", flush=True))
         subprocess.Popen(
             ["osascript", "-e",
              'tell application "System Events" to set frontmost of every process '
