@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -1205,10 +1206,30 @@ def main(argv: list[str] | None = None) -> None:
     reopen = threading.Event()
     signal.signal(signal.SIGUSR1, lambda _signum, _frame: reopen.set())
 
+    def _surface_console() -> None:
+        # macOS Tk quirk: deiconify() on a withdrawn window maps it, but
+        # does not bring the app forward — the window lands behind whatever
+        # is frontmost (or on another Space) and reads as "did not open".
+        # A topmost toggle forces it above every window; the System Events
+        # activation makes the app itself frontmost when permitted.
+        print("console: reopen requested", flush=True)
+        root.deiconify(); root.lift()
+        try:
+            root.attributes("-topmost", True)
+            root.after(400, lambda: root.attributes("-topmost", False))
+        except Exception:
+            pass
+        subprocess.Popen(
+            ["osascript", "-e",
+             'tell application "System Events" to set frontmost of every process '
+             'whose name contains "Python" to true'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
     def _watch_reopen() -> None:
         if reopen.is_set():
             reopen.clear()
-            root.deiconify(); root.lift(); root.focus_force()
+            _surface_console()
         root.after(500, _watch_reopen)
 
     root.protocol("WM_DELETE_WINDOW", root.withdraw)
