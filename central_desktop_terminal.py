@@ -12,6 +12,7 @@ import base64
 import hashlib
 import json
 import os
+import signal
 import sys
 import tempfile
 import threading
@@ -1154,7 +1155,15 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(f"desktop terminal unavailable: {error}") from error
     lock_path = Path(tempfile.gettempdir()) / f"hitl-desktop-{hashlib.sha256(config.central_url.encode('utf-8')).hexdigest()}.lock"
     if not acquire_instance_lock(lock_path):
-        raise SystemExit("desktop terminal unavailable: another instance is already running")
+        # The running instance owns the console. Ask it to surface its
+        # window instead of failing: launching the terminal again is the
+        # documented way to re-open a console that was closed to the
+        # background.
+        try:
+            os.kill(int(Path(lock_path).read_text(encoding="utf-8").strip()), signal.SIGUSR1)
+        except (ValueError, OSError):
+            pass
+        raise SystemExit(0)
     central = CentralHttpDesktopClient(config)
     holder: dict[str, DesktopTerminalClient] = {}
     presenter = TkPresentation(root, lambda: holder["client"])
@@ -1188,6 +1197,22 @@ def main(argv: list[str] | None = None) -> None:
         schedule_ui=root.after,
     )
     root.deiconify(); root.title("HITL 操作台")
+    # Closing the console only hides it: the terminal keeps running in the
+    # background (heartbeat, listener and call dialogs are all independent
+    # of the console window's visibility). Launching the terminal again
+    # sends SIGUSR1 and brings the console back; quit for real via
+    # launchctl unload or kill.
+    reopen = threading.Event()
+    signal.signal(signal.SIGUSR1, lambda _signum, _frame: reopen.set())
+
+    def _watch_reopen() -> None:
+        if reopen.is_set():
+            reopen.clear()
+            root.deiconify(); root.lift(); root.focus_force()
+        root.after(500, _watch_reopen)
+
+    root.protocol("WM_DELETE_WINDOW", root.withdraw)
+    _watch_reopen()
     try:
         root.mainloop()
     finally:
