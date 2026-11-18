@@ -1207,23 +1207,17 @@ def main(argv: list[str] | None = None) -> None:
     # are untouched.
     console_state: dict[str, Any] = {"window": None}
 
-    def _pin_console(*, surface: bool) -> None:
-        """Make the console join every Space (and briefly float above
-        everything while it surfaces). macOS never moves a window across
-        Spaces on its own, so an ordinary window is invisible whenever the
-        human is on another desktop — solved by the public
-        canJoinAllSpaces + moveToActiveSpace collection behaviors, applied
-        to the shared NSApplication's window titled like our console."""
-        try:
-            from AppKit import NSApplication, NSWindowCollectionBehaviorCanJoinAllSpaces
-
-            for candidate in NSApplication.sharedApplication().windows():
-                if candidate is not None and candidate.title() == "HITL 操作台":
-                    candidate.setCollectionBehavior_(NSWindowCollectionBehaviorCanJoinAllSpaces)
-                    candidate.setLevel_(25 if surface else 0)
-        except Exception as error:  # pragma: no cover — best effort
-            print(f"console: pin failed ({error!r})", flush=True)
-
+    # Empirically established 2026-11-19: the console was last SEEN by the
+    # human exactly when the AppKit "pin" (canJoinAllSpaces + setLevel_)
+    # raised and left the window untouched — a bare Tk Toplevel, layer 0,
+    # default collection behavior. Every build in which the pin succeeded
+    # was invisible on all physical screens even though the window server
+    # listed the window as on-screen. The incoming-call dialogs — plain
+    # Toplevels with no pin, no topmost, no geometry override — have never
+    # failed to appear. TKWindow + collection-behavior mutation is the
+    # prime suspect for the invisibility, so the console is built exactly
+    # like a call dialog: bare Toplevel, lift, nothing else. Fresh windows
+    # map onto the active Space; that is the whole strategy.
     def _build_console() -> None:
         old = console_state.get("window")
         if old is not None:
@@ -1239,21 +1233,22 @@ def main(argv: list[str] | None = None) -> None:
                               scan_ringtones(config.ringtones_dir),
                               current.panel_ringtone_path, tk,
                               current.short_ringtone_path, short_state_file)
-        try:
-            console.attributes("-topmost", True)
-            console.after(400, lambda: console.attributes("-topmost", False))
-        except Exception:
-            pass
-        console.lift()
-        _pin_console(surface=True)
-        console.after(1200, lambda: _pin_console(surface=False))
         console_state["window"] = console
         print(f"console: built winfo_id={console.winfo_id()}", flush=True)
+
+    def _alive(window: Any) -> bool:
+        try:
+            window.winfo_rootx()
+            return True
+        except Exception:
+            return False
 
     def _console_state() -> object:
         window = console_state.get("window")
         if window is None:
             return "no console window"
+        if not _alive(window):
+            return "destroyed"
         try:
             return (window.winfo_ismapped(), window.winfo_rootx(),
                     window.winfo_rooty(), window.winfo_width(), window.winfo_height())
