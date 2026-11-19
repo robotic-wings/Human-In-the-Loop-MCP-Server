@@ -37,6 +37,9 @@ class FakeWidget:
     def columnconfigure(self, *_args: object, **_kwargs: object) -> None:
         return None
 
+    def bind(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
 
 
 class FakeStringVar:
@@ -55,6 +58,8 @@ class FakeEntry:
         return self
     def grid(self, *_args: object, **_kwargs: object) -> "FakeEntry":
         return self
+    def bind(self, *_args: object, **_kwargs: object) -> None:
+        return None
 
 
     def get(self) -> str:
@@ -161,7 +166,7 @@ def _presentation(central: FakeCentral) -> TkPresentation:
 def _attach_command(monkeypatch: Any, tk: FakeTk, central: FakeCentral) -> Any:
     monkeypatch.setitem(sys.modules, "tkinter", tk)
     presentation = _presentation(central)
-    presentation._answer("call-1", {"payload": {"tool": "get_text_input", "prompt": "x"}})
+    presentation.show_accepted({"call_id": "call-1", "payload": {"tool": "get_text_input", "prompt": "x"}})
     attach = next(button for button in tk.buttons if button.get("text") == "添加附件")
     return attach["command"]
 

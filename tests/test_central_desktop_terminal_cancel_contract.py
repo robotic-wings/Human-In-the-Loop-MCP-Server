@@ -92,6 +92,10 @@ class FakeWidget:
         return None
 
 
+    def bind(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+
     def destroy(self) -> None:
         pass
 
@@ -190,7 +194,7 @@ def test_answer_dialog_exposes_cancel_button_that_ends_the_round(monkeypatch: An
     terminal = FakeTerminal()
     presentation = TkPresentation(root=FakeWidget(), client_ref=lambda: terminal)
 
-    presentation._answer("call-1", {"payload": {"tool": "get_text_input", "prompt": "x"}})
+    presentation.show_accepted({"call_id": "call-1", "payload": {"tool": "get_text_input", "prompt": "x"}})
 
     cancel_button = next(
         (button for button in fake_tk.buttons if str(button.get("text", "")) == "取消"),

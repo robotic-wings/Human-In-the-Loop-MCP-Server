@@ -65,12 +65,18 @@ class FakeText:
     def pack(self, *_args: object, **_kwargs: object) -> "FakeText":
         return self
 
+    def bind(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
 
 class FakeEntry:
     def pack(self, *_args: object, **_kwargs: object) -> "FakeEntry":
         return self
     def grid(self, *_args: object, **_kwargs: object) -> "FakeEntry":
         return self
+
+    def bind(self, *_args: object, **_kwargs: object) -> None:
+        return None
 
 
     def get(self) -> str:
@@ -169,7 +175,7 @@ def _report_progress_command(monkeypatch: Any, central: FakeCentral) -> tuple[Fa
     monkeypatch.setitem(sys.modules, "tkinter", tk)
     terminal = FakeTerminal(central)
     presentation = TkPresentation(root=object(), client_ref=lambda: terminal)
-    presentation._answer("call-1", {"payload": {"tool": "assign_task_to_human", "task_description": "deploy"}})
+    presentation.show_accepted({"call_id": "call-1", "payload": {"tool": "assign_task_to_human", "task_description": "deploy"}})
     button = next(b for b in tk.buttons if b.get("text") == "报告进度")
     return tk, button["command"]
 

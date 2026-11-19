@@ -197,8 +197,14 @@ class Application(McpRpcMixin):
                 await self._send(send, 400, self._error("invalid_request")); return
             response = service.heartbeat(session_id=session, gui_ready=gui_ready)
         elif method == "GET" and path == "/api/terminals/state":
-            response = service.states(session_id=session)
             context = self._terminal_context(session)
+            if context is not None:
+                # A restarted terminal polls with a fresh session: rebind
+                # this device's in-progress rounds to it before reporting
+                # state, so a reopened answer surface can submit under the
+                # live session handle (owner identity itself never moves).
+                self.lifecycle.reattach_owner_sessions(context[0], session)
+            response = service.states(session_id=session)
             if response.get("success") and context is not None:
                 device_id, _platform, _operator = context
                 central_states = self.lifecycle.terminal_states(device_id)
@@ -361,7 +367,7 @@ class Application(McpRpcMixin):
             payload = self.lifecycle._load(call["payload_json"])
         except (TypeError, ValueError, json.JSONDecodeError):
             payload = {}
-        return {
+        view: dict[str, object] = {
             "success": True, "call_id": call_id, "call_state": state,
             "version": call["version"], "handled_on": call["handled_on"],
             "terminal_platform": call["terminal_platform"],
@@ -369,6 +375,13 @@ class Application(McpRpcMixin):
             "can_decline": state == "ringing" and invited,
             "payload": payload if isinstance(payload, Mapping) else {},
         }
+        if owned and state in ("accepted", "in_progress"):
+            # Draft continuity across terminal restarts: partial human input
+            # belongs to the round, not to the process that happened to be
+            # typing it (I8-adjacent: readable by the owning surface only).
+            view["draft_content"] = call["draft_content"] if call["draft_content"] is not None else ""
+            view["draft_version"] = int(call["draft_version"] or 0)
+        return view
 
     async def _agent_outcomes_api(self, method: object, path: object, headers: object,
                                    query_string: str, receive: Any, send: Any) -> None:

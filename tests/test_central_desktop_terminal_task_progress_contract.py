@@ -125,6 +125,9 @@ class FakeWidget:
     def insert(self, *_args: object, **_kwargs: object) -> None:
         pass
 
+    def bind(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
 
 class FakeStringVar:
     def __init__(self, value: str = "") -> None:
@@ -231,7 +234,7 @@ def _open_task_dialog(monkeypatch: Any) -> tuple[FakeTk, FakeTerminal]:
     monkeypatch.setitem(sys.modules, "tkinter", fake_tk)
     terminal = FakeTerminal()
     presentation = TkPresentation(root=FakeWidget(), client_ref=lambda: terminal)
-    presentation._answer("call-1", {"payload": {"tool": "task", "task_description": "Deploy the service"}})
+    presentation.show_accepted({"call_id": "call-1", "payload": {"tool": "task", "task_description": "Deploy the service"}})
     return fake_tk, terminal
 
 

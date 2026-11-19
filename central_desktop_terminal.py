@@ -49,6 +49,7 @@ class DesktopTerminalClient:
         self._online = False
         self._gui_ready = False
         self._shown: dict[str, int] = {}
+        self._answers: dict[str, int] = {}
         self._operations: dict[tuple[str, str, str], dict[str, object]] = {}
 
     def start(self) -> dict[str, object]:
@@ -99,6 +100,10 @@ class DesktopTerminalClient:
             return {"success": False, "status": "session_not_found"}
         if self._shown.get(call_id, -1) >= version:
             return {"success": True, "status": "duplicate", "call_id": call_id}
+        if self._answers.get(call_id, -1) >= version:
+            # Already presenting this round's answer surface at this
+            # version: skip the per-tick re-read (sync() still watches it).
+            return {"success": True, "status": "duplicate", "call_id": call_id}
         try:
             state = self._central.read_call(call_id, self._session_id)
         except (ConnectionError, OSError):
@@ -113,11 +118,20 @@ class DesktopTerminalClient:
                 return {"success": True, "status": "synchronized", "call_id": call_id}
             return {"success": False, "status": "session_not_found"}
         self.listener.acknowledge(dict(event))
-        if state.get("call_state") != "ringing":
-            if state.get("call_state") == "accepted" and state.get("handled_on") == "iphone_web":
-                show_hint = getattr(self.presenter, "show_handled_hint", None)
-                if callable(show_hint):
-                    show_hint(call_id, "已在手机端接听")
+        current = state.get("call_state")
+        if current in ("accepted", "in_progress"):
+            # The call view serves accepted rounds to their owner only, so
+            # reaching here means this device owns the round.  A live window
+            # is deduped by the presenter; a missing one means the process
+            # restarted while the human was answering — reopen it.
+            self._close(call_id)
+            show_accepted = getattr(self.presenter, "show_accepted", None)
+            if callable(show_accepted) and call_id not in self._answers:
+                self._answers[call_id] = version
+                show_accepted(state)
+                return {"success": True, "status": "reopened", "call_id": call_id}
+            return {"success": True, "status": "synchronized", "call_id": call_id}
+        if current != "ringing":
             self._close(call_id)
             return {"success": True, "status": "synchronized", "call_id": call_id}
         self._shown[call_id] = version
@@ -144,14 +158,32 @@ class DesktopTerminalClient:
         if not self._online or self._session_id is None:
             return {"success": False, "status": "central_unavailable"}
         call_ids = list(self._shown)
+        answer_ids = list(self._answers)
         try:
             for call_id in call_ids:
                 state = self._central.read_call(call_id, self._session_id)
                 if not state.get("success") or state.get("call_state") != "ringing":
                     self._close(call_id)
+            for call_id in answer_ids:
+                state = self._central.read_call(call_id, self._session_id)
+                if not state.get("success") or state.get("call_state") not in ("accepted", "in_progress"):
+                    self._close_answer(call_id)
         except (ConnectionError, OSError):
             return self._central_lost()
         return {"success": True, "status": "synchronized", "call_ids": call_ids}
+
+    def _close_answer(self, call_id: str) -> None:
+        """Retire an answer surface whose round left the human-active states.
+
+        Central loss deliberately does NOT close answer surfaces: the human
+        keeps typing and retries; only a settled/superseded round closes it.
+        """
+
+        if call_id in self._answers:
+            del self._answers[call_id]
+            close_answer = getattr(self.presenter, "close_answer", None)
+            if callable(close_answer):
+                close_answer(call_id)
 
     def _act(self, action: str, call_id: str, operation_id: str) -> dict[str, object]:
         # Operation identifiers are idempotent only within their call.  A
@@ -175,6 +207,11 @@ class DesktopTerminalClient:
                 state = self._central.read_call(call_id, self._session_id)
             except (ConnectionError, OSError):
                 return self._central_lost()
+            # The presenter opened the answer surface; track it so later
+            # sync feeds recognise the round as already being shown.  A
+            # view without a version counts as 0: the next poll re-reads
+            # and the presenter still dedupes the window itself.
+            self._answers[call_id] = state["version"] if isinstance(state.get("version"), int) else 0
             result = {**result, **{key: state[key] for key in ("handled_on", "terminal_platform") if key in state}}
         self._operations[cache_key] = dict(result)
         return result
@@ -650,6 +687,12 @@ class CentralHttpDesktopClient:
             "content": base64.b64encode(content).decode("ascii"),
         })
 
+    def save_draft(self, call_id: str, draft_version: int, content: str) -> dict[str, object]:
+        """Persist partial human input on the round row (restart continuity)."""
+        return self._request("PUT", f"/api/calls/{call_id}/draft", json_body={
+            "draft_version": draft_version, "content": content,
+        })
+
     def cancel(self, call_id: str, operation_id: str) -> dict[str, object]:
         return self._request("POST", f"/api/calls/{call_id}/cancel", json_body={"operation_id": operation_id})
 
@@ -680,6 +723,7 @@ class TkPresentation:
         self._root, self._client_ref, self._windows = root, client_ref, {}
         self._calls: dict[str, dict[str, object]] = {}
         self._buttons: dict[str, tuple[Any, Any]] = {}
+        self._answer_windows: dict[str, Any] = {}
 
     def show(self, state: dict[str, object]) -> None:
         call_id = state.get("call_id")
@@ -730,7 +774,7 @@ class TkPresentation:
         self._stop_ring_now(call_id)
         result = self._client_ref().accept(call_id=call_id, operation_id=uuid.uuid4().hex)
         if result.get("success"):
-            self._answer(call_id, self._calls.get(call_id, {}))
+            self.show_accepted(self._calls.get(call_id, {"call_id": call_id}))
         else:
             self._calls.pop(call_id, None)
 
@@ -747,7 +791,35 @@ class TkPresentation:
             ring.stop(call_id)
         self.close(call_id)
 
-    def _answer(self, call_id: str, state: Mapping[str, object]) -> None:
+    def show_accepted(self, state: dict[str, object]) -> None:
+        """Open (once) the answer surface for a round this device owns.
+
+        Called right after a local accept and, with a freshly read call
+        view, when a restarted terminal reconciles rounds that are still
+        accepted/in_progress on central.  The dialog deduplicates per
+        call_id, so re-feeding from the poll never stacks windows.
+        """
+        call_id = state.get("call_id")
+        if not isinstance(call_id, str) or call_id in self._answer_windows:
+            return
+        payload = state.get("payload")
+        payload = dict(payload) if isinstance(payload, Mapping) else {}
+        enriched = {**state, "payload": payload}
+        dialog = self._build_answer_dialog(call_id, enriched)
+        if dialog is not None:
+            self._answer_windows[call_id] = dialog
+            self._calls[call_id] = enriched
+
+    def close_answer(self, call_id: str) -> None:
+        window = self._answer_windows.pop(call_id, None)
+        self._calls.pop(call_id, None)
+        if window is not None:
+            try:
+                window.destroy()
+            except Exception:
+                pass
+
+    def _build_answer_dialog(self, call_id: str, state: Mapping[str, object]) -> Any:
         import tkinter as tk
         dialog = tk.Toplevel(self._root)
         dialog.title("回答")
@@ -757,7 +829,42 @@ class TkPresentation:
         prompt = payload.get("prompt") or payload.get("message") or payload.get("task_description") or "请完成此请求"
         tk.Label(dialog, text=str(prompt), wraplength=620, justify="left").pack(padx=12, pady=(12, 6), anchor="w")
         error = tk.StringVar(value="")
-        build_result = self._response_controls(dialog, tool, payload, tk)
+
+        draft_text = state.get("draft_content")
+        draft_text = draft_text if isinstance(draft_text, str) else ""
+        draft_version = {"value": int(state.get("draft_version") or 0)}
+        draft_pending: dict[str, object] = {"after_id": None}
+
+        def save_draft_now(*_args: object) -> None:
+            draft_pending["after_id"] = None
+            source = getattr(build_result, "draft", None)
+            if not callable(source):
+                return
+            try:
+                content = source()
+            except Exception:
+                return
+            if not content:
+                return
+            draft_version["value"] += 1
+            try:
+                response = self._client_ref()._central.save_draft(call_id, draft_version["value"], content)
+            except Exception:
+                draft_version["value"] -= 1
+                return
+            if not response.get("success"):
+                draft_version["value"] -= 1
+
+        def schedule_draft() -> None:
+            after = draft_pending.get("after_id")
+            if after is not None:
+                try:
+                    dialog.after_cancel(after)
+                except Exception:
+                    pass
+            draft_pending["after_id"] = dialog.after(800, save_draft_now)
+
+        build_result = self._response_controls(dialog, tool, payload, tk, draft_text, schedule_draft)
         build_progress = getattr(build_result, "progress", None)
 
         attachment_ids: list[str] = []
@@ -781,6 +888,16 @@ class TkPresentation:
                     error.set("附件上传失败，请重试。")
         tk.Button(dialog, text="添加附件", command=choose_files).pack(padx=12, anchor="w")
 
+        def _retire() -> None:
+            after = draft_pending.get("after_id")
+            if after is not None:
+                try:
+                    dialog.after_cancel(after)
+                except Exception:
+                    pass
+            self._answer_windows.pop(call_id, None)
+            self._calls.pop(call_id, None)
+
         def submit() -> None:
             result = build_result()
             if result is None:
@@ -788,14 +905,14 @@ class TkPresentation:
                 return
             response = self._client_ref()._central.submit(call_id, uuid.uuid4().hex, result, attachment_ids)
             if response.get("success"):
-                self._calls.pop(call_id, None)
+                _retire()
                 dialog.destroy()
             else:
                 error.set("中央服务未接受此回复，请重试。")
 
         def cancel() -> None:
             self._client_ref()._central.cancel(call_id=call_id, operation_id=uuid.uuid4().hex)
-            self._calls.pop(call_id, None)
+            _retire()
             dialog.destroy()
 
         def report_progress() -> None:
@@ -814,10 +931,27 @@ class TkPresentation:
             tk.Button(button_bar, text="报告进度", command=report_progress).pack(side="left")
         tk.Button(button_bar, text="取消", command=cancel, width=10).pack(side="right")
         tk.Button(button_bar, text="提交", command=submit, width=10).pack(side="right", padx=(0, 8))
+        return dialog
 
     @staticmethod
-    def _response_controls(dialog: Any, tool: str, payload: Mapping[str, object], tk: Any) -> Callable[[], dict[str, object] | None]:
-        """Build labelled controls for every shared interaction family."""
+    def _response_controls(dialog: Any, tool: str, payload: Mapping[str, object], tk: Any,
+                           draft_text: str = "",
+                           on_edit: Callable[[], None] | None = None) -> Callable[[], dict[str, object] | None]:
+        """Build labelled controls for every shared interaction family.
+
+        Text-bearing controls are seeded from ``draft_text`` (the round's
+        saved partial input) and report edits through ``on_edit`` so the
+        terminal can debounce-save the draft back onto the round row.  The
+        returned callable may carry a ``draft`` attribute exposing the
+        current text; controls without free text leave it absent.
+        """
+
+        def wire_text(box: Any, read: Callable[[], str], insert: Callable[[str], None]) -> None:
+            if draft_text:
+                insert(draft_text)
+            if on_edit is not None:
+                box.bind("<KeyRelease>", lambda _event: on_edit())
+
         required = bool(payload.get("required", True))
         if "confirm" in tool:
             value = tk.StringVar(value="")
@@ -831,18 +965,23 @@ class TkPresentation:
             return lambda: {"acknowledged": True} if value.get() else None
         if "feedback" in tool:
             box = TkPresentation._labelled_text(dialog, tk, "反馈")
-            return lambda: TkPresentation._text_result("feedback", box, required)
+            wire_text(box, lambda: box.get("1.0", "end-1c"), lambda text: box.insert("1.0", text))
+            result = lambda: TkPresentation._text_result("feedback", box, required)
+            result.draft = lambda: box.get("1.0", "end-1c")  # type: ignore[attr-defined]
+            return result
         if "task" in tool or "assign" in tool:
             status = tk.StringVar(value="completed")
             tk.Label(dialog, text="任务状态").pack(padx=12, pady=(6, 0), anchor="w")
             tk.OptionMenu(dialog, status, "completed", "failed").pack(padx=12, anchor="w")
             report = TkPresentation._labelled_text(dialog, tk, "任务报告")
+            wire_text(report, lambda: report.get("1.0", "end-1c"), lambda text: report.insert("1.0", text))
             def task_result() -> dict[str, object] | None:
                 text = report.get("1.0", "end-1c")
                 return {"status": status.get(), "report": text} if text or not required else None
             def task_progress() -> dict[str, object]:
                 return {"status": "in_progress", "progress": report.get("1.0", "end-1c")}
             task_result.progress = task_progress  # type: ignore[attr-defined]
+            task_result.draft = lambda: report.get("1.0", "end-1c")  # type: ignore[attr-defined]
             return task_result
         choices = payload.get("choices") or payload.get("options")
         if ("choice" in tool or "select" in tool or isinstance(choices, list)) and isinstance(choices, list):
@@ -868,12 +1007,18 @@ class TkPresentation:
         numeric = "number" in tool or str(payload.get("input_type", "")).lower() == "number"
         if multiline:
             box = TkPresentation._labelled_text(dialog, tk, "请输入完整回复")
-            return lambda: TkPresentation._text_result("user_input", box, required)
+            wire_text(box, lambda: box.get("1.0", "end-1c"), lambda text: box.insert("1.0", text))
+            result = lambda: TkPresentation._text_result("user_input", box, required)
+            result.draft = lambda: box.get("1.0", "end-1c")  # type: ignore[attr-defined]
+            return result
         label = "请输入数字" if numeric else "请输入回复"
         tk.Label(dialog, text=label).pack(padx=12, pady=(6, 0), anchor="w")
         entry = tk.Entry(dialog, width=70)
         entry.pack(padx=12, pady=(0, 8), fill="x")
-        return lambda: {"user_input": entry.get()} if entry.get() or not required else None
+        wire_text(entry, entry.get, lambda text: entry.insert(0, text))
+        result = lambda: {"user_input": entry.get()} if entry.get() or not required else None
+        result.draft = entry.get  # type: ignore[attr-defined]
+        return result
 
     @staticmethod
     def _labelled_text(dialog: Any, tk: Any, label: str) -> Any:

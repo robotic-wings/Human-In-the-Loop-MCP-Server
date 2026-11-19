@@ -118,6 +118,10 @@ class FakeWidget:
         return None
 
 
+    def bind(self, *_args: object, **_kwargs: object) -> None:
+        return None
+
+
     def destroy(self) -> None:
         pass
 
@@ -221,7 +225,7 @@ def test_answer_dialog_exposes_file_selection_and_attachment_list(monkeypatch: A
     terminal = FakeTerminal()
     presentation = TkPresentation(root=FakeWidget(), client_ref=lambda: terminal)
 
-    presentation._answer("call-1", {"payload": {"tool": "get_text_input", "prompt": "x"}})
+    presentation.show_accepted({"call_id": "call-1", "payload": {"tool": "get_text_input", "prompt": "x"}})
 
     assert fake_tk.listboxes, "answer dialog must render an attachment list"
     assert any(str(button.get("text", "")) != "提交" for button in fake_tk.buttons), (

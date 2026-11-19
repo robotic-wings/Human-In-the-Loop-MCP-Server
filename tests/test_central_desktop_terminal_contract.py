@@ -57,6 +57,7 @@ class FakeCentral:
                 "success": True,
                 "call_id": call_id,
                 "call_state": "accepted",
+                "version": 2,
                 "handled_on": "desktop",
                 "terminal_platform": "linux",
                 "can_accept": False,
@@ -94,9 +95,17 @@ class FakePresenter:
     shown: list[dict[str, object]] = field(default_factory=list)
     closed: list[str] = field(default_factory=list)
     hints: list[tuple[str, str]] = field(default_factory=list)
+    accepted: list[dict[str, object]] = field(default_factory=list)
+    closed_answers: list[str] = field(default_factory=list)
 
     def show(self, state: dict[str, object]) -> None:
         self.shown.append(dict(state))
+
+    def show_accepted(self, state: dict[str, object]) -> None:
+        self.accepted.append(dict(state))
+
+    def close_answer(self, call_id: str) -> None:
+        self.closed_answers.append(call_id)
 
     def close(self, call_id: str) -> None:
         self.closed.append(call_id)
@@ -310,7 +319,11 @@ def test_sync_wake_and_remote_acceptance_close_stale_desktop_alert_without_takeo
     assert client.accept(call_id="call-1", operation_id="late") == {"success": False, "status": "session_not_found"}
 
 
-def test_remote_acceptance_shows_handled_on_phone_hint_not_silent_close() -> None:
+def test_accepted_round_readable_from_state_feed_reopens_answer_surface() -> None:
+    """Restart recovery: the call view serves accepted rounds to their owner
+    only, so a readable accepted state in the poll feed means this device
+    owns the round and its answer surface must be (re)opened — the process
+    may have restarted after the human accepted."""
     central = FakeCentral(states={"call-1": _ringing("call-1")})
     client = _client(central=central)
     client.start()
@@ -320,16 +333,64 @@ def test_remote_acceptance_shows_handled_on_phone_hint_not_silent_close() -> Non
         "success": True,
         "call_id": "call-1",
         "call_state": "accepted",
-        "handled_on": "iphone_web",
-        "terminal_platform": "ios",
+        "handled_on": "desktop",
+        "terminal_platform": "linux",
         "can_accept": False,
         "can_decline": False,
+        "version": 2,
+        "payload": {"tool": "get_text_input", "prompt": "继续作答"},
     }
-    client.receive_notification({"call_id": "call-1", "version": 2}, callback_credential="central-callback-secret")
+    result = client.receive_notification({"call_id": "call-1", "version": 2}, callback_credential="central-callback-secret")
 
-    assert client.presenter.hints, "remote acceptance must show a handled-on-phone hint"
-    assert client.presenter.hints[0][0] == "call-1"
-    assert client.presenter.closed == ["call-1"]
+    assert result == {"success": True, "status": "reopened", "call_id": "call-1"}
+    assert client.presenter.accepted == [
+        {"success": True, "call_id": "call-1", "call_state": "accepted", "handled_on": "desktop",
+         "terminal_platform": "linux", "can_accept": False, "can_decline": False,
+         "version": 2, "payload": {"tool": "get_text_input", "prompt": "继续作答"}},
+    ], "an owned accepted round must reopen exactly once"
+    assert client.presenter.closed == ["call-1"], "any ringing alert for the round is retired"
+    # Re-feeding the same version must neither re-read nor stack windows.
+    again = client.receive_notification({"call_id": "call-1", "version": 2}, callback_credential="central-callback-secret")
+    assert again == {"success": True, "status": "duplicate", "call_id": "call-1"}
+    assert len(client.presenter.accepted) == 1
+
+
+def test_sync_retires_answer_surface_when_round_settles() -> None:
+    """The answer window follows the round: once central settles it (agent
+    gone, submitted elsewhere, disconnected), sync retires the surface."""
+    central = FakeCentral(states={"call-1": _ringing("call-1")})
+    client = _client(central=central)
+    client.start()
+    client.receive_notification({"call_id": "call-1", "version": 1}, callback_credential="central-callback-secret")
+    accepted = client.accept(call_id="call-1", operation_id="op-1")
+    assert accepted.get("success") is True
+    assert client.presenter.closed_answers == []
+
+    central.states["call-1"] = {"success": True, "call_id": "call-1", "call_state": "answered"}
+    assert client.sync() == {"success": True, "status": "synchronized", "call_ids": []}
+    assert client.presenter.closed_answers == ["call-1"], "a settled round must retire its answer surface"
+
+
+def test_central_loss_keeps_answer_surfaces_open() -> None:
+    """Central loss is not round settlement: the human keeps typing and the
+    terminal retries — only a settled/superseded round closes the surface."""
+    central = FakeCentral(states={"call-1": _ringing("call-1")})
+    client = _client(central=central)
+    client.start()
+    client.receive_notification({"call_id": "call-1", "version": 1}, callback_credential="central-callback-secret")
+    assert client.accept(call_id="call-1", operation_id="op-1").get("success") is True
+
+    central.available = False
+    assert client.sync() == {"success": False, "status": "central_unavailable"}
+    assert client.presenter.closed_answers == [], "central loss must not close answer surfaces"
+
+    central.available = True
+    # Production recovery flow: the heartbeat tick sees the client offline
+    # and recovers it (re-authentication) before syncing again.
+    assert client.recover().get("success") is True
+    recovered = client.sync()
+    assert recovered == {"success": True, "status": "synchronized", "call_ids": []}
+    assert client.presenter.closed_answers == []
 
 
 def test_remote_acceptance_with_unreadable_call_uses_event_state_for_handled_hint() -> None:

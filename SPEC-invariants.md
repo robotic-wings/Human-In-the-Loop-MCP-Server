@@ -20,6 +20,15 @@
 - 一轮至多一个 owner；owner 在 **accept 时刻**建立，之后**不可变**。
 - owner 通道 ∈ {desktop, mobile}；未 accept 的轮次无 owner。
 - owner 通道决定保活语义（见 I3）。
+- **归属身份 vs 会话句柄**：不可变的是身份（owner 设备 + 通道）。同一设备
+  重新认证后的会话句柄（`owner_session_id`）允许在 state 轮询中重绑到当前
+  已认证会话——桌面终端崩溃重启后的恢复依赖这一点。重绑的边界：
+  - 只作用于该设备自己的 accepted/in_progress 轮次（mobile 归属的行
+    `owner_device_id` 为哨兵值，永不被桌面重绑触及）；
+  - 重绑前先执行到期结算：owner lease 已过期的轮次照常落 `terminal_disconnected`，
+    绝不因重绑而复活；
+  - 重绑后旧会话对该轮次的 submit/draft 即失效（新句柄是唯一有效句柄）。
+  钉死：`test_central_mcp_terminal_restart_recovery_contract.py`。
 
 ## I3 保活 → 结算（Liveness → Settlement）
 

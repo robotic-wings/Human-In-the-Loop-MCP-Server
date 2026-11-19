@@ -888,20 +888,54 @@ class WaitingLifecycle:
                 raise
 
     def terminal_states(self, device_id: str) -> list[dict[str, object]]:
+        """Rounds a terminal must know about: owned rounds plus rings invited to it.
+
+        Owned rows (accepted, in_progress and any already-settled rounds this
+        device still owns) keep the restarted terminal's answer surfaces in
+        step with central authority; invited ringing rows make the poll — not
+        only the push — able to present a call whose notification delivery
+        was acknowledged by a process that died before showing it.
+        """
         with self._connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 self._settle_due(conn)
                 self._refresh_owner_lease_for_device(conn, device_id)
                 rows = conn.execute(
-                    "SELECT call_id, call_state, version FROM lifecycle_calls WHERE owner_device_id=? ORDER BY call_id",
-                    (device_id,),
+                    "SELECT call_id, call_state, version FROM lifecycle_calls "
+                    "WHERE owner_device_id=? OR (invited_desktop_id=? AND call_state='ringing') ORDER BY call_id",
+                    (device_id, device_id),
                 ).fetchall()
                 conn.commit()
             except BaseException:
                 conn.rollback()
                 raise
         return [{"call_id": row["call_id"], "call_state": row["call_state"], "version": row["version"]} for row in rows]
+
+    def reattach_owner_sessions(self, device_id: str, session_id: str) -> dict[str, object]:
+        """Rebind this device's in-progress rounds to its current live session.
+
+        A restarted terminal registers a fresh session while its device keeps
+        owning rounds accepted earlier.  Owner identity (device + channel) is
+        established at accept and immutable (I2); only the per-process session
+        handle moves here, and only for the authenticated session of the very
+        same device.  Rounds whose owner lease already expired settle first
+        and are never resurrected.
+        """
+        with self._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._settle_due(conn)
+                changed = conn.execute(
+                    "UPDATE lifecycle_calls SET owner_session_id=? "
+                    "WHERE owner_device_id=? AND call_state IN ('accepted','in_progress') AND owner_session_id<>?",
+                    (session_id, device_id, session_id),
+                ).rowcount
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+        return {"success": True, "status": "reattached", "reattached": int(changed or 0)}
 
     def save_draft(self, *, call_id: str, device_id: str, session_id: str,
                    draft_version: int, content: str) -> dict[str, object]:
