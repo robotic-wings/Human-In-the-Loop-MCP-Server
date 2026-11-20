@@ -212,16 +212,13 @@ class CentralServiceConfig:
         tls_cert_file = required_text("tls_cert_file")
         tls_key_file = required_text("tls_key_file")
 
-        raw_ring_timeout = mapping.get("ring_timeout_seconds", 60)
-        if isinstance(raw_ring_timeout, bool) or not isinstance(raw_ring_timeout, (int, float)) or raw_ring_timeout <= 0:
-            raise ValueError("ring_timeout_seconds must be a positive number")
-        ring_timeout_seconds = float(raw_ring_timeout)
-
         def _positive_seconds(name: str, default: float) -> float:
             raw = mapping.get(name, default)
             if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw <= 0:
                 raise ValueError(f"{name} must be a positive number")
             return float(raw)
+
+        ring_timeout_seconds = _positive_seconds("ring_timeout_seconds", 60)
 
         # agent_reconnect_seconds must exceed the agent's max poll interval
         # (LLM turn latency); terminal_disconnect_seconds bounds how long a
