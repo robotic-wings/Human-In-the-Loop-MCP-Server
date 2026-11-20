@@ -75,6 +75,23 @@ The configured listener address must match the management-preconfigured desktop 
 
 The desktop packaging and platform UI adapter remain separate from the central-service process. The terminal must report `gui_unavailable` rather than claim it can accept calls when no graphical session is available.
 
+## Central Portal (shell client for agents)
+
+`central_portal.py` is a stdlib-only CLI that drives ONE central round per invocation and parks it to a terminal outcome — so an agent harness that can wait on a shell command (opencode, Claude Code, …) never spends LLM turns on keepalive traffic. The portal performs the MCP `initialize` handshake, sends the tool call, and then — in plain deterministic code — issues every continuation leg (heartbeat → opened → in_progress → …) with the correct forward-only `after_event_seq` cursor until `needs_continuation` clears. The outcome is printed once as JSON on stdout; progress goes to stderr.
+
+```bash
+central-portal call get_user_input --arg 'prompt=现在方便吗？' --max-wait-seconds 600
+central-portal call assign_task_to_human --max-wait-seconds 3600 \
+    --arg 'task_description=拍一张北墙的照片' --arg max_result_bytes=1000000
+central-portal call list_my_interactions          # recover open rounds
+central-portal call <tool> --resume <interaction_id> <call_id> <after_event_seq>
+central-portal tools / help / help <tool>          # tool reference
+```
+
+Transport-retry discipline: a re-sent request reuses the same JSON-RPC id, so the central replays its recorded outcome instead of duplicating the call; a busy line is retried under a fresh id (the old id would replay the busy verdict forever). Before a round exists, transport failures give up after a bounded number of retries; once a round is open, retries are unbounded — the portal owes the round patience. Exit codes: `0` definitive outcome, `1` usage, `2` transport/auth, `3` max-wait exceeded with the round still open (payload carries a ready-made resume command), `5` busy line did not clear.
+
+Configuration: CLI flags > `HITL_CENTRAL` / `HITL_TOKEN` / `HITL_CAFILE` env > `~/.config/hitl-portal/config.json` (`{"url", "token", "ca_file"}`) > default `https://10.10.0.1:9443`. The CA cert must include a `keyUsage` extension (critical `keyCertSign`, `cRLSign`): OpenSSL 4.x rejects a CA without it.
+
 ## Development checks
 
 ```bash
