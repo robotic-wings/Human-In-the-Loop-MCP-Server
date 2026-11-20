@@ -174,6 +174,8 @@ class CentralServiceConfig:
     operator_directory: Mapping[str, Mapping[str, object]] = field(default_factory=dict)
     operator_session_secret: bytes | None = None
     ring_timeout_seconds: float = 60
+    agent_reconnect_seconds: float = 300
+    terminal_disconnect_seconds: float = 1800
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, object]) -> "CentralServiceConfig":
@@ -214,6 +216,18 @@ class CentralServiceConfig:
         if isinstance(raw_ring_timeout, bool) or not isinstance(raw_ring_timeout, (int, float)) or raw_ring_timeout <= 0:
             raise ValueError("ring_timeout_seconds must be a positive number")
         ring_timeout_seconds = float(raw_ring_timeout)
+
+        def _positive_seconds(name: str, default: float) -> float:
+            raw = mapping.get(name, default)
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw <= 0:
+                raise ValueError(f"{name} must be a positive number")
+            return float(raw)
+
+        # agent_reconnect_seconds must exceed the agent's max poll interval
+        # (LLM turn latency); terminal_disconnect_seconds bounds how long a
+        # desktop round survives a terminal outage (crash-restart window).
+        agent_reconnect_seconds = _positive_seconds("agent_reconnect_seconds", 300)
+        terminal_disconnect_seconds = _positive_seconds("terminal_disconnect_seconds", 1800)
 
         # The legacy ingress remains constructible for its isolated contract;
         # lifecycle composition validates routes only when that factory is
@@ -359,6 +373,8 @@ class CentralServiceConfig:
             operator_directory=operator_directory,
             operator_session_secret=operator_session_secret,
             ring_timeout_seconds=ring_timeout_seconds,
+            agent_reconnect_seconds=agent_reconnect_seconds,
+            terminal_disconnect_seconds=terminal_disconnect_seconds,
         )
 
 
@@ -453,6 +469,8 @@ def create_lifecycle_app(
         operator_directory=dict(config.operator_directory) or None,
         operator_session_secret=config.operator_session_secret,
         ring_timeout_seconds=config.ring_timeout_seconds,
+        agent_reconnect_seconds=config.agent_reconnect_seconds,
+        terminal_disconnect_seconds=config.terminal_disconnect_seconds,
     )
     lifecycle_holder["app"] = app
     return app

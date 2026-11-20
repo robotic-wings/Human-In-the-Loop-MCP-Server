@@ -152,7 +152,10 @@ class WaitingLifecycle:
         )
 
     def _arm_agent_lease(self, conn: sqlite3.Connection, call_id: str, state: str) -> None:
-        grace = 300 if state == "in_progress" else self._agent_reconnect_seconds
+        # D11 floor: in-progress human work survives at least 300s of agent
+        # silence; a larger configured lease raises it for slow-polling agents.
+        grace = (max(300.0, self._agent_reconnect_seconds)
+                 if state == "in_progress" else self._agent_reconnect_seconds)
         conn.execute(
             "UPDATE lifecycle_calls SET agent_reconnect_deadline=? WHERE call_id=?",
             (self._clock() + grace, call_id),
