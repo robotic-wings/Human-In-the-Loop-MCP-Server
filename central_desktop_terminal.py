@@ -62,6 +62,8 @@ class DesktopTerminalClient:
         self._shown: dict[str, int] = {}
         self._answers: dict[str, int] = {}
         self._operations: dict[tuple[str, str, str], dict[str, object]] = {}
+        self._tick_lock = threading.Lock()
+        self._tick_running = False
 
     def start(self) -> dict[str, object]:
         if self._callback_credential() is None:
@@ -85,6 +87,23 @@ class DesktopTerminalClient:
 
     def status(self) -> dict[str, object]:
         return {"gui_ready": self._gui_ready, "online": self._online}
+
+    def begin_tick(self) -> bool:
+        """Claim the single network slot for one heartbeat group.
+
+        A group slower than ``heartbeat_seconds`` must not be joined by the
+        next one: overlapping polls each walk the same feed and only pile
+        more work onto a slow central.
+        """
+        with self._tick_lock:
+            if self._tick_running:
+                return False
+            self._tick_running = True
+            return True
+
+    def end_tick(self) -> None:
+        with self._tick_lock:
+            self._tick_running = False
 
     def recover(self) -> dict[str, object]:
         """Re-register after the central service restarted or the session was lost."""
@@ -116,6 +135,19 @@ class DesktopTerminalClient:
                 # Already presenting this round's answer surface at this
                 # version: skip the per-tick re-read (sync() still watches it).
                 return {"success": True, "status": "duplicate", "call_id": call_id}
+            feed_state = event.get("call_state")
+            if isinstance(feed_state, str) and feed_state not in ("ringing", "accepted", "in_progress"):
+                # The poll reports this device's owned history, so most rows
+                # describe rounds nothing local refers to any more.  One
+                # round trip per historical row starved sync() and left
+                # cancelled windows open for a minute or more: a settled row
+                # needs no authority read, only local retirement.
+                self.listener.acknowledge(dict(event))
+                if call_id in self._shown or call_id in self._answers:
+                    self._close(call_id)
+                    self._close_answer(call_id)
+                    return {"success": True, "status": "closed", "call_id": call_id}
+                return {"success": True, "status": "ignored", "call_id": call_id}
             try:
                 state = self._central.read_call(call_id, self._session_id)
             except (ConnectionError, OSError):
@@ -652,6 +684,25 @@ class CentralHttpDesktopClient:
         self._config, self._session_id = config, None
         self._states: dict[str, dict[str, object]] = {}
         self.operator: str | None = getattr(self._config, "callsign", None) or None
+        # One pooled connection: the heartbeat tick and the notification
+        # listener both talk to central, and a fresh TLS handshake per call
+        # made a state poll cost one round trip per row.
+        self._http: httpx.Client | None = None
+        self._http_lock = threading.Lock()
+
+    def _client(self) -> httpx.Client:
+        with self._http_lock:
+            if self._http is None or getattr(self._http, "is_closed", False):
+                self._http = httpx.Client(timeout=5.0, verify=self._config.verify_tls)
+            return self._http
+
+    def close(self) -> None:
+        with self._http_lock:
+            if self._http is not None:
+                close = getattr(self._http, "close", None)
+                if callable(close):
+                    close()
+                self._http = None
 
     def _request(self, method: str, path: str, *, json_body: object | None = None) -> dict[str, object]:
         headers: dict[str, str] = {}
@@ -662,8 +713,8 @@ class CentralHttpDesktopClient:
             if legacy:
                 headers["authorization"] = f"Terminal {legacy}"
         try:
-            with httpx.Client(timeout=5.0, verify=self._config.verify_tls) as client:
-                response = client.request(method, self._config.central_url + path, json=json_body, headers=headers)
+            response = self._client().request(
+                method, self._config.central_url + path, json=json_body, headers=headers)
             data = response.json()
         except (httpx.HTTPError, ValueError, OSError) as error:
             raise ConnectionError("central service is unreachable") from error
@@ -1274,6 +1325,12 @@ def run_heartbeat_tick(central: Any, client: Any, *, callback_credential: str | 
         )
 
     def network_group() -> None:
+        begin = getattr(client, "begin_tick", None)
+        if callable(begin) and not begin():
+            # The previous group is still on the wire.  A second one would
+            # only queue more work behind a slow central; the next tick
+            # covers whatever this one would have polled.
+            return
         try:
             central.heartbeat()
             status = getattr(client, "status", None)
@@ -1281,11 +1338,21 @@ def run_heartbeat_tick(central: Any, client: Any, *, callback_credential: str | 
                 recover = getattr(client, "recover", None)
                 if callable(recover):
                     recover()
+            # Retire settled local windows BEFORE walking the poll feed: a
+            # cancellation must never wait behind the feed's own work.
+            client.sync()
             for state in central.synchronize():
                 client.receive_notification(state, callback_credential=callback_credential)
             client.sync()
         except ConnectionError:
             schedule_ui(0, client._central_lost)
+        except Exception as error:  # keep an unexpected failure visible
+            print(f"desktop terminal: heartbeat group failed: {error!r}",
+                  file=sys.stderr, flush=True)
+        finally:
+            end = getattr(client, "end_tick", None)
+            if callable(end):
+                end()
 
     run_worker(network_group)
     schedule_ui(int(heartbeat_seconds * 1000), next_tick)
