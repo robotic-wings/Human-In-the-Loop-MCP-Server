@@ -51,7 +51,9 @@ from typing import Any, Callable, Mapping
 
 DEFAULT_CENTRAL = "https://10.10.0.1:9443"
 DEFAULT_CONFIG = Path("~/.config/hitl-portal/config.json").expanduser()
-LEG_SECONDS_DEFAULT = 600        # one parked leg; server returns ~leg-30s
+LEG_SECONDS_DEFAULT = 10         # one parked leg (~7.5s park); heartbeats are
+                                 # free in deterministic code, and a dead
+                                 # connection is detected within one leg
 TIMEOUT_EXTRA_DEFAULT = 90       # HTTP read timeout margin above the leg
 BUSY_WAIT_DEFAULT = 180          # how long to keep retrying a busy line
 
