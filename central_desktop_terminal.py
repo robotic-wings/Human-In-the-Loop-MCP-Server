@@ -12,6 +12,7 @@ import base64
 import hashlib
 import json
 import os
+import queue
 import signal
 import subprocess
 import sys
@@ -38,6 +39,7 @@ class DesktopTerminalClient:
         gui_capability: Callable[[], bool],
         ring: Any,
         presenter: Any,
+        schedule_ui: Callable[[Callable[[], None]], None] | None = None,
     ) -> None:
         self._config = dict(config)
         self._central = central
@@ -45,6 +47,15 @@ class DesktopTerminalClient:
         self._gui_capability = gui_capability
         self.ring = ring
         self.presenter = presenter
+        # Tk may only be touched from the UI thread.  Every presenter and
+        # ring mutation goes through this seam: real terminals inject a
+        # scheduler that marshals onto the Tk loop; headless tests run
+        # inline.
+        self._ui = schedule_ui if schedule_ui is not None else (lambda fn: fn())
+        # Notification delivery (listener thread) and the heartbeat tick
+        # (worker thread) both reconcile local windows; one re-entrant
+        # lock serialises their bookkeeping and their read calls.
+        self._lock = threading.RLock()
         self._session_id: str | None = None
         self._online = False
         self._gui_ready = False
@@ -98,50 +109,54 @@ class DesktopTerminalClient:
         call_id, version = event.get("call_id"), event.get("version")
         if not isinstance(call_id, str) or not isinstance(version, int) or not self._online or self._session_id is None:
             return {"success": False, "status": "session_not_found"}
-        if self._shown.get(call_id, -1) >= version:
-            return {"success": True, "status": "duplicate", "call_id": call_id}
-        if self._answers.get(call_id, -1) >= version:
-            # Already presenting this round's answer surface at this
-            # version: skip the per-tick re-read (sync() still watches it).
-            return {"success": True, "status": "duplicate", "call_id": call_id}
-        try:
-            state = self._central.read_call(call_id, self._session_id)
-        except (ConnectionError, OSError):
-            return self._central_lost()
-        if not state.get("success"):
-            if event.get("call_state") == "accepted" and event.get("handled_on") == "iphone_web":
-                self.listener.acknowledge(dict(event))
-                show_hint = getattr(self.presenter, "show_handled_hint", None)
-                if callable(show_hint):
-                    show_hint(call_id, "已在手机端接听")
+        with self._lock:
+            if self._shown.get(call_id, -1) >= version:
+                return {"success": True, "status": "duplicate", "call_id": call_id}
+            if self._answers.get(call_id, -1) >= version:
+                # Already presenting this round's answer surface at this
+                # version: skip the per-tick re-read (sync() still watches it).
+                return {"success": True, "status": "duplicate", "call_id": call_id}
+            try:
+                state = self._central.read_call(call_id, self._session_id)
+            except (ConnectionError, OSError):
+                return self._central_lost()
+            if not state.get("success"):
+                if event.get("call_state") == "accepted" and event.get("handled_on") == "iphone_web":
+                    self.listener.acknowledge(dict(event))
+                    show_hint = getattr(self.presenter, "show_handled_hint", None)
+                    if callable(show_hint):
+                        self._ui(lambda: show_hint(call_id, "已在手机端接听"))
+                    self._close(call_id)
+                    return {"success": True, "status": "synchronized", "call_id": call_id}
+                return {"success": False, "status": "session_not_found"}
+            self.listener.acknowledge(dict(event))
+            current = state.get("call_state")
+            if current in ("accepted", "in_progress"):
+                # The call view serves accepted rounds to their owner only, so
+                # reaching here means this device owns the round.  A live
+                # window is deduped by the presenter; a missing one means the
+                # process restarted while the human was answering — reopen it.
+                self._close(call_id)
+                show_accepted = getattr(self.presenter, "show_accepted", None)
+                if callable(show_accepted) and call_id not in self._answers:
+                    self._answers[call_id] = version
+                    self._ui(lambda: show_accepted(state))
+                    return {"success": True, "status": "reopened", "call_id": call_id}
+                return {"success": True, "status": "synchronized", "call_id": call_id}
+            if current != "ringing":
                 self._close(call_id)
                 return {"success": True, "status": "synchronized", "call_id": call_id}
-            return {"success": False, "status": "session_not_found"}
-        self.listener.acknowledge(dict(event))
-        current = state.get("call_state")
-        if current in ("accepted", "in_progress"):
-            # The call view serves accepted rounds to their owner only, so
-            # reaching here means this device owns the round.  A live window
-            # is deduped by the presenter; a missing one means the process
-            # restarted while the human was answering — reopen it.
-            self._close(call_id)
-            show_accepted = getattr(self.presenter, "show_accepted", None)
-            if callable(show_accepted) and call_id not in self._answers:
-                self._answers[call_id] = version
-                show_accepted(state)
-                return {"success": True, "status": "reopened", "call_id": call_id}
-            return {"success": True, "status": "synchronized", "call_id": call_id}
-        if current != "ringing":
-            self._close(call_id)
-            return {"success": True, "status": "synchronized", "call_id": call_id}
-        self._shown[call_id] = version
-        self.presenter.show(state)
-        quiet_mode = event.get("quiet_mode")
-        if quiet_mode == "short":
-            self.ring.start(call_id, "short")
-        elif quiet_mode != "silent":
-            self.ring.start(call_id, "long")
-        return {"success": True, "status": "presented", "call_id": call_id}
+            self._shown[call_id] = version
+            self._ui(lambda: self.presenter.show(state))
+            quiet_mode = event.get("quiet_mode")
+            if quiet_mode == "short":
+                self._ui(lambda: self.ring.start(call_id, "short"))
+            elif quiet_mode != "silent":
+                self._ui(lambda: self.ring.start(call_id, "long"))
+            # A new ring moves the human's attention; any window for a round
+            # that has since terminalised must not linger beside it.
+            self._reconcile_others(call_id)
+            return {"success": True, "status": "presented", "call_id": call_id}
 
     def accept(self, *, call_id: str, operation_id: str) -> dict[str, object]:
         return self._act("accept", call_id, operation_id)
@@ -157,20 +172,21 @@ class DesktopTerminalClient:
     def sync(self) -> dict[str, object]:
         if not self._online or self._session_id is None:
             return {"success": False, "status": "central_unavailable"}
-        call_ids = list(self._shown)
-        answer_ids = list(self._answers)
-        try:
-            for call_id in call_ids:
-                state = self._central.read_call(call_id, self._session_id)
-                if not state.get("success") or state.get("call_state") != "ringing":
-                    self._close(call_id)
-            for call_id in answer_ids:
-                state = self._central.read_call(call_id, self._session_id)
-                if not state.get("success") or state.get("call_state") not in ("accepted", "in_progress"):
-                    self._close_answer(call_id)
-        except (ConnectionError, OSError):
-            return self._central_lost()
-        return {"success": True, "status": "synchronized", "call_ids": call_ids}
+        with self._lock:
+            call_ids = list(self._shown)
+            answer_ids = list(self._answers)
+            try:
+                for call_id in call_ids:
+                    state = self._central.read_call(call_id, self._session_id)
+                    if not state.get("success") or state.get("call_state") != "ringing":
+                        self._close(call_id)
+                for call_id in answer_ids:
+                    state = self._central.read_call(call_id, self._session_id)
+                    if not state.get("success") or state.get("call_state") not in ("accepted", "in_progress"):
+                        self._close_answer(call_id)
+            except (ConnectionError, OSError):
+                return self._central_lost()
+            return {"success": True, "status": "synchronized", "call_ids": call_ids}
 
     def _close_answer(self, call_id: str) -> None:
         """Retire an answer surface whose round left the human-active states.
@@ -183,7 +199,7 @@ class DesktopTerminalClient:
             del self._answers[call_id]
             close_answer = getattr(self.presenter, "close_answer", None)
             if callable(close_answer):
-                close_answer(call_id)
+                self._ui(lambda: close_answer(call_id))
 
     def _act(self, action: str, call_id: str, operation_id: str) -> dict[str, object]:
         # Operation identifiers are idempotent only within their call.  A
@@ -219,13 +235,48 @@ class DesktopTerminalClient:
     def _close(self, call_id: str) -> None:
         if call_id in self._shown:
             del self._shown[call_id]
-            self.ring.stop(call_id)
-            self.presenter.close(call_id)
+            self._retire(call_id)
+
+    def _retire(self, call_id: str) -> None:
+        """Stop the ring and destroy the alert window on the UI thread.
+
+        ``_close`` removes the bookkeeping entry before scheduling this,
+        so the round is never tracked twice; the Tk work runs on the UI
+        thread, where ``destroy()`` is reliable.  A failure is reported
+        rather than silently orphaning a window no later tick would
+        revisit.
+        """
+
+        def retire() -> None:
+            try:
+                self.ring.stop(call_id)
+            except Exception:
+                pass
+            try:
+                self.presenter.close(call_id)
+            except Exception as error:
+                print(f"desktop terminal: close {call_id} failed: {error!r}",
+                      file=sys.stderr, flush=True)
+
+        self._ui(retire)
+
+    def _reconcile_others(self, keep: str) -> None:
+        """Close stale alert windows when a new ring takes the foreground."""
+        for call_id in list(self._shown):
+            if call_id == keep:
+                continue
+            try:
+                state = self._central.read_call(call_id, self._session_id)
+            except (ConnectionError, OSError):
+                return
+            if not state.get("success") or state.get("call_state") != "ringing":
+                self._close(call_id)
 
     def _central_lost(self) -> dict[str, object]:
-        self._online = False
-        for call_id in list(self._shown):
-            self._close(call_id)
+        with self._lock:
+            self._online = False
+            for call_id in list(self._shown):
+                self._close(call_id)
         return {"success": False, "status": "central_unavailable"}
 
     def _callback_credential(self) -> str | None:
@@ -1313,11 +1364,39 @@ def main(argv: list[str] | None = None) -> None:
     central = CentralHttpDesktopClient(config)
     holder: dict[str, DesktopTerminalClient] = {}
     presenter = TkPresentation(root, lambda: holder["client"])
+    # UI seam: worker and listener threads only ever enqueue callables; the
+    # pump below drains them on the Tk thread.  No Tk call crosses threads,
+    # which is what previously let close() race destroy() and orphan
+    # windows ("bad window path name" in the log).
+    ui_queue: "queue.SimpleQueue[Callable[[], None]]" = queue.SimpleQueue()
+
+    def schedule_ui(delay_ms: int, fn: Callable[[], None]) -> None:
+        if delay_ms and delay_ms > 0:
+            # Delayed work is only ever scheduled from the UI thread (the
+            # heartbeat tick reschedules itself).
+            root.after(int(delay_ms), fn)
+        else:
+            ui_queue.put(fn)
+
+    def pump_ui_queue() -> None:
+        while True:
+            try:
+                task = ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                task()
+            except Exception as error:
+                print(f"desktop terminal: ui task failed: {error!r}",
+                      file=sys.stderr, flush=True)
+        root.after(25, pump_ui_queue)
+
+    pump_ui_queue()
     prefs_file = preferences_file(args.config)
     short_state_file = prefs_file
     selection = startup_ringtone_selection(config, prefs_file)
     ring = RingtonePlayer(ringtone_path=selection.long_ringtone_path, ringtone_alt_path=config.ringtone_alt_path, bell=root.bell, short_ringtone_path=selection.short_ringtone_path)
-    client = DesktopTerminalClient(config={"callsign": config.callsign, "operator_password": config.operator_password, "device_id": config.device_id, "terminal_credential": config.terminal_credential, "callback_credential": config.callback_credential}, central=central, listener=_TerminalListener(), gui_capability=lambda: True, ring=ring, presenter=presenter)
+    client = DesktopTerminalClient(config={"callsign": config.callsign, "operator_password": config.operator_password, "device_id": config.device_id, "terminal_credential": config.terminal_credential, "callback_credential": config.callback_credential}, central=central, listener=_TerminalListener(), gui_capability=lambda: True, ring=ring, presenter=presenter, schedule_ui=lambda fn: schedule_ui(0, fn))
     holder["client"] = client
     if config.listener_scheme == "https" and (not config.listener_tls_cert_file or not config.listener_tls_key_file):
         raise SystemExit("desktop terminal unavailable: HTTPS listener requires listener_tls_cert_file and listener_tls_key_file")
@@ -1339,7 +1418,7 @@ def main(argv: list[str] | None = None) -> None:
         callback_credential=config.callback_credential,
         heartbeat_seconds=config.heartbeat_seconds,
         run_worker=run_worker,
-        schedule_ui=root.after,
+        schedule_ui=schedule_ui,
     )
     # The console is ephemeral; the process is permanent. root stays
     # withdrawn forever and only hosts the event loop. Every surface —
